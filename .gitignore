@@ -1,0 +1,18 @@
+# Installed dependencies and generated output; bun.lock stays tracked.
+node_modules/
+dist/
+coverage/
+*.tgz
+*.log
+*.tsbuildinfo
+
+# Local secrets and machine-specific files.
+.env
+.env.*
+!.env.example
+.DS_Store
+
+# Local OMP sessions and agent tooling are not extension source.
+.omp/
+.rasen/
+.claude/

@@ -1,0 +1,9 @@
+version: 2
+updates:
+  # Keep immutable action pins current. OMP and Bun upgrades are deliberate
+  # compatibility changes and are validated separately against the runtime.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
