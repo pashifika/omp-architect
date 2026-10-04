@@ -23,8 +23,8 @@ export interface JevOptions {
 }
 export interface JevDependencies {
   fetch?: (input: string, init: RequestInit) => Promise<Response>;
-  /** Test seam; production reads TYPESAFE_API_KEY only at provider invocation. */
-  readApiKey?: () => string | undefined;
+  /** Resolves credentials at invocation; standalone providers default to TYPESAFE_API_KEY. */
+  readApiKey?: () => string | undefined | Promise<string | undefined>;
 }
 export interface JevRequest {
   model: string;
@@ -295,15 +295,6 @@ export function createJevProvider(
   return async (evidence, signal) => {
     if (signal.aborted) throw new JevError("JEV_ABORTED");
     const body = JSON.stringify(buildJevRequest(evidence, config));
-    let key: string | undefined;
-    try {
-      key = readApiKey();
-    } catch {
-      throw new JevError("JEV_MISSING_API_KEY");
-    }
-    if (!key) throw new JevError("JEV_MISSING_API_KEY");
-    if (typeof key !== "string" || !/^[\x21-\x7e]{1,4096}$/.test(key))
-      throw new JevError("JEV_INVALID_API_KEY");
     const controller = new AbortController();
     let abortCode: "JEV_ABORTED" | "JEV_TIMEOUT" = "JEV_ABORTED";
     let rejectAbort: (error: JevError) => void = () => {};
@@ -323,6 +314,16 @@ export function createJevProvider(
       if (signal.aborted) cancel();
       const execute = async (): Promise<Decision> => {
         if (controller.signal.aborted) throw new JevError(abortCode);
+        let key: string | undefined;
+        try {
+          key = await readApiKey();
+        } catch {
+          throw new JevError("JEV_MISSING_API_KEY");
+        }
+        if (controller.signal.aborted) throw new JevError(abortCode);
+        if (!key) throw new JevError("JEV_MISSING_API_KEY");
+        if (typeof key !== "string" || !/^[\x21-\x7e]{1,4096}$/.test(key))
+          throw new JevError("JEV_INVALID_API_KEY");
         const response = await fetcher(endpoint, {
           method: "POST",
           headers: {
