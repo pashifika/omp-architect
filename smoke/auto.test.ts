@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, jest, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -401,6 +401,90 @@ for (const valid of [true, false]) {
     }
   });
 }
+
+test("real loader keeps Auto completion within 24s despite the normal 120s review deadline", async () => {
+  const { promise: started, resolve: markStarted } = Promise.withResolvers<void>();
+  let reads = 0;
+  let reviews = 0;
+  let validations = 0;
+  let reviewSignal: AbortSignal | undefined;
+  let cancelReview = () => {};
+  const fixture = await loaderFixture(
+    {},
+    {
+      minReviews: 1,
+      reviewer: async (_request, signal) => {
+        reviews++;
+        reviewSignal = signal;
+        const { promise, reject } = Promise.withResolvers<never>();
+        const aborted = () => reject(signal.reason ?? new Error("Fixture review cancelled"));
+        cancelReview = () => reject(new Error("Fixture review cleanup"));
+        signal.addEventListener("abort", aborted, { once: true });
+        if (signal.aborted) aborted();
+        markStarted();
+        try {
+          return await promise;
+        } finally {
+          signal.removeEventListener("abort", aborted);
+        }
+      },
+      dependencies: {
+        snapshot: async () => snapshot(reads++ === 0 ? 0 : 2),
+        validate: async () => {
+          validations++;
+        },
+      },
+    },
+  );
+  let stopping: Promise<unknown> | undefined;
+  try {
+    // Load and start the real SDK fixture before replacing the clock; retain normal review defaults.
+    await fixture.start();
+    jest.useFakeTimers();
+    let settled = false;
+    stopping = fixture.stop();
+    void stopping.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    await started;
+    expect(reviews).toBe(1);
+    expect(validations).toBe(1);
+    jest.advanceTimersByTime(23_999);
+    await Promise.resolve();
+    expect(reviewSignal?.aborted).toBe(false);
+    expect(settled).toBe(false);
+    expect(await fixture.status()).toMatchObject({ status: "running", completionVerified: false });
+
+    jest.advanceTimersByTime(2);
+    await expect(stopping).resolves.toBeUndefined();
+    expect(reviewSignal?.aborted).toBe(true);
+    expect(await fixture.status()).toMatchObject({
+      status: "blocked",
+      reason: "Auto boundary cancelled or timed out",
+      completionVerified: false,
+    });
+    expect(await fixture.stop()).toBeUndefined();
+    expect(reviews).toBe(1);
+    expect(validations).toBe(1);
+    expect(reads).toBe(2);
+    expect(fixture.counts().decisions).toBe(0);
+    expect(fixture.bootstraps).toHaveLength(1);
+    expect(fixture.messages.filter((message) => message.customType === "omp-auto")).toHaveLength(1);
+  } finally {
+    try {
+      cancelReview();
+      await stopping?.catch(() => {});
+    } finally {
+      jest.useRealTimers();
+      await fixture.close();
+    }
+  }
+});
 
 test("real loader blocks subagent spawning and background-capable tool paths during Auto", async () => {
   const fixture = await loaderFixture();

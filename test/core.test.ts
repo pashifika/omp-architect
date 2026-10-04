@@ -21,12 +21,17 @@ describe("role routing and configuration", () => {
     expect(routeAgent("m1", config)).toBeUndefined();
     expect(routeAgent("reviewer", config)).toBeUndefined();
   });
+  test.each([100, 35000, 120000])("explicit review timeout %p is accepted", (reviewTimeoutMs) => {
+    expect(parseConfig({ reviewTimeoutMs }).reviewTimeoutMs).toBe(reviewTimeoutMs);
+  });
   test("model selectors and unknown options fail instead of forming a second model map", () => {
     for (const invalid of [
       { roles: { architect: "openai/gpt-5:high" } },
       { roles: { research: "default" } },
       { retry: 5 },
-      { reviewTimeoutMs: 30000 },
+      { reviewTimeoutMs: 99 },
+      { reviewTimeoutMs: 120001 },
+      { reviewTimeoutMs: 100.5 },
       { repeatedErrorThreshold: 1 },
       { reviews: { min: 3, max: 2 } },
       { reviews: { min: 0, max: 2 } },
