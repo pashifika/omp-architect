@@ -74,6 +74,7 @@ async function loaderFixture(
     reviewer?: Reviewer;
     minReviews?: number;
     maxReviews?: number;
+    modelRegistry?: ModelRegistry;
   } = {},
 ) {
   const cwd = await project(config, overrides.minReviews, overrides.maxReviews);
@@ -114,6 +115,7 @@ async function loaderFixture(
   );
   const ctx = {
     cwd,
+    modelRegistry: overrides.modelRegistry,
     agent: { kind: "main", id: "main", name: "main", depth: 0 },
     hasUI: true,
     isIdle: () => true,
@@ -175,6 +177,216 @@ async function loaderFixture(
     },
   };
 }
+
+const loginFixtureKey = "synthetic-typesafe-login-not-a-secret";
+const envFixtureKey = "synthetic-typesafe-env-not-a-secret";
+
+async function jevAuthFixture(
+  options: {
+    loginKey?: string;
+    envKey?: string;
+    fallback?: AutoConfig["fallback"];
+    configureKeys?: (auth: AuthStorage) => void;
+  } = {},
+) {
+  const authDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-auto-auth-smoke-"));
+  const originalEnvKey = process.env.TYPESAFE_API_KEY;
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
+  let auth: AuthStorage | undefined;
+  let closeFixture: (() => Promise<void>) | undefined;
+  let fallbacks = 0;
+  const close = async () => {
+    try {
+      await closeFixture?.();
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (originalEnvKey === undefined) delete process.env.TYPESAFE_API_KEY;
+      else process.env.TYPESAFE_API_KEY = originalEnvKey;
+      try {
+        auth?.close();
+      } finally {
+        await fs.rm(authDir, { recursive: true, force: true });
+      }
+    }
+  };
+  try {
+    if (options.envKey === undefined) delete process.env.TYPESAFE_API_KEY;
+    else process.env.TYPESAFE_API_KEY = options.envKey;
+    // Preserve Bun's ancillary fetch properties, including non-enumerable ones.
+    globalThis.fetch = Object.defineProperties(
+      (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        requests.push({ url: String(input), init });
+        return new Response(
+          JSON.stringify({
+            model: "jev-latest",
+            answers: {
+              next: {
+                type: "choice",
+                choice: "continue",
+                confidence: 0.99,
+                probabilities: {
+                  continue: 0.97,
+                  replan: 0.01,
+                  needs_user: 0.01,
+                  uncertain: 0.01,
+                },
+              },
+            },
+            usage: { input_tokens: 1, output_tokens: 1 },
+          }),
+        );
+      }) as typeof fetch,
+      Object.getOwnPropertyDescriptors(originalFetch),
+    );
+    auth = await AuthStorage.create(path.join(authDir, "agent.db"));
+    if (options.loginKey !== undefined)
+      await auth.credentials.set("typesafe", {
+        type: "api_key",
+        key: options.loginKey,
+        source: "login",
+      });
+    const settings = Settings.isolated({
+      "memory.backend": "off",
+      "bash.autoBackground.enabled": false,
+    });
+    const registry = new ModelRegistry(auth, path.join(authDir, "models.yml"), { settings });
+    // ModelRegistry installs the host resolver; inject faults only after that.
+    options.configureKeys?.(auth);
+    const fixture = await loaderFixture(
+      { maxSteps: 2, decisionTimeoutMs: 500, fallback: options.fallback ?? "architect" },
+      {
+        modelRegistry: registry,
+        dependencies: {
+          // Remove the loader fixture's decision override, not the production provider.
+          decision: undefined,
+          fallback: () => async () => {
+            fallbacks++;
+            throw new Error("Unexpected authentication fallback");
+          },
+        },
+      },
+    );
+    closeFixture = fixture.close;
+    return { ...fixture, requests, fallbacks: () => fallbacks, close };
+  } catch (error) {
+    await close();
+    throw error;
+  }
+}
+
+interface JevAuthCase {
+  scenario: string;
+  loginKey?: string;
+  envKey?: string;
+  expectedKey: string;
+}
+
+const jevAuthCases: JevAuthCase[] = [
+  {
+    scenario: "uses an OMP /login TypeSafe key with TYPESAFE_API_KEY unset",
+    loginKey: loginFixtureKey,
+    expectedKey: loginFixtureKey,
+  },
+  {
+    scenario: "prefers the OMP /login TypeSafe key over TYPESAFE_API_KEY",
+    loginKey: loginFixtureKey,
+    envKey: envFixtureKey,
+    expectedKey: loginFixtureKey,
+  },
+  {
+    scenario: "retains TYPESAFE_API_KEY-only compatibility",
+    envKey: envFixtureKey,
+    expectedKey: envFixtureKey,
+  },
+];
+
+test.each(jevAuthCases)("real loader default Jev $scenario", async (testCase) => {
+  const fixture = await jevAuthFixture(testCase);
+  try {
+    expect(process.env.TYPESAFE_API_KEY).toBe(testCase.envKey);
+    await fixture.start();
+    const continuation = (await fixture.stop()) as {
+      continue: boolean;
+      additionalContext: string;
+    };
+    expect(continuation).toMatchObject({ continue: true });
+    expect(fixture.requests).toHaveLength(1);
+    const request = fixture.requests[0]!;
+    expect(request.url).toBe("https://api.typesafe.ai/v1/systemone");
+    expect(new Headers(request.init?.headers).get("Authorization")).toBe(
+      `Bearer ${testCase.expectedKey}`,
+    );
+    const status = await fixture.status();
+    expect(status).toMatchObject({
+      status: "running",
+      decisions: 1,
+      completionVerified: false,
+    });
+    expect(fixture.fallbacks()).toBe(0);
+    const visible = JSON.stringify({ status, continuation, messages: fixture.messages });
+    expect(visible).not.toContain(loginFixtureKey);
+    expect(visible).not.toContain(envFixtureKey);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("real loader default Jev fails closed without TypeSafe credentials or network", async () => {
+  const fixture = await jevAuthFixture({ fallback: "stop" });
+  try {
+    await fixture.start();
+    expect(await fixture.stop()).toBeUndefined();
+    const status = await fixture.status();
+    expect(status).toMatchObject({
+      status: "uncertain",
+      decisions: 1,
+      completionVerified: false,
+    });
+    expect(await fixture.stop()).toBeUndefined();
+    expect(fixture.requests).toHaveLength(0);
+    expect(fixture.fallbacks()).toBe(0);
+    expect(fixture.bootstraps).toHaveLength(1);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("real loader default Jev fails closed when OMP key resolution rejects without leaking keys", async () => {
+  const resolvedKeys: string[] = [];
+  const fixture = await jevAuthFixture({
+    loginKey: loginFixtureKey,
+    envKey: envFixtureKey,
+    fallback: "stop",
+    configureKeys(auth) {
+      auth.keys.setResolver(async (key) => {
+        resolvedKeys.push(key);
+        throw new Error(`Resolver rejected ${key} while ${envFixtureKey} was set`);
+      });
+    },
+  });
+  try {
+    await fixture.start();
+    expect(await fixture.stop()).toBeUndefined();
+    const status = await fixture.status();
+    expect(status).toMatchObject({
+      status: "uncertain",
+      decisions: 1,
+      completionVerified: false,
+    });
+    expect(resolvedKeys).toEqual([loginFixtureKey]);
+    expect(await fixture.stop()).toBeUndefined();
+    expect(fixture.requests).toHaveLength(0);
+    expect(fixture.fallbacks()).toBe(0);
+    expect(fixture.bootstraps).toHaveLength(1);
+    const visible = JSON.stringify({ status, messages: fixture.messages });
+    expect(visible).not.toContain(loginFixtureKey);
+    expect(visible).not.toContain(envFixtureKey);
+    expect(visible).not.toContain("Resolver rejected");
+  } finally {
+    await fixture.close();
+  }
+});
 
 test("real loader stops Auto at its turn cap without another decision or retry", async () => {
   const fixture = await loaderFixture({ maxSteps: 1 });

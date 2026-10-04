@@ -491,11 +491,14 @@ export function createAutoController(
         }
         const primary =
           dependencies.decision?.(config, ctx) ??
-          createJevProvider({
-            model: "jev-latest",
-            timeoutMs: config.decisionTimeoutMs,
-            maxEvidenceChars: config.maxEvidenceChars,
-          });
+          createJevProvider(
+            {
+              model: "jev-latest",
+              timeoutMs: config.decisionTimeoutMs,
+              maxEvidenceChars: config.maxEvidenceChars,
+            },
+            { readApiKey: () => ctx.modelRegistry.authStorage.keys.get("typesafe") },
+          );
         const fallback =
           dependencies.fallback?.(config, ctx) ??
           createDecisionFallback(pi, ctx, architect.config, config);

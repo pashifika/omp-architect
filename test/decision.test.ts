@@ -1,4 +1,5 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
+import { setImmediate as nextTurn } from "node:timers/promises";
 import {
   buildJevRequest,
   createJevProvider,
@@ -257,6 +258,172 @@ describe("Jev transport", () => {
     expect(keyReads).toBe(1);
     expect(requests).toBe(1);
   });
+  test("awaits credentials at invocation before authenticating the request", async () => {
+    const { promise: credential, resolve: resolveKey } = Promise.withResolvers<string>();
+    let keyReads = 0;
+    let requests = 0;
+    const run = createJevProvider(options, {
+      readApiKey: () => {
+        keyReads++;
+        return credential;
+      },
+      fetch: async (_, init) => {
+        requests++;
+        expect(new Headers(init.headers).get("authorization")).toBe(`Bearer ${fakeKey}`);
+        return jsonResponse();
+      },
+    });
+    expect(keyReads).toBe(0);
+    const pending = run(evidence, new AbortController().signal);
+    expect(keyReads).toBe(1);
+    expect(requests).toBe(0);
+    resolveKey(fakeKey);
+    expect(await pending).toEqual({ choice: "continue", confidence: 0.94 });
+    expect(requests).toBe(1);
+  });
+  interface CredentialFailureCase {
+    readonly scenario: string;
+    readonly readApiKey: NonNullable<JevDependencies["readApiKey"]>;
+    readonly code: "JEV_MISSING_API_KEY" | "JEV_INVALID_API_KEY";
+  }
+  const credentialFailures: CredentialFailureCase[] = [
+    {
+      scenario: "an async missing credential fails before fetch",
+      readApiKey: async () => undefined,
+      code: "JEV_MISSING_API_KEY",
+    },
+    {
+      scenario: "an async empty credential fails before fetch",
+      readApiKey: async () => "",
+      code: "JEV_MISSING_API_KEY",
+    },
+    {
+      scenario: "an async credential containing header injection fails before fetch",
+      readApiKey: async () => `${fakeKey}\r\ninjected`,
+      code: "JEV_INVALID_API_KEY",
+    },
+    {
+      scenario: "an async oversized credential fails before fetch",
+      readApiKey: async () => "x".repeat(4097),
+      code: "JEV_INVALID_API_KEY",
+    },
+    {
+      scenario: "an async credential rejection is sanitized before fetch",
+      readApiKey: async () => {
+        throw new Error(`${fakeKey}: ${evidence.summary}`);
+      },
+      code: "JEV_MISSING_API_KEY",
+    },
+    {
+      scenario: "a synchronous credential exception is sanitized before fetch",
+      readApiKey: () => {
+        throw new Error(`${fakeKey}: ${evidence.summary}`);
+      },
+      code: "JEV_MISSING_API_KEY",
+    },
+  ];
+  test.each(credentialFailures)("$scenario", async ({ readApiKey, code }) => {
+    let requests = 0;
+    const run = createJevProvider(options, {
+      readApiKey,
+      fetch: async () => {
+        requests++;
+        return jsonResponse();
+      },
+    });
+    const error = await run(evidence, new AbortController().signal).catch(
+      (error: unknown) => error,
+    );
+    expect(error).toBeInstanceOf(JevError);
+    expect((error as JevError).code).toBe(code);
+    expect((error as Error).message).toBe(code);
+    expect(String(error)).not.toContain(fakeKey);
+    expect(String(error)).not.toContain(evidence.summary);
+    expect(error).not.toHaveProperty("cause");
+    expect(requests).toBe(0);
+  });
+  interface PendingCredentialCase {
+    readonly scenario: string;
+    readonly timeoutMs: number;
+    readonly interrupt: (controller: AbortController) => void;
+    readonly settleLate: (resolve: (key: string) => void, reject: (error: Error) => void) => void;
+    readonly code: "JEV_TIMEOUT" | "JEV_ABORTED";
+  }
+  const pendingCredentials: PendingCredentialCase[] = [
+    {
+      scenario: "credential timeout prevents a later resolved key from sending HTTP",
+      timeoutMs: 10,
+      interrupt: () => vi.advanceTimersByTime(10),
+      settleLate: (resolve) => resolve(fakeKey),
+      code: "JEV_TIMEOUT",
+    },
+    {
+      scenario: "credential timeout consumes a later credential rejection",
+      timeoutMs: 10,
+      interrupt: () => vi.advanceTimersByTime(10),
+      settleLate: (_, reject) => reject(new Error(`${fakeKey}: ${evidence.summary}`)),
+      code: "JEV_TIMEOUT",
+    },
+    {
+      scenario: "caller cancellation prevents a later resolved key from sending HTTP",
+      timeoutMs: 1000,
+      interrupt: (controller) => controller.abort(new Error("private cancellation reason")),
+      settleLate: (resolve) => resolve(fakeKey),
+      code: "JEV_ABORTED",
+    },
+    {
+      scenario: "caller cancellation consumes a later credential rejection",
+      timeoutMs: 1000,
+      interrupt: (controller) => controller.abort(new Error("private cancellation reason")),
+      settleLate: (_, reject) => reject(new Error(`${fakeKey}: ${evidence.summary}`)),
+      code: "JEV_ABORTED",
+    },
+  ];
+  test.each(pendingCredentials)("$scenario", async ({ timeoutMs, interrupt, settleLate, code }) => {
+    const {
+      promise: credential,
+      resolve: resolveKey,
+      reject: rejectKey,
+    } = Promise.withResolvers<string>();
+    let keyReads = 0;
+    let requests = 0;
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    const controller = new AbortController();
+    const run = createJevProvider(
+      { ...options, timeoutMs },
+      {
+        readApiKey: () => {
+          keyReads++;
+          return credential;
+        },
+        fetch: async () => {
+          requests++;
+          return jsonResponse();
+        },
+      },
+    );
+    process.on("unhandledRejection", onUnhandled);
+    vi.useFakeTimers();
+    try {
+      const pending = run(evidence, controller.signal);
+      expect(keyReads).toBe(1);
+      expect(requests).toBe(0);
+      expect(vi.getTimerCount()).toBe(1);
+      interrupt(controller);
+      await expect(pending).rejects.toThrow(code);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(requests).toBe(0);
+      vi.useRealTimers();
+      settleLate(resolveKey, rejectKey);
+      await nextTurn();
+      expect(requests).toBe(0);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+      vi.useRealTimers();
+    }
+  });
   test("missing and invalid synthetic keys fail before fetch", async () => {
     for (const key of [undefined, "", "secret\r\ninjected", "x".repeat(4097)]) {
       let calls = 0;
@@ -343,11 +510,14 @@ describe("Jev transport", () => {
   test("caller cancellation interrupts fetch without exposing its abort reason", async () => {
     const controller = new AbortController();
     let requestSignal: AbortSignal | null | undefined;
+    const { promise: fetching, resolve: startedFetch } = Promise.withResolvers<void>();
     const run = provider(async (_, init) => {
       requestSignal = init.signal;
+      startedFetch();
       return new Promise<Response>(() => {});
     });
     const pending = run(evidence, controller.signal);
+    await fetching;
     controller.abort(new Error("private cancellation reason"));
     await expect(pending).rejects.toThrow("JEV_ABORTED");
     expect(requestSignal?.aborted).toBe(true);

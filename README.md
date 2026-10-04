@@ -64,7 +64,7 @@ configured provider; do not include secrets. These checks do not replace tool ap
 | Install, preview, update, or remove the local plugin | [Installation guide](docs/installation.md) |
 | Choose models and reasoning effort | Native OMP `modelRoles`; [model-role guide](docs/architect.md#one-source-of-truth-for-models-and-reasoning) |
 | Set review rounds, role names, and thresholds | Project `.omp/architect.json`; [review guide](docs/architect.md#bounded-review-rounds) and [sample settings](examples/architect.json) |
-| Enable automatic execution for a prepared Rasen change | [Rasen Auto setup and limits](docs/rasen-auto.md); requires pinned Rasen and `TYPESAFE_API_KEY` |
+| Enable automatic execution for a prepared Rasen change | [Rasen Auto setup and limits](docs/rasen-auto.md); requires pinned Rasen and TypeSafe authentication through OMP `/login` or `TYPESAFE_API_KEY` |
 | Understand tested behavior and reproduce verification | [Verification record](docs/rasen-auto-verification.md) |
 | Develop, run local checks, or submit a pull request | [Contributing](CONTRIBUTING.md) |
 
