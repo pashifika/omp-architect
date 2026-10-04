@@ -1,13 +1,49 @@
 # Contributing
 
 Create a short-lived topic branch from `main` and submit changes through a pull
-request. See [development and verification](README.md#development-and-verification)
-for the pinned toolchain and local checks. Use isolated homes for installer tests;
-never exercise an installer against personal OMP configuration. The installer
-suite uses real native OMP commands, temporary homes, and no model or network
-calls. Its Windows file-symlink refusal tests require permission to create file
-symlinks (for example, Developer Mode); they fail explicitly when unavailable.
-The installer itself uses OMP's directory junctions and needs no such privilege.
+request. Use the pinned toolchain and checks below before submitting.
+
+## Development and verification
+
+Use **Bun 1.3.14** and the locked **OMP 18.5.1** and **TypeScript 5.9.3**
+dependencies from `package.json`.
+
+```bash
+bun install --frozen-lockfile
+bun run check
+bun run check:package
+bun run check:workflows
+bun run test:dev-install
+```
+
+`check` runs formatting, type checking, and unit tests. `check:package` packs,
+inspects, and loads the tarball against the locked OMP host; it does not publish.
+`check:workflows` validates workflow safety and the tracked branch policy.
+
+For the Rasen integration suite, prepare the pinned development build first:
+
+```bash
+bun run prepare:rasen
+bun run test:smoke
+```
+
+The preparation step downloads public upstream source and dependencies into an
+isolated installation. Smoke tests fail rather than skip when that build is absent.
+See [the verification record](docs/rasen-auto-verification.md) for provenance,
+coverage, and recorded results. No model credentials are needed for these suites;
+model responses use deterministic fixtures.
+
+Use isolated homes for installer tests; never exercise an installer against
+personal OMP configuration. The installer suite uses real native OMP commands,
+temporary homes, and no model or network calls. Its Windows file-symlink refusal
+tests require permission to create file symlinks (for example, Developer Mode);
+they fail explicitly when unavailable. The installer itself uses OMP's directory
+junctions and needs no such privilege.
+
+CI runs installer tests on macOS and Windows. Workflows run for pull requests
+and pushes to `main`, using pinned actions, least-privilege permissions,
+nonpersistent checkout credentials, timeouts, and concurrency cancellation.
+No release or publishing workflow or credentials are configured.
 
 ## Required status checks
 
@@ -17,10 +53,10 @@ or merging this file does not change live GitHub repository settings. This follo
 the [mado-pilot file convention](https://github.com/pashifika/mado-pilot/tree/main/.github/rulesets).
 
 The intended policy requires a pull request, resolved review conversations,
-merge commits and the strict, up-to-date `ci` status check. It blocks branch
-deletion and force pushes, with no bypass actors. The approval count is zero to
-allow a solo maintainer to submit their own changes; the JSON is authoritative
-for policy parameters.
+merge commits and a successful `ci` status check. Branches do not need to be
+up to date with the base branch. It blocks branch deletion and force pushes,
+with no bypass actors. The approval count is zero to allow a solo maintainer
+to submit their own changes; the JSON is authoritative for policy parameters.
 
 `ci` is the stable aggregate gate in [CI](.github/workflows/ci.yml). It depends on
 all quality, integration and cross-platform installer jobs, runs even when a

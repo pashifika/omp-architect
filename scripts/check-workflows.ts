@@ -168,11 +168,11 @@ const checks = mapping(
   "main required checks",
 );
 assert(
-  checks.strict_required_status_checks_policy === true &&
+  checks.strict_required_status_checks_policy === false &&
     checks.do_not_enforce_on_create === false &&
     Array.isArray(checks.required_status_checks) &&
     checks.required_status_checks.length === 1 &&
     mapping(checks.required_status_checks[0], "main required check").context === "ci",
-  "main ruleset: require exactly the stable ci gate with strict up-to-date checks",
+  "main ruleset: require exactly the stable ci gate without requiring an up-to-date branch",
 );
 console.log("rulesets: main desired state validated (live GitHub enforcement is not checked)");
