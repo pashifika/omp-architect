@@ -78,6 +78,78 @@ export function routeAgent(agent: string, config: Config): string | undefined {
   return undefined;
 }
 
+const omitted = " [... omitted ...] ";
+function jsonSize(value: unknown, nested = false): number {
+  const json = JSON.stringify(value);
+  return nested ? JSON.stringify(json).length : json.length;
+}
+function boundedText(text: string, limit: number, nested = false): string {
+  if (text.length <= limit && jsonSize(text, nested) <= limit) return text;
+  let result = omitted;
+  let low = 0;
+  let high = Math.min(text.length, limit);
+  while (low <= high) {
+    const retained = Math.floor((low + high) / 2);
+    let start = Math.ceil(retained / 2);
+    let end = text.length - Math.floor(retained / 2);
+    const before = text.charCodeAt(start - 1);
+    const after = text.charCodeAt(end);
+    if (before >= 0xd800 && before <= 0xdbff) start--;
+    if (after >= 0xdc00 && after <= 0xdfff) end++;
+    const candidate = text.slice(0, start) + omitted + text.slice(end);
+    if (jsonSize(candidate, nested) <= limit) {
+      result = candidate;
+      low = retained + 1;
+    } else {
+      high = retained - 1;
+    }
+  }
+  return result;
+}
+function boundedPlan(steps: string[], limit: number): string[] {
+  if (jsonSize(steps) <= limit) return steps;
+  const result: string[] = [];
+  let remaining = limit - jsonSize([omitted]);
+  for (const step of steps) {
+    if (remaining < jsonSize(omitted) + 1) {
+      result.push(omitted);
+      break;
+    }
+    const bounded = boundedText(step, remaining - 1);
+    result.push(bounded);
+    remaining -= jsonSize(bounded) + 1;
+  }
+  return result;
+}
+function boundedEvidence(
+  tool: string,
+  input: Record<string, unknown>,
+  output: string,
+  isError: boolean,
+  limit: number,
+): string {
+  const record = {
+    tool: boundedText(tool, Math.min(100, Math.floor(limit / 8)), true),
+    input,
+    output: "",
+    isError,
+  };
+  const inputText = JSON.stringify(input);
+  const inputLimit = Math.floor(limit / 4);
+  if (inputText.length > inputLimit || jsonSize(inputText) > inputLimit) {
+    const preview = { truncated: true, preview: "" };
+    preview.preview = boundedText(
+      inputText,
+      inputLimit - jsonSize(preview, true) + jsonSize("", true),
+      true,
+    );
+    record.input = preview;
+  }
+  // Include the second JSON encoding: evidence records remain strings in the snapshot.
+  record.output = boundedText(output, limit - jsonSize(record, true) + jsonSize("", true), true);
+  return JSON.stringify(record);
+}
+
 export class Orchestrator {
   revision = 0;
   reviewCount = 0;
@@ -95,6 +167,8 @@ export class Orchestrator {
   #failures = new Map<string, { key: string; count: number }>();
   #cache = new Map<string, Verdict>();
   #inFlight = false;
+  #evidenceChars = 0;
+  #omittedEvidence = 0;
   constructor(readonly config: Config) {}
 
   begin(request: string): void {
@@ -110,6 +184,8 @@ export class Orchestrator {
     this.approvedPlan = "";
     this.blocked = "";
     this.evidence = [];
+    this.#evidenceChars = 0;
+    this.#omittedEvidence = 0;
     this.#seen.clear();
     this.#failures.clear();
     this.#cache.clear();
@@ -134,8 +210,20 @@ export class Orchestrator {
     if (tool === "architect_checkpoint" || this.#seen.has(id)) return false;
     this.#seen.add(id);
     this.invalidate();
-    this.evidence.push(JSON.stringify({ tool, input, output: output.slice(0, 4000), isError }));
-    while (this.evidence.join("\n").length > this.config.maxEvidenceChars) this.evidence.shift();
+    // One record cannot consume the ring or the space reserved for checkpoint context.
+    const entry = boundedEvidence(
+      tool,
+      input,
+      output,
+      isError,
+      Math.floor(this.config.maxEvidenceChars / 3),
+    );
+    this.evidence.push(entry);
+    this.#evidenceChars += jsonSize(entry) + 1;
+    while (this.#evidenceChars > this.config.maxEvidenceChars) {
+      this.#evidenceChars -= jsonSize(this.evidence.shift()!) + 1;
+      this.#omittedEvidence++;
+    }
     if (!isError) {
       this.#failures.delete(tool);
       return false;
@@ -170,18 +258,31 @@ export class Orchestrator {
     }
   }
   snapshot(phase: Phase, summary: string): string {
-    return JSON.stringify(
-      {
-        phase,
-        request: this.request.slice(0, 8000),
-        summary: summary.slice(0, 8000),
-        pendingPlan: this.pendingPlan,
-        pendingRecovery: this.pendingRecovery,
-        recentToolEvidence: this.evidence,
-      },
-      null,
-      2,
-    ).slice(0, this.config.maxEvidenceChars);
+    const snapshot = {
+      phase,
+      request: "",
+      summary: "",
+      pendingPlan: [] as string[],
+      pendingRecovery: this.pendingRecovery,
+      recentToolEvidence: [] as string[],
+      omittedToolEvidence: this.#omittedEvidence + this.evidence.length,
+    };
+    // Reserve at least half the available space for whole, newest-first evidence.
+    const contextLimit = Math.floor((this.config.maxEvidenceChars - jsonSize(snapshot)) / 6);
+    snapshot.request = boundedText(this.request, contextLimit);
+    snapshot.summary = boundedText(summary, contextLimit);
+    snapshot.pendingPlan = boundedPlan(this.pendingPlan, contextLimit);
+    let remaining = this.config.maxEvidenceChars - jsonSize(snapshot);
+    for (let i = this.evidence.length - 1; i >= 0; i--) {
+      const entry = this.evidence[i]!;
+      const size = jsonSize(entry) + (snapshot.recentToolEvidence.length ? 1 : 0);
+      if (size > remaining) break;
+      snapshot.recentToolEvidence.push(entry);
+      snapshot.omittedToolEvidence--;
+      remaining -= size;
+    }
+    snapshot.recentToolEvidence.reverse();
+    return JSON.stringify(snapshot);
   }
   revokeApproval(phase: Phase): void {
     this.#cache.clear();

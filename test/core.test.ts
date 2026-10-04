@@ -13,6 +13,185 @@ function controller() {
   return s;
 }
 
+describe("bounded review evidence", () => {
+  test("the reviewer receives the latest PR result after long context and older logs", async () => {
+    const s = new Orchestrator(parseConfig({}));
+    s.begin("request ".repeat(750));
+    for (let i = 0; i < 6; i++) {
+      s.observe(`old-${i}`, "read", { path: `old-${i}.ts` }, "o".repeat(2600), false);
+    }
+    s.observe("latest", "bash", { command: "gh pr view 5" }, "LATEST_PR_CONFIRMED", false);
+    let received = "";
+    await s.review("completion", "summary ".repeat(1000), async ({ evidence }) => {
+      received = evidence;
+      return approved;
+    });
+
+    expect(received.length).toBeLessThanOrEqual(s.config.maxEvidenceChars);
+    const snapshot = JSON.parse(received);
+    expect(snapshot.phase).toBe("completion");
+    expect(snapshot.pendingRecovery).toBe(false);
+    const records = snapshot.recentToolEvidence.map((entry: string) => JSON.parse(entry));
+    expect(records.at(-1)).toEqual({
+      tool: "bash",
+      input: { command: "gh pr view 5" },
+      output: "LATEST_PR_CONFIRMED",
+      isError: false,
+    });
+  });
+
+  test("oversized input cannot evict its own result or the entire evidence ring", async () => {
+    const s = controller();
+    s.observe("earlier", "bash", { command: "bun test" }, "EARLIER_TESTS_PASSED", false);
+    s.observe(
+      "latest",
+      "write",
+      { path: "large.txt", content: "huge input ".repeat(20000) },
+      "LATEST_WRITE_SUCCEEDED",
+      false,
+    );
+    expect(s.evidence.join("\n").length).toBeLessThanOrEqual(s.config.maxEvidenceChars);
+    expect(s.evidence.map((entry) => JSON.parse(entry).output)).toEqual([
+      "EARLIER_TESTS_PASSED",
+      "LATEST_WRITE_SUCCEEDED",
+    ]);
+    let received = "";
+    await s.review("completion", "Check both actual tool results", async ({ evidence }) => {
+      received = evidence;
+      return approved;
+    });
+
+    const records = JSON.parse(received).recentToolEvidence.map((entry: string) =>
+      JSON.parse(entry),
+    );
+    expect(records.map((record: { output: string }) => record.output)).toEqual([
+      "EARLIER_TESTS_PASSED",
+      "LATEST_WRITE_SUCCEEDED",
+    ]);
+    expect(records[1].input).not.toEqual({
+      path: "large.txt",
+      content: "huge input ".repeat(20000),
+    });
+    expect(JSON.stringify(records[1].input)).toMatch(/omitted|truncated/i);
+    expect(received.length).toBeLessThanOrEqual(s.config.maxEvidenceChars);
+  });
+
+  test("older whole records are omitted explicitly while retained records stay chronological", async () => {
+    const s = new Orchestrator(parseConfig({ maxEvidenceChars: 1000 }));
+    s.begin("Check recent tool results");
+    for (let i = 0; i < 30; i++) {
+      s.observe(`read-${i}`, "read", { index: i }, `result-${i}\n${"log ".repeat(100)}`, false);
+    }
+    let received = "";
+    await s.review("completion", "Review the latest result", async ({ evidence }) => {
+      received = evidence;
+      return approved;
+    });
+
+    const snapshot = JSON.parse(received);
+    const records = snapshot.recentToolEvidence.map((entry: string) => JSON.parse(entry));
+    const indexes: number[] = records.map(
+      (record: { input: { index: number } }) => record.input.index,
+    );
+    expect(indexes.at(-1)).toBe(29);
+    expect(indexes).toEqual([...indexes].sort((a, b) => a - b));
+    expect(snapshot.omittedToolEvidence).toBe(30 - records.length);
+    expect(snapshot.omittedToolEvidence).toBeGreaterThan(0);
+    expect(received.length).toBeLessThanOrEqual(s.config.maxEvidenceChars);
+  });
+
+  test("long tool output retains its opening and terminal status with explicit loss", async () => {
+    const s = controller();
+    const output = `TEST_SUITE_STARTED\n${"intermediate log\n".repeat(2000)}TESTS_PASSED_EXIT_0`;
+    s.observe("tests", "bash", { command: "bun test" }, output, false);
+    let received = "";
+    await s.review("completion", "Verify the observed test exit", async ({ evidence }) => {
+      received = evidence;
+      return approved;
+    });
+
+    const [record] = JSON.parse(received).recentToolEvidence.map((entry: string) =>
+      JSON.parse(entry),
+    );
+    expect(record.input).toEqual({ command: "bun test" });
+    expect(record.output.startsWith("TEST_SUITE_STARTED\n")).toBe(true);
+    expect(record.output.endsWith("TESTS_PASSED_EXIT_0")).toBe(true);
+    expect(record.output).toMatch(/omitted|truncated/i);
+    expect(record.output.length).toBeLessThan(output.length);
+    expect(record.isError).toBe(false);
+  });
+
+  test.each([
+    1000, 24000, 100000,
+  ])("budget %p bounds escaped JSON while preserving phase, recovery and latest output", async (maxEvidenceChars) => {
+    const s = new Orchestrator(parseConfig({ maxEvidenceChars }));
+    const noise = '"\\\n\t\u0000🧪'.repeat(20000);
+    s.begin(`REQUEST_START ${noise} REQUEST_END`);
+    s.setPendingPlan([
+      `STEP_0 ${noise}`,
+      ...Array.from({ length: 100 }, (_, i) => `STEP_${i + 1}`),
+    ]);
+    s.observe("failure-1", "bash", {}, "same failure", true);
+    s.observe("failure-2", "bash", {}, "same failure", true);
+    s.observe(
+      "latest",
+      "bash",
+      { command: "bun test" },
+      `LOG_START\n${noise}\nLATEST_TEST_EXIT_0`,
+      false,
+    );
+    let received = "";
+    await s.review("recovery", `SUMMARY_START ${noise} SUMMARY_END`, async ({ evidence }) => {
+      received = evidence;
+      return approved;
+    });
+
+    expect(received.length).toBeLessThanOrEqual(maxEvidenceChars);
+    expect(s.evidence.join("\n").length).toBeLessThanOrEqual(maxEvidenceChars);
+    const snapshot = JSON.parse(received);
+    expect(snapshot.phase).toBe("recovery");
+    expect(snapshot.pendingRecovery).toBe(true);
+    expect(snapshot.request).toContain("REQUEST_START");
+    expect(snapshot.summary).toContain("SUMMARY_START");
+    expect(snapshot.request).toMatch(/omitted|truncated/i);
+    expect(snapshot.summary).toMatch(/omitted|truncated/i);
+    expect(snapshot.pendingPlan.length).toBeGreaterThan(0);
+    expect(JSON.stringify(snapshot.pendingPlan)).toMatch(/omitted|truncated/i);
+    const records = snapshot.recentToolEvidence.map((entry: string) => JSON.parse(entry));
+    expect(records.at(-1).input).toEqual({ command: "bun test" });
+    expect(records.at(-1).output.startsWith("LOG_START\n")).toBe(true);
+    expect(records.at(-1).output.endsWith("\nLATEST_TEST_EXIT_0")).toBe(true);
+    expect(records.at(-1).output).toMatch(/omitted|truncated/i);
+    expect(records.at(-1).isError).toBe(false);
+  });
+
+  test("short context, plan and structured input reach the reviewer unchanged", async () => {
+    const s = controller();
+    const steps = ["inspect", "fix", "verify"];
+    const input = { command: "printf", args: ['"\\\n\u0000🧪'], metadata: { ok: true } };
+    s.setPendingPlan(steps);
+    s.observe("short", "bash", input, "passed\n", false);
+    let received = "";
+    await s.review("plan", "Review these exact steps", async ({ evidence }) => {
+      received = evidence;
+      return approved;
+    });
+
+    const snapshot = JSON.parse(received);
+    expect(snapshot.request).toBe("Implement the requested fix");
+    expect(snapshot.summary).toBe("Review these exact steps");
+    expect(snapshot.pendingPlan).toEqual(steps);
+    expect(snapshot.pendingRecovery).toBe(false);
+    expect(snapshot.recentToolEvidence).toHaveLength(1);
+    expect(JSON.parse(snapshot.recentToolEvidence[0])).toEqual({
+      tool: "bash",
+      input,
+      output: "passed\n",
+      isError: false,
+    });
+  });
+});
+
 describe("role routing and configuration", () => {
   test("custom role names route only package workers, preserving explicit other agents", () => {
     const config = parseConfig({ roles: { implementation: "builder", research: "fast" } });

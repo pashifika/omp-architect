@@ -15,9 +15,11 @@ import {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { TodoTool } from "@oh-my-pi/pi-coding-agent/tools/todo";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import type { XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
+import type { ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
 import type { TodoPhase, TodoToolDetails } from "@oh-my-pi/pi-tui/tools/todo";
 import type { WriteToolDetails } from "@oh-my-pi/pi-tui/tools/write";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
@@ -128,7 +130,11 @@ test("ordinary Architect preserves minimum rounds across host before_agent_start
   }
 });
 
-async function xdCheckpointFixture(reviews?: { min: number; max: number }, reviewer?: Reviewer) {
+async function xdCheckpointFixture(
+  reviews?: { min: number; max: number },
+  reviewer?: Reviewer,
+  initialPrompt = "Implement the isolated fixture plan",
+) {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-architect-xd-"));
   try {
     if (reviews)
@@ -228,6 +234,10 @@ async function xdCheckpointFixture(reviews?: { min: number; max: number }, revie
         phases = next;
       },
     } as unknown as ToolSession;
+    const read = new ExtensionToolWrapper<ReadTool["parameters"], ReadToolDetails>(
+      new ReadTool(session),
+      runner,
+    );
     const write = new ExtensionToolWrapper<WriteTool["parameters"], WriteToolDetails>(
       new WriteTool(session),
       runner,
@@ -237,7 +247,7 @@ async function xdCheckpointFixture(reviews?: { min: number; max: number }, revie
       runner,
     );
     await runner.emit({ type: "session_start" });
-    await runner.emitBeforeAgentStart("Implement the isolated fixture plan", undefined, []);
+    await runner.emitBeforeAgentStart(initialPrompt, undefined, []);
     expect(errors).toEqual([]);
     return {
       cwd,
@@ -250,6 +260,7 @@ async function xdCheckpointFixture(reviews?: { min: number; max: number }, revie
       before: (prompt: string) => runner.emitBeforeAgentStart(prompt, undefined, []),
       input: (text: string) => runner.emitInput(text, undefined, "interactive"),
       write,
+      read,
       todo,
       phases: () => phases,
       stop: (signal = new AbortController().signal) =>
@@ -401,6 +412,164 @@ test("xd completion approval survives its outer write result but fresh filesyste
         output: expect.stringContaining("Successfully wrote"),
       }),
     );
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("xd completion reviews the newest actual write despite oversized input and accumulated evidence", async () => {
+  const steps = ["Write prior evidence", "Write the current result", "Review filesystem evidence"];
+  const latestContent = 'Current result: "verified" \\ \t日本語\n'.repeat(1_500);
+  let latestPath = "";
+  let latestOutput = "";
+  const fixture = await xdCheckpointFixture(
+    { min: 1, max: 2 },
+    async (request) => {
+      expect(request.evidence.length).toBeLessThanOrEqual(24_000);
+      const snapshot = JSON.parse(request.evidence);
+      const records = snapshot.recentToolEvidence.map((entry: string) => JSON.parse(entry));
+      if (request.phase === "plan") {
+        expect(snapshot.pendingPlan).toEqual(steps);
+      } else {
+        expect(request.phase).toBe("completion");
+        expect(await fs.readFile(latestPath, "utf8")).toBe(latestContent);
+        expect(latestOutput).toContain(
+          `Successfully wrote ${Buffer.byteLength(latestContent, "utf8")} bytes`,
+        );
+        expect(latestOutput).toContain(path.basename(latestPath));
+        expect(records.at(-1)).toMatchObject({
+          tool: "write",
+          isError: false,
+          output: latestOutput,
+        });
+      }
+      return { decision: "approve", summary: "Actual filesystem evidence retained", issues: [] };
+    },
+    "Implement and verify the current filesystem result. ".repeat(200),
+  );
+  try {
+    await expect(
+      fixture.todo.execute("stage-evidence-plan", { op: "init", items: steps }),
+    ).rejects.toThrow("Substantial plan");
+    await expect(
+      fixture.write.execute("approve-evidence-plan", {
+        path: "xd://architect_checkpoint",
+        content: JSON.stringify({ phase: "plan", summary: "Review the staged evidence plan" }),
+      }),
+    ).resolves.toMatchObject({
+      isError: false,
+      details: { xdev: { inner: { decision: "approve" } } },
+    });
+    const recorded = await fixture.todo.execute("record-evidence-plan", {
+      op: "init",
+      items: steps,
+    });
+    expect(recorded.isError).not.toBe(true);
+    for (let index = 0; index < 6; index++) {
+      const result = await fixture.write.execute(`prior-evidence-${index}`, {
+        path: path.join(fixture.cwd, `prior-${index}.txt`),
+        content: `Prior filesystem evidence ${index}\n${"old data ".repeat(350)}`,
+      });
+      expect(result.isError).not.toBe(true);
+    }
+    latestPath = path.join(fixture.cwd, "latest-confirmed-result.txt");
+    const latest = await fixture.write.execute("latest-filesystem-evidence", {
+      path: latestPath,
+      content: latestContent,
+    });
+    expect(latest.isError).not.toBe(true);
+    latestOutput = latest.content
+      .filter((part) => part.type === "text")
+      .map((part) => part.text)
+      .join("\n");
+    expect(await fs.readFile(latestPath, "utf8")).toBe(latestContent);
+    await expect(
+      fixture.write.execute("review-latest-filesystem-evidence", {
+        path: "xd://architect_checkpoint",
+        content: JSON.stringify({
+          phase: "completion",
+          summary:
+            "Review the current successful filesystem write and its observed result. ".repeat(100),
+        }),
+      }),
+    ).resolves.toMatchObject({
+      isError: false,
+      details: { xdev: { tool: "architect_checkpoint", inner: { decision: "approve" } } },
+    });
+    expect(fixture.requests.map((request) => request.phase)).toEqual(["plan", "completion"]);
+    expect(await fixture.stop()).toBeUndefined();
+    expect(fixture.requests).toHaveLength(2);
+    expect(fixture.aborts()).toBe(0);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("xd completion retains the beginning and final status of a real SDK read result", async () => {
+  const report = [
+    "Filesystem verification report: current-result",
+    ...Array.from({ length: 100 }, (_, index) => `Checked item ${index}: ${"detail ".repeat(15)}`),
+    "Final filesystem verification status: PASS current-result",
+  ].join("\n");
+  let reportPath = "";
+  let observedOutput = "";
+  const fixture = await xdCheckpointFixture({ min: 1, max: 1 }, async (request) => {
+    expect(request.phase).toBe("completion");
+    expect(request.evidence.length).toBeLessThanOrEqual(24_000);
+    const snapshot = JSON.parse(request.evidence);
+    const records = snapshot.recentToolEvidence.map((entry: string) => JSON.parse(entry));
+    const latest = records.at(-1);
+    expect(latest).toMatchObject({
+      tool: "read",
+      input: { path: `${reportPath}:raw` },
+      isError: false,
+    });
+    expect(await fs.readFile(reportPath, "utf8")).toBe(report);
+    expect(latest.output.startsWith(observedOutput.slice(0, 128))).toBe(true);
+    expect(latest.output.endsWith(observedOutput.slice(-128))).toBe(true);
+    expect(latest.output).toContain("Final filesystem verification status: PASS current-result");
+    expect(latest.output.length).toBeLessThan(observedOutput.length);
+    expect(latest.output).toMatch(/omitt|truncat/i);
+    return {
+      decision: "approve",
+      summary: "Actual read result retains its final status",
+      issues: [],
+    };
+  });
+  try {
+    reportPath = path.join(fixture.cwd, "verification-report.txt");
+    const written = await fixture.write.execute("write-verification-report", {
+      path: reportPath,
+      content: report,
+    });
+    expect(written.isError).not.toBe(true);
+    const read = await fixture.read.execute("read-verification-report", {
+      path: `${reportPath}:raw`,
+    });
+    expect(read.isError).not.toBe(true);
+    observedOutput = read.content
+      .filter((part) => part.type === "text")
+      .map((part) => part.text)
+      .join("\n");
+    expect(observedOutput.length).toBeGreaterThan(8_000);
+    expect(observedOutput).toContain("Filesystem verification report: current-result");
+    expect(observedOutput).toContain("Final filesystem verification status: PASS current-result");
+    await expect(
+      fixture.write.execute("review-final-read-status", {
+        path: "xd://architect_checkpoint",
+        content: JSON.stringify({
+          phase: "completion",
+          summary: "Review the actual report including its final verification status",
+        }),
+      }),
+    ).resolves.toMatchObject({
+      isError: false,
+      details: { xdev: { tool: "architect_checkpoint", inner: { decision: "approve" } } },
+    });
+    expect(fixture.requests).toHaveLength(1);
+    expect(await fixture.stop()).toBeUndefined();
+    expect(fixture.requests).toHaveLength(1);
+    expect(fixture.aborts()).toBe(0);
   } finally {
     await fixture.close();
   }
