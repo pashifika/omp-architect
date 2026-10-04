@@ -373,7 +373,9 @@ test("native bash timing footers do not hide repeated command errors", () => {
 test("min counts real review-fix rounds, phases share bounds but not allowances", async () => {
   const s = new Orchestrator(parseConfig({ reviews: { min: 2, max: 2 } }));
   s.begin("work");
+  s.setPendingPlan(["inspect", "fix", "test"]);
   await s.review("plan", "plan", async () => approved);
+  await s.review("plan", "independent plan review", async () => approved);
   await s.review("completion", "first", async () => ({
     decision: "revise",
     summary: "Fix this",
@@ -382,7 +384,7 @@ test("min counts real review-fix rounds, phases share bounds but not allowances"
   s.observe("edit", "edit", {}, "fixed", false);
   await s.review("completion", "fixed and verified", async () => approved);
   expect(s.completionApproved).toBe(true);
-  expect(s.reviewCount).toBe(3);
+  expect(s.reviewCount).toBe(4);
   expect(s.phaseReviews.completion).toBe(2);
 });
 test("min>1 uses an independent current-state review and cannot count a cached approval", async () => {
@@ -451,4 +453,94 @@ test("a cancelled plan re-review cannot reuse its revoked cached approval", asyn
   await s.review("plan", "plan", reviewer);
   expect(calls).toBe(2);
   expect(s.gate("bash", {})).toBeUndefined();
+});
+
+describe("canonical plan recovery and admission evidence", () => {
+  const steps = ["Inspect context", "Implement fix", "Verify behavior"];
+  test.each(
+    [
+      ["Inspect context.", "Implement fix", "Verify behavior"],
+      ["Inspect context ", "Implement fix", "Verify behavior"],
+      ["Verify behavior", "Implement fix", "Inspect context"],
+      ["Inspect context", "Implement fix", "Verify behavior", "Document result"],
+      ["Inspect context", "Verify behavior"],
+    ].map((changed) => ({ changed })),
+  )("changed todo remains exact-match gated and can restore approved steps: %p", async ({
+    changed,
+  }) => {
+    const s = controller();
+    s.setPendingPlan(steps);
+    await s.review("plan", "Review exact steps", async () => approved);
+    const canonical = s.planStatus().approved!;
+    expect(canonical.steps).toEqual(steps);
+    const denial = s.gate("todo", { op: "init", items: changed });
+    expect(denial).toMatch(/Step (?:\d+|count) differs/);
+    expect(denial).toContain(canonical.id);
+    expect(s.planStatus().pending!.id).not.toBe(canonical.id);
+    expect(s.planStatus().approved).toEqual(canonical);
+    for (const tool of ["write", "bash", "graph_project_list", "report_issue"])
+      expect(s.gate(tool, {})).toContain("not approved");
+    expect(s.gate("todo", { op: "init", items: canonical.steps })).toBeUndefined();
+    expect(s.planApproved).toBe(true);
+    expect(s.gate("write", {})).toBeUndefined();
+    expect(s.reviewCount).toBe(1);
+  });
+  test.each([
+    { steps: [] },
+    { steps: [" ", "\t"] },
+  ])("empty or blank plans cannot consume or approve a review: %p", async ({ steps }) => {
+    const s = controller();
+    s.setPendingPlan([...steps]);
+    let calls = 0;
+    const verdict = await s.review("plan", "Only prose", async () => {
+      calls++;
+      return approved;
+    });
+    expect(verdict.decision).toBe("blocked");
+    expect(verdict.summary).toContain("non-empty steps");
+    expect(calls).toBe(0);
+    expect(s.reviewCount).toBe(0);
+    expect(s.approvedPlan).toBe("");
+  });
+  test.each([
+    1000, 24000,
+  ])("gate denials stay bounded and separate from executed error streaks (%p)", (maxEvidenceChars) => {
+    const s = new Orchestrator(parseConfig({ maxEvidenceChars }));
+    s.begin("Inspect failures");
+    s.observe("error-1", "bash", {}, "same execution failure", true);
+    for (let i = 0; i < 20; i++) {
+      s.deny(
+        `denied-${i}`,
+        "bash",
+        { command: '\"\\\n'.repeat(10000) },
+        "DENIAL_START " + '\"\\\n'.repeat(10000) + " DENIAL_END",
+      );
+      s.deny(`denied-${i}`, "bash", {}, "duplicate");
+      s.observe(`denied-${i}`, "bash", {}, "same execution failure", true);
+    }
+    expect(s.pendingRecovery).toBe(false);
+    const snapshotText = s.snapshot("recovery", "Review admissions");
+    expect(snapshotText.length).toBeLessThanOrEqual(maxEvidenceChars);
+    const snapshot = JSON.parse(snapshotText);
+    const records = snapshot.recentToolEvidence.map((entry: string) => JSON.parse(entry));
+    expect(records.at(-1)).toMatchObject({ kind: "gate_denial", executed: false, isError: true });
+    expect(records.at(-1).output).toContain("DENIAL_START");
+    expect(records.at(-1).output).toContain("DENIAL_END");
+    expect(snapshot.omittedToolEvidence).toBe(21 - records.length);
+    // Admission failures neither advance nor clear the actual execution-error streak.
+    expect(s.observe("error-2", "bash", {}, "same execution failure", true)).toBe(true);
+  });
+  test("new denied evidence makes an in-flight review stale", async () => {
+    const s = controller();
+    s.setPendingPlan(steps);
+    const deferred = Promise.withResolvers<Verdict>();
+    const pending = s.review("plan", "Review before denied attempt", async () => deferred.promise);
+    s.deny("blocked-write", "write", {}, s.gate("write", {})!);
+    deferred.resolve(approved);
+    expect((await pending).summary).toContain("stale");
+    expect(s.planApproved).toBe(false);
+    expect(s.terminalReason).toBeUndefined();
+    await s.review("plan", "Include the denied attempt", async () => approved);
+    expect(s.planApproved).toBe(true);
+  });
 });
