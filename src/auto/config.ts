@@ -16,7 +16,8 @@ export interface AutoConfig {
 }
 
 export const autoDefaults: AutoConfig = {
-  enabled: false,
+  // Allows an explicit, confirmed /auto start; never starts or resumes a run itself.
+  enabled: true,
   // OMP 18.5.1 itself caps hidden session-stop continuations at eight.
   maxSteps: 8,
   maxToolCalls: 80,
