@@ -12,6 +12,7 @@ import {
   realpath,
   rm,
   symlink,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -865,5 +866,89 @@ describe("development installer against the pinned native OMP host", () => {
     await absent(path.join(uncheckedRoot, "plugins"));
     await absent(path.join(otherAgent, "plugins"));
     await unchanged(protectedFiles);
+  }, 30_000);
+
+  test.each([
+    "dry run",
+    "configuration refusal",
+  ])("%s leaves stale native-cache versions and sentinel bytes untouched", async (mode) => {
+    const f = await fixture();
+    const stale = path.join(f.home, ".omp", "natives", "1.0.0");
+    const sentinel = path.join(stale, "owned-sentinel.bin");
+    const content = Buffer.from([0, 1, 2, 127, 128, 254, 255]);
+    await mkdir(stale, { recursive: true });
+    await writeFile(sentinel, content);
+    // Native loader garbage collection removes old version directories during
+    // import. A fixed old mtime makes this regression independent of wall time.
+    const oldTime = new Date("2000-01-01T00:00:00.000Z");
+    await utimes(sentinel, oldTime, oldTime);
+    await utimes(stale, oldTime, oldTime);
+    const originalMtime = (await lstat(stale)).mtimeMs;
+    if (mode === "configuration refusal") {
+      await put(f.lock, "{ malformed config");
+      await rejectedWithoutWrites(f, /Cannot safely read/);
+    } else {
+      const before = await snapshot(f.base);
+      succeeded(install(f, "--dry-run"));
+      expect(await snapshot(f.base)).toEqual(before);
+    }
+    expect(await readFile(sentinel)).toEqual(content);
+    expect((await lstat(stale)).mtimeMs).toBe(originalMtime);
+    await absent(f.link);
+  });
+
+  test.each([
+    { label: "launch environment", launch: true, first: 0, selected: ".from-launch" },
+    { label: "project OMP alias", launch: false, first: 0, selected: ".from-project" },
+    { label: "agent dotenv", launch: false, first: 1, selected: ".from-agent" },
+    { label: "config dotenv", launch: false, first: 2, selected: ".from-config" },
+    { label: "home dotenv", launch: false, first: 3, selected: ".from-home" },
+  ])("read-only dotenv bootstrap matches native precedence for $label", async ({
+    launch,
+    first,
+    selected,
+  }) => {
+    const f = await fixture(launch ? { configDir: ".from-launch" } : {});
+    const sources = [
+      [
+        path.join(f.checkout, ".env"),
+        "PI_CONFIG_DIR=.wrong-project-alias\nOMP_CONFIG_DIR=.from-project\n",
+      ],
+      [path.join(f.agent, ".env"), "PI_CONFIG_DIR=.from-agent\n"],
+      [path.join(f.configRoot, ".env"), "PI_CONFIG_DIR=.from-config\n"],
+      [path.join(f.home, ".env"), "PI_CONFIG_DIR=.from-home\n"],
+    ];
+    for (const [file, content] of sources.slice(first)) await put(file!, content!);
+    const protectedFiles = await sentinels(f);
+    const before = await snapshot(f.base);
+    const dry = install(f, "--dry-run");
+    succeeded(dry);
+    const selectedRoot = path.join(f.home, selected);
+    expect(dry.output).toContain(path.join(selectedRoot, "plugins"));
+    expect(await snapshot(f.base)).toEqual(before);
+    succeeded(install(f));
+    expect(await realpath(path.join(selectedRoot, "plugins", "node_modules", name))).toBe(
+      await realpath(f.checkout),
+    );
+    expect(
+      (await readJson(path.join(selectedRoot, "plugins", "omp-plugins.lock.json"))).plugins[name],
+    ).toEqual(pluginState());
+    expect(
+      (await readJson(path.join(selectedRoot, "marketplaces.json"))).marketplaces[0].name,
+    ).toBe(name);
+    for (const ignored of [
+      ".omp",
+      ".from-launch",
+      ".wrong-project-alias",
+      ".from-project",
+      ".from-agent",
+      ".from-config",
+      ".from-home",
+    ]) {
+      if (ignored !== selected) await absent(path.join(f.home, ignored, "plugins"));
+    }
+    await unchanged(protectedFiles);
+    for (const [file, content] of sources.slice(first))
+      expect(await readFile(file!, "utf8")).toBe(content!);
   }, 30_000);
 });

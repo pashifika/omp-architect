@@ -1,10 +1,11 @@
 #!/usr/bin/env bun
 /** Checkout installation only. Native OMP owns every registry write. */
 import { spawnSync } from "node:child_process";
-import { lstat, readFile, realpath } from "node:fs/promises";
+import { lstat, readFile, realpath, stat as followStat } from "node:fs/promises";
+import { homedir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { isDeepStrictEqual } from "node:util";
+import { isDeepStrictEqual, parseEnv } from "node:util";
 
 const NAME = "omp-architect";
 const root = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -53,6 +54,88 @@ function objectField(doc: Mapping, key: string, context: string): Mapping {
   return doc[key] === undefined ? {} : mapping(doc[key], `${context}: ${key}`);
 }
 
+type HostDirs = typeof import("@oh-my-pi/pi-utils/dirs");
+
+/**
+ * Read-only counterpart of pinned OMP 18.5.1's env bootstrap. Importing its env
+ * module calls getProjectDir, which stages a native addon on Windows. Its main
+ * discovery module also loads that addon and can delete old native caches on
+ * any platform. Neither side effect belongs in a preflight or dry run.
+ *
+ * Keep native profile/XDG resolution; mirror only the small dotenv merge here.
+ * Read all four original locations before applying anything (no second pass).
+ */
+async function loadEnvironment(dirs: HostDirs, checkout: string): Promise<void> {
+  const files = await Promise.all(
+    [checkout, dirs.getAgentDir(), dirs.getConfigRootDir(), homedir()].map(async (directory) => {
+      try {
+        const parsed = parseEnv(await readFile(path.join(directory, ".env"), "utf8"));
+        const values: Record<string, string> = {};
+        for (const [key, value] of Object.entries(parsed)) {
+          if (
+            typeof value === "string" &&
+            /^[A-Za-z_][A-Za-z0-9_]*$/.test(key) &&
+            !value.includes("\0")
+          )
+            values[key] = value;
+        }
+        for (const key of Object.keys(values)) {
+          if (key.startsWith("OMP_")) values[`PI_${key.slice(4)}`] = values[key];
+        }
+        return values;
+      } catch {
+        // OMP ignores missing, unreadable and malformed dotenv files.
+        return {};
+      }
+    }),
+  );
+  const ignored = (key: string) =>
+    key === "MallocStackLogging" || key === "MallocStackLoggingNoCompact";
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!key || key.includes("=") || key.includes("\0") || value?.includes("\0") || ignored(key)) {
+      delete process.env[key];
+    }
+  }
+  for (const values of files) {
+    for (const [key, value] of Object.entries(values)) {
+      if (!ignored(key) && !process.env[key]) process.env[key] = value;
+    }
+  }
+  dirs.refreshDirsFromEnv();
+}
+
+/** Filesystem-only equivalent of pinned OMP's resolveActiveProjectRegistryPath. */
+async function projectRegistryPath(dirs: HostDirs, checkout: string): Promise<string | null> {
+  const normalize = dirs.normalizePathForComparison;
+  const home = normalize(homedir());
+  const config = dirs.getConfigDirName();
+  const userRoots = [
+    normalize(path.join(homedir(), config)),
+    normalize(path.dirname(dirs.getPluginsDir())),
+  ];
+  // Nearest existing config directory wins, even if a nearer .git exists.
+  for (const [pass, marker] of [config, ".git"].entries()) {
+    let directory = checkout;
+    while (normalize(directory) !== home) {
+      try {
+        const info = await followStat(path.join(directory, marker));
+        if (
+          (pass === 1 || info.isDirectory()) &&
+          !userRoots.includes(normalize(path.join(directory, config)))
+        ) {
+          return path.join(directory, config, "plugins", "installed_plugins.json");
+        }
+      } catch {
+        // Like the host, continue walking if this marker cannot be inspected.
+      }
+      const parent = path.dirname(directory);
+      if (parent === directory) break;
+      directory = parent;
+    }
+  }
+  return null;
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   for (const arg of args) {
@@ -76,7 +159,7 @@ async function main(): Promise<void> {
   const launchEnv = { ...process.env };
   const dirs = await import("@oh-my-pi/pi-utils/dirs");
   dirs.setProfile(dirs.resolveProfileEnv(process.env.OMP_PROFILE, process.env.PI_PROFILE));
-  await import("@oh-my-pi/pi-utils/env");
+  await loadEnvironment(dirs, checkout);
   const plugins = dirs.getPluginsDir();
   const lockPath = dirs.getPluginsLockfile();
   const link = path.join(dirs.getPluginsNodeModules(), NAME);
@@ -158,10 +241,7 @@ async function main(): Promise<void> {
 
   // List output omits broken installs and marketplace entries use a different
   // shape. Inspect the registries themselves, including the active project scope.
-  const { resolveActiveProjectRegistryPath } = await import(
-    "@oh-my-pi/pi-coding-agent/discovery/helpers"
-  );
-  const projectRegistry = await resolveActiveProjectRegistryPath(checkout);
+  const projectRegistry = await projectRegistryPath(dirs, checkout);
   for (const file of new Set([
     path.join(plugins, "installed_plugins.json"),
     ...(projectRegistry ? [projectRegistry] : []),
