@@ -30,8 +30,60 @@ fails after a previous step succeeded, fix the cause and rerun safely.
 ```bash
 bun run dev:install --dry-run         # inspect without changing OMP installation files
 bun run dev:install --no-marketplace  # link only
+bun run dev:install --with-brief      # also install the optional standalone /brief command
 bun run dev:install --help
 ```
+
+## Optional standalone `/brief`
+
+Auto can read external brief packs without installing `/brief`. The normal
+installation registers no `/brief` command. If you already have the supplied
+standalone extension, keep it and omit `--with-brief`.
+
+This optional runtime is adapted from pashifika's supplied `brief` v0.1.0.
+Its private template packs are not distributed; Auto and standalone brief share
+the text-format renderer while retaining their separate command behavior.
+
+On OMP 18.5.1+, `bun run dev:install --with-brief` additionally links the separate
+`omp-architect-brief` package from `src/brief`. It retains the standalone command,
+pack/block completion, and scaffolding behavior:
+
+```text
+/brief <pack> <value> [block...]
+/brief help
+/brief new <pack>
+/brief new global <pack>
+```
+
+Packs remain yours: project packs live at `<cwd>/.omp/brief/<pack>/`, and global
+packs at the active OMP agent directory's `brief/<pack>/`. The active profile and
+agent-directory override come from OMP. A project pack shadows the global pack
+of the same name. `_shared.md` supplies the common text and `{blocks}` location;
+other Markdown files are selectable blocks. The text parser and renderer are
+shared with Auto. No user pack, template, credential, or configuration is bundled,
+copied, or overwritten by installation. `/brief new` creates only a new pack and
+refuses an existing destination, including a symbolic link.
+
+Space shows block suggestions; Tab chooses one. Enter submits exactly the typed
+arguments, including while a suggestion popup is visible. LF retains the host's
+newline behavior. The shared editor keeps these guards for both Auto and brief,
+regardless of extension load order.
+
+The installer refuses another installation under the optional package name and
+checks existing native/legacy extension directories, configured extension paths,
+installed package entrypoints, and file commands for a recognizable `/brief`.
+These are conservative, bounded source checks; it does not execute user code.
+Computed command names or extra `--extension` paths supplied to a future launch
+cannot be proven absent. Keep only one `/brief` provider in your actual session.
+On a conflict, omit `--with-brief` to keep your existing provider; there is no
+overwrite/force switch. A dry run checks the same paths without writes, including
+native caches. Reruns retain enabled/disabled state, selected features, and settings;
+omitting the flag later does not uninstall the optional package.
+
+Remove only this optional command with `omp plugin uninstall omp-architect-brief`.
+Your template packs and main Architect installation remain in place.
+
+## Profiles and catalog
 
 OMP's `OMP_PROFILE` / `PI_PROFILE`, `PI_CONFIG_DIR`, `PI_CODING_AGENT_DIR` and
 existing XDG layout are honored through its own path helpers. In particular,
@@ -53,10 +105,10 @@ OMP 18.5.1 is the minimum supported host version, with no upper bound. The
 development SDK dependencies track `latest`; update them together:
 
 ```bash
-bun update @oh-my-pi/pi-ai @oh-my-pi/pi-coding-agent @oh-my-pi/pi-utils
+bun update @oh-my-pi/pi-ai @oh-my-pi/pi-coding-agent @oh-my-pi/pi-tui @oh-my-pi/pi-utils
 ```
 
-Bun may save concrete version ranges during the update. Restore the three SDK
+Bun may save concrete version ranges during the update. Restore the four SDK
 `devDependencies` to `"latest"` in `package.json` and keep the OMP peer range at
 `">=18.5.1"`, then run `bun install --lockfile-only` to synchronize the lockfile.
 Do not use `bun update --no-save` for a recorded update: it also skips saving the lockfile.

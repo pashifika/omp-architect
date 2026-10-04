@@ -1,19 +1,21 @@
 #!/usr/bin/env bun
 /** Checkout installation only. Native OMP owns every registry write. */
 import { spawnSync } from "node:child_process";
-import { lstat, readFile, realpath, stat as followStat } from "node:fs/promises";
+import { lstat, readFile, readdir, realpath, stat as followStat } from "node:fs/promises";
 import { homedir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual, parseEnv } from "node:util";
 
 const NAME = "omp-architect";
+const BRIEF_NAME = "omp-architect-brief";
 const root = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
-const help = `Usage: bun run dev:install [--dry-run] [--no-marketplace]
+const help = `Usage: bun run dev:install [--dry-run] [--no-marketplace] [--with-brief]
 
 Link this checkout and register its local marketplace catalog using its installed OMP.
 --dry-run         Check ownership and show the plan without running OMP or changing its files
 --no-marketplace  Only link the checkout
+--with-brief      Also link the optional standalone /brief command (OMP 18.5.1+)
 --help            Show this help
 
 Uses OMP's active profile, PI_CONFIG_DIR and XDG paths. Does not edit config.yml,
@@ -136,10 +138,147 @@ async function projectRegistryPath(dirs: HostDirs, checkout: string): Promise<st
   return null;
 }
 
+/** Conservative, read-only checks; never import user extensions during preflight. */
+async function checkExistingBrief(
+  dirs: HostDirs,
+  checkout: string,
+  pluginNames: string[],
+  installedPaths: string[],
+): Promise<void> {
+  const conflict = (file: string): never => {
+    throw new Error(
+      `Existing brief extension or command at ${file}; keep it and omit --with-brief, or remove its registration with OMP first. No templates are replaced`,
+    );
+  };
+  const seen = new Set<string>();
+  let inspected = 0;
+  async function inspect(file: string): Promise<void> {
+    const info = await followStat(file).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return undefined;
+      throw error;
+    });
+    if (!info) return;
+    const actual = await realpath(file);
+    if (seen.has(actual)) return;
+    seen.add(actual);
+    if (++inspected > 500) throw new Error("Too many extension files to check safely for /brief");
+    if (info.isDirectory()) {
+      const manifest = await json(path.join(file, "package.json"));
+      if (manifest?.name === BRIEF_NAME) conflict(file);
+      if (/^brief(?:[.-]|$)/i.test(path.basename(file))) conflict(file);
+      const omp = manifest?.omp ?? manifest?.pi;
+      const entries =
+        omp && typeof omp === "object" && !Array.isArray(omp)
+          ? (omp as Mapping).extensions
+          : undefined;
+      const features =
+        omp && typeof omp === "object" && !Array.isArray(omp)
+          ? (omp as Mapping).features
+          : undefined;
+      if (features && typeof features === "object" && !Array.isArray(features)) {
+        // Include disabled features too: later enabling one must not silently
+        // replace another /brief command installed by this checkout.
+        for (const feature of Object.values(features)) {
+          const paths =
+            feature && typeof feature === "object" && !Array.isArray(feature)
+              ? (feature as Mapping).extensions
+              : undefined;
+          if (Array.isArray(paths))
+            for (const entry of paths)
+              if (typeof entry === "string") await inspect(path.resolve(file, entry));
+        }
+      }
+      if (Array.isArray(entries) && entries.length > 0) {
+        for (const entry of entries)
+          if (typeof entry === "string") await inspect(path.resolve(file, entry));
+      } else {
+        // Native directory discovery uses index first, then one-level modules.
+        let index: string | undefined;
+        for (const entry of ["index.ts", "index.js"])
+          if (await stat(path.join(file, entry))) {
+            index = entry;
+            break;
+          }
+        if (index) await inspect(path.join(file, index));
+        else
+          for (const entry of await readdir(file, { withFileTypes: true })) {
+            if (entry.isFile() && /\.[cm]?[jt]sx?$/.test(entry.name))
+              await inspect(path.join(file, entry.name));
+          }
+      }
+      return;
+    }
+    if (!info.isFile() || !/\.[cm]?[jt]sx?$/.test(file)) return;
+    if (info.size > 1024 * 1024)
+      throw new Error(`Extension source ${file} is too large to safely check for /brief`);
+    if (/^brief\.[cm]?[jt]sx?$/i.test(path.basename(file))) conflict(file);
+    const source = await readFile(file, "utf8");
+    if (
+      /registerCommand\s*\(\s*["'`]brief["'`]|\b(?:const|let|var)\s+COMMAND\s*=\s*["'`]brief["'`]/.test(
+        source,
+      )
+    )
+      conflict(file);
+    // Follow only local source imports. Reading a dependency never executes it.
+    for (const match of source.matchAll(/(?:from\s*|import\s*\()(["'])(\.[^"']+)\1/g)) {
+      const imported = path.resolve(path.dirname(file), match[2]);
+      for (const candidate of [imported, `${imported}.ts`, `${imported}.js`])
+        if (await stat(candidate)) {
+          await inspect(candidate);
+          break;
+        }
+    }
+  }
+  for (const name of pluginNames) {
+    if (name === NAME || name === BRIEF_NAME) continue;
+    if (/(?:^|[/-])brief(?:$|[.-])/i.test(name)) conflict(name);
+    await inspect(path.join(dirs.getPluginsNodeModules(), name));
+  }
+  for (const file of installedPaths) await inspect(file);
+  // OMP's native user/project extension directories and explicit configuration.
+  // Checking both scopes conservatively also catches a disabled/manual install.
+  for (const base of new Set([
+    dirs.getAgentDir(),
+    path.join(homedir(), ".pi", "agent"),
+    path.join(checkout, ".omp"),
+    path.join(checkout, ".pi"),
+  ])) {
+    const directory = path.join(base, "extensions");
+    if (await stat(directory)) {
+      for (const entry of await readdir(directory)) await inspect(path.join(directory, entry));
+    }
+    for (const configName of ["config.yml", "config.yaml", "settings.json"]) {
+      const file = path.join(base, configName);
+      if (!(await stat(file))) continue;
+      let config: unknown;
+      try {
+        const contents = await readFile(file, "utf8");
+        config = configName.endsWith("json") ? JSON.parse(contents) : Bun.YAML.parse(contents);
+      } catch {
+        throw new Error(`Cannot safely check extensions in ${file}; repair it before --with-brief`);
+      }
+      const extensions =
+        config && typeof config === "object" && !Array.isArray(config)
+          ? (config as Mapping).extensions
+          : undefined;
+      if (Array.isArray(extensions)) {
+        for (const value of extensions) {
+          if (typeof value !== "string") continue;
+          const expanded = value.startsWith("~/") ? path.join(homedir(), value.slice(2)) : value;
+          await inspect(path.resolve(checkout, expanded));
+        }
+      }
+    }
+    for (const entry of ["brief.md", "brief.ts", "brief.js"])
+      if (await stat(path.join(base, "commands", entry)))
+        conflict(path.join(base, "commands", entry));
+  }
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   for (const arg of args) {
-    if (!["--dry-run", "--no-marketplace", "--help"].includes(arg)) {
+    if (!["--dry-run", "--no-marketplace", "--with-brief", "--help"].includes(arg)) {
       throw new Error(`Unknown option ${arg}\n${help}`);
     }
   }
@@ -149,6 +288,7 @@ async function main(): Promise<void> {
   }
   const dryRun = args.includes("--dry-run");
   const marketplace = !args.includes("--no-marketplace");
+  const withBrief = args.includes("--with-brief");
   const checkout = await realpath(root);
   // Match OMP's bootstrap: select the profile before loading its .env files.
   // All path getters used below are read-only (unlike getMarketplacesRegistryPath,
@@ -163,6 +303,8 @@ async function main(): Promise<void> {
   const plugins = dirs.getPluginsDir();
   const lockPath = dirs.getPluginsLockfile();
   const link = path.join(dirs.getPluginsNodeModules(), NAME);
+  const briefCheckout = path.join(checkout, "src", "brief");
+  const briefLink = path.join(dirs.getPluginsNodeModules(), BRIEF_NAME);
   const registryPath = path.join(path.dirname(plugins), "marketplaces.json");
   const catalogCache = path.join(plugins, "cache", "marketplaces", NAME, "marketplace.json");
   // Do not let OMP's recursive destination replacement or cache writes traverse
@@ -251,10 +393,16 @@ async function main(): Promise<void> {
   if (Object.hasOwn(dependencies, NAME)) {
     throw new Error(`${NAME} is installed as a package; uninstall it with OMP before linking`);
   }
+  if (withBrief && Object.hasOwn(dependencies, BRIEF_NAME)) {
+    throw new Error(
+      `${BRIEF_NAME} is installed as a package; uninstall it with OMP before linking`,
+    );
+  }
 
   // List output omits broken installs and marketplace entries use a different
   // shape. Inspect the registries themselves, including the active project scope.
   const projectRegistry = await projectRegistryPath(dirs, checkout);
+  const installedPaths: string[] = [];
   for (const file of new Set([
     path.join(plugins, "installed_plugins.json"),
     ...(projectRegistry ? [projectRegistry] : []),
@@ -272,9 +420,15 @@ async function main(): Promise<void> {
         if (typeof record.installPath !== "string") {
           throw new Error(`${file}: missing installPath for ${id}`);
         }
+        if (withBrief) installedPaths.push(record.installPath);
       }
       if (id.split("@")[0].toLowerCase() === NAME && entries.length) {
         throw new Error(`${NAME} is installed from marketplace ${id}; uninstall it with OMP first`);
+      }
+      if (withBrief && id.split("@")[0].toLowerCase() === BRIEF_NAME && entries.length) {
+        throw new Error(
+          `${BRIEF_NAME} is installed from marketplace ${id}; uninstall it with OMP first`,
+        );
       }
     }
   }
@@ -293,6 +447,39 @@ async function main(): Promise<void> {
     );
   }
   const linkNeeded = !linkedHere || !registered;
+
+  let briefLinkNeeded = false;
+  if (withBrief) {
+    if (!Bun.semver.satisfies(String(host.version), ">=18.5.1"))
+      throw new Error("The optional /brief editor requires OMP 18.5.1 or newer");
+    const briefManifest = await json(path.join(briefCheckout, "package.json"));
+    if (
+      briefManifest?.name !== BRIEF_NAME ||
+      briefManifest.version !== manifest.version ||
+      JSON.stringify(mapping(briefManifest.omp, "brief package omp").extensions) !==
+        JSON.stringify(["./extension.ts"])
+    )
+      throw new Error("Unexpected optional brief package; review dev:install for this manifest");
+    await readFile(path.join(briefCheckout, "extension.ts"));
+    const previous = await stat(briefLink);
+    const ours = previous?.isSymbolicLink() && samePath(briefLink, briefCheckout);
+    if (previous && !ours)
+      throw new Error(
+        `${briefLink} already exists and is not a link to this checkout; refusing to replace it`,
+      );
+    const known = Object.hasOwn(states, BRIEF_NAME);
+    if (known && !ours)
+      throw new Error(
+        `${BRIEF_NAME} has a stale registration in ${lockPath}; repair or uninstall it with OMP first`,
+      );
+    await checkExistingBrief(
+      dirs,
+      checkout,
+      [...new Set([...Object.keys(states), ...Object.keys(dependencies)])],
+      installedPaths,
+    );
+    briefLinkNeeded = !ours || !known;
+  }
 
   let catalogNeeded = false;
   let catalogUpdate = false;
@@ -387,6 +574,9 @@ async function main(): Promise<void> {
   console.log(`Development install: ${NAME}\n  checkout: ${checkout}\n  plugins: ${plugins}`);
   console.log(`  catalog: ${marketplace ? registryPath : "skipped (--no-marketplace)"}`);
   console.log(
+    `  standalone /brief: ${withBrief ? "opt-in; templates stay external" : "skipped (use --with-brief)"}`,
+  );
+  console.log(
     "  build: not needed (OMP loads TypeScript)\n  MCP: not applicable (no server in this package)",
   );
   // Run the host installed in this checkout, not whichever unrelated omp happens to
@@ -420,6 +610,11 @@ async function main(): Promise<void> {
   if (linkNeeded) run(["link", checkout]);
   else
     console.log("  checkout already linked; keeping enabled state, feature selection and settings");
+  if (briefLinkNeeded) run(["link", briefCheckout]);
+  else if (withBrief)
+    console.log(
+      "  optional brief already linked; keeping enabled state, feature selection and settings",
+    );
   if (catalogNeeded) run(["marketplace", "add", checkout]);
   else if (catalogUpdate) run(["marketplace", "update", NAME]);
   else if (marketplace) console.log("  checkout catalog already registered and current");
@@ -430,6 +625,15 @@ async function main(): Promise<void> {
     const written = objectField((await json(lockPath)) ?? {}, "plugins", lockPath);
     if (!Object.hasOwn(written, NAME))
       throw new Error("OMP reported success but registration is missing");
+    if (
+      withBrief &&
+      (!(await stat(briefLink))?.isSymbolicLink() ||
+        !samePath(briefLink, briefCheckout) ||
+        !Object.hasOwn(written, BRIEF_NAME))
+    )
+      throw new Error(
+        "OMP reported success but the optional brief link/registration could not be verified",
+      );
     if (marketplace) {
       const registry = await json(registryPath);
       if (

@@ -49,15 +49,12 @@ function snapshot(complete = 0): RasenSnapshot {
 }
 
 async function project(
-  config: Partial<AutoConfig> = {},
+  config: Partial<AutoConfig> | null = {},
   minReviews = 1,
   maxReviews = Math.max(2, minReviews),
 ) {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-auto-smoke-"));
-  await Bun.write(
-    path.join(cwd, ".omp", "auto.json"),
-    JSON.stringify({ enabled: true, ...config }),
-  );
+  if (config !== null) await Bun.write(path.join(cwd, ".omp", "auto.json"), JSON.stringify(config));
   await Bun.write(
     path.join(cwd, ".omp", "architect.json"),
     JSON.stringify({ reviews: { min: minReviews, max: maxReviews } }),
@@ -68,16 +65,18 @@ async function project(
 // These tests run the real OMP extension loader, then explicitly deliver lifecycle
 // events. They do not pretend to execute the host's model/continuation loop.
 async function loaderFixture(
-  config: Partial<AutoConfig> = {},
+  config: Partial<AutoConfig> | null = {},
   overrides: {
     dependencies?: AutoDependencies;
     reviewer?: Reviewer;
     minReviews?: number;
     maxReviews?: number;
     modelRegistry?: ModelRegistry;
+    prepare?: (cwd: string) => Promise<void>;
   } = {},
 ) {
   const cwd = await project(config, overrides.minReviews, overrides.maxReviews);
+  await overrides.prepare?.(cwd);
   const runtime = new ExtensionRuntime();
   const messages: Array<{ customType: string; content: unknown }> = [];
   const bootstraps: string[] = [];
@@ -179,6 +178,243 @@ async function loaderFixture(
 }
 
 const loginFixtureKey = "synthetic-typesafe-login-not-a-secret";
+
+for (const mode of ["missing", "disabled", "invalid", "declined"] as const) {
+  test(`real loader ${mode} config only starts after explicit consent`, async () => {
+    const fixture = await loaderFixture(
+      mode === "missing" ? null : mode === "disabled" ? { enabled: false } : {},
+      {
+        prepare:
+          mode === "invalid"
+            ? async (cwd) => {
+                await Bun.write(path.join(cwd, ".omp/auto.json"), "{");
+              }
+            : undefined,
+      },
+    );
+    let confirms = 0;
+    const ctx = {
+      ...fixture.ctx,
+      ui: {
+        ...fixture.ctx.ui,
+        confirm: async () => {
+          confirms++;
+          return mode !== "declined";
+        },
+      },
+    };
+    try {
+      expect(await fixture.status()).toMatchObject({
+        status: "idle",
+        enabled: mode !== "disabled" && mode !== "invalid",
+      });
+      if (mode === "invalid") expect((await fixture.status()).error).toContain("Invalid");
+      expect(fixture.bootstraps).toHaveLength(0);
+      await fixture.extension.commands.get("auto")!.handler("start fixture-change", ctx);
+      expect(confirms).toBe(mode === "disabled" || mode === "invalid" ? 0 : 1);
+      expect(fixture.bootstraps).toHaveLength(mode === "missing" ? 1 : 0);
+      expect(fixture.counts().reads).toBe(mode === "missing" ? 1 : 0);
+    } finally {
+      await fixture.close();
+    }
+  });
+}
+
+test("real loader rejects broken or oversized brief instructions before consent or CLI", async () => {
+  const fixture = await loaderFixture();
+  let confirms = 0;
+  const ctx = {
+    ...fixture.ctx,
+    ui: {
+      ...fixture.ctx.ui,
+      confirm: async () => {
+        confirms++;
+        return true;
+      },
+    },
+  };
+  try {
+    await fixture.extension.commands
+      .get("auto")!
+      .handler("start fixture-change --brief missing", ctx);
+    await fixture.extension.commands
+      .get("auto")!
+      .handler(`start fixture-change ${"x".repeat(11000)}`, ctx);
+    expect(confirms).toBe(0);
+    expect(fixture.counts().reads).toBe(0);
+    expect(fixture.bootstraps).toEqual([]);
+  } finally {
+    await fixture.close();
+  }
+});
+
+for (const cancel of ["stop", "input", "session"] as const) {
+  test(`real loader ${cancel} cancels pending confirmation and repeated starts cannot reset it`, async () => {
+    const fixture = await loaderFixture();
+    const deferred = Promise.withResolvers<boolean>();
+    let confirms = 0;
+    const ctx = {
+      ...fixture.ctx,
+      ui: {
+        ...fixture.ctx.ui,
+        confirm: async () => {
+          confirms++;
+          return deferred.promise;
+        },
+      },
+    };
+    try {
+      const first = fixture.extension.commands
+        .get("auto")!
+        .handler("start fixture-change Keep original", ctx);
+      await Promise.resolve();
+      await fixture.extension.commands
+        .get("auto")!
+        .handler("start fixture-change Replace original", ctx);
+      expect(confirms).toBe(1);
+      if (cancel === "stop") await fixture.extension.commands.get("auto")!.handler("stop", ctx);
+      else if (cancel === "input")
+        await fixture.extension.handlers.get("input")![0](
+          { type: "input", text: "new request", source: "interactive" },
+          ctx,
+        );
+      else
+        await fixture.extension.handlers.get("session_switch")![0](
+          { type: "session_switch", reason: "resume" },
+          ctx,
+        );
+      deferred.resolve(true);
+      await first;
+      expect(fixture.bootstraps).toEqual([]);
+      expect(fixture.counts().reads).toBe(0);
+    } finally {
+      deferred.resolve(false);
+      await fixture.close();
+    }
+  });
+}
+
+test("brief is frozen after consent; new runs replace instructions and stopped runs keep their budgets", async () => {
+  const fixture = await loaderFixture(
+    {},
+    {
+      prepare: async (cwd) => {
+        await Bun.write(path.join(cwd, ".omp/brief/example/_shared.md"), "Frozen {var}\n{blocks}");
+      },
+    },
+  );
+  try {
+    const ctx = {
+      ...fixture.ctx,
+      ui: {
+        ...fixture.ctx.ui,
+        confirm: async (title: string, content: string) => {
+          expect(content).toContain("Frozen fixture-change");
+          await Bun.write(path.join(fixture.cwd, ".omp/brief/example/_shared.md"), "MUTATED");
+          return true;
+        },
+      },
+    };
+    await fixture.extension.commands
+      .get("auto")!
+      .handler("start fixture-change --brief example -- Preserve me", ctx);
+    expect(fixture.bootstraps[0]).toContain("Frozen fixture-change");
+    expect(fixture.bootstraps[0]).not.toContain("MUTATED");
+    await fixture.extension.handlers.get("before_agent_start")![0](
+      { type: "before_agent_start", prompt: fixture.bootstraps[0], systemPrompt: [] },
+      fixture.ctx,
+    );
+    const next = (await fixture.stop()) as { additionalContext: string };
+    expect(next.additionalContext).toContain("Frozen fixture-change");
+    expect(next.additionalContext).toContain("Preserve me");
+    await fixture.extension.commands
+      .get("auto")!
+      .handler("start fixture-change Replace me", fixture.ctx);
+    expect(fixture.bootstraps).toHaveLength(1);
+    expect((await fixture.status()).steps).toBe("2/8");
+    await fixture.extension.commands.get("auto")!.handler("stop", fixture.ctx);
+    await fixture.extension.commands
+      .get("auto")!
+      .handler("start fixture-change New guidance", fixture.ctx);
+    expect(fixture.bootstraps).toHaveLength(2);
+    expect(fixture.bootstraps[1]).toContain("New guidance");
+    expect(fixture.bootstraps[1]).not.toContain("Preserve me");
+  } finally {
+    await fixture.close();
+  }
+});
+
+for (const delivery of ["bootstrap", "continuation"] as const) {
+  for (const cancel of ["stop", "session", "new-input"] as const) {
+    test(`real loader rejects queued ${delivery} after ${cancel} without ordinary-request fallback`, async () => {
+      const fixture = await loaderFixture();
+      try {
+        await fixture.extension.commands
+          .get("auto")!
+          .handler("start fixture-change Old instructions", fixture.ctx);
+        let text = fixture.bootstraps[0];
+        if (delivery === "continuation") {
+          await fixture.extension.handlers.get("before_agent_start")![0](
+            { type: "before_agent_start", prompt: text, systemPrompt: [] },
+            fixture.ctx,
+          );
+          text = ((await fixture.stop()) as { additionalContext: string }).additionalContext;
+        }
+        if (cancel === "stop")
+          await fixture.extension.commands.get("auto")!.handler("stop", fixture.ctx);
+        else if (cancel === "session")
+          await fixture.extension.handlers.get("session_switch")![0](
+            { type: "session_switch", reason: "resume" },
+            fixture.ctx,
+          );
+        else
+          await fixture.extension.handlers.get("input")![0](
+            { type: "input", text: "Unrelated task", source: "interactive" },
+            fixture.ctx,
+          );
+        await fixture.extension.handlers.get("before_agent_start")![0](
+          { type: "before_agent_start", prompt: text, systemPrompt: [] },
+          fixture.ctx,
+        );
+        expect(
+          await fixture.extension.handlers.get("tool_call")![0](
+            {
+              type: "tool_call",
+              toolName: "write",
+              toolCallId: "stale",
+              input: { path: "x", content: "y" },
+            },
+            fixture.ctx,
+          ),
+        ).toMatchObject({ block: true });
+        expect(fixture.counts().aborts).toBeGreaterThan(0);
+        expect(fixture.bootstraps).toHaveLength(1);
+        await fixture.extension.handlers.get("input")![0](
+          { type: "input", text: "Fresh unrelated request", source: "interactive" },
+          fixture.ctx,
+        );
+        await fixture.extension.handlers.get("before_agent_start")![0](
+          { type: "before_agent_start", prompt: "Fresh unrelated request", systemPrompt: [] },
+          fixture.ctx,
+        );
+        expect(
+          await fixture.extension.handlers.get("tool_call")![0](
+            {
+              type: "tool_call",
+              toolName: "write",
+              toolCallId: "fresh",
+              input: { path: "x", content: "y" },
+            },
+            fixture.ctx,
+          ),
+        ).toBeUndefined();
+      } finally {
+        await fixture.close();
+      }
+    });
+  }
+}
+
 const envFixtureKey = "synthetic-typesafe-env-not-a-secret";
 
 async function jevAuthFixture(
@@ -817,8 +1053,15 @@ for (const interrupt of ["status", "unexpected-hidden", "new-user"] as const) {
 // lifecycle, hidden continuation delivery, and agent-end handling are host code.
 // The combined case runs the pinned actual Rasen CLI and actual OMP write tools;
 // only model transports and the architect verdict are deterministic fixtures.
-for (const mode of ["snapshots", "real-cli", "max-cap"] as const) {
-  test(`real OMP session ${mode === "max-cap" ? "enforces a two-turn cap without terminal retry" : `completes ${mode} with two architect reviews`}`, async () => {
+for (const mode of [
+  "snapshots",
+  "real-cli",
+  "max-cap",
+  "config-free",
+  "brief",
+  "cancel-delivery",
+] as const) {
+  test(`real OMP session ${mode === "cancel-delivery" ? "rejects cancelled queued delivery before model inference" : mode === "max-cap" ? "enforces a two-turn cap without terminal retry" : `completes ${mode} with two architect reviews`}`, async () => {
     let executable: string | undefined;
     if (mode === "real-cli") {
       executable = process.env.RASEN_BIN;
@@ -831,12 +1074,26 @@ for (const mode of ["snapshots", "real-cli", "max-cap"] as const) {
       }
     }
     const cwd = await project(
-      {
-        ...(executable ? { rasenExecutable: executable } : {}),
-        ...(mode === "max-cap" ? { maxSteps: 2 } : {}),
-      },
+      mode === "config-free" || mode === "brief"
+        ? null
+        : {
+            ...(executable ? { rasenExecutable: executable } : {}),
+            ...(mode === "max-cap" ? { maxSteps: 2 } : {}),
+          },
       2,
     );
+    const guidance = "  Keep changes small  and preserve spacing\n  Report facts in Japanese\n";
+    const briefText = "Apply fixture-change\n  TS for fixture-change\nUnknown {untouched}\n";
+    if (mode === "brief") {
+      await Bun.write(
+        path.join(cwd, ".omp/brief/example/_shared.md"),
+        "---\nvariable: change\n---\nApply {change}\n{blocks}\nUnknown {untouched}\n",
+      );
+      await Bun.write(
+        path.join(cwd, ".omp/brief/example/ts.md"),
+        "---\naliases: typescript\n---\n  TS for {change}\n",
+      );
+    }
     const taskPath = path.join(cwd, "rasen", "changes", "fixture-change", "tasks.md");
     const tasks = (complete: number) =>
       `## 1. Local integration fixture\n\n- [${complete >= 1 ? "x" : " "}] 1.1 Mark fixture unit one\n- [${complete >= 2 ? "x" : " "}] 1.2 Mark fixture unit two\n`;
@@ -892,6 +1149,7 @@ for (const mode of ["snapshots", "real-cli", "max-cap"] as const) {
     const errors: unknown[] = [];
     const sends: Promise<unknown>[] = [];
     const contexts: string[] = [];
+    const prompts: string[] = [];
     const providerConfig: Parameters<ModelRegistry["registerProvider"]>[1] = {
       baseUrl: "https://unused.invalid",
       apiKey: "fixture-not-a-secret",
@@ -1025,6 +1283,15 @@ for (const mode of ["snapshots", "real-cli", "max-cap"] as const) {
         settings,
         sessionManager: SessionManager.inMemory(cwd),
         extensions: [
+          (pi) => {
+            if (mode === "cancel-delivery")
+              pi.on("before_agent_start", async () => {
+                // Stop after sendUserMessage queued the bootstrap, before Auto accepts delivery.
+                await session!
+                  .extensionRunner!.getCommand("auto")!
+                  .handler("stop", session!.extensionRunner!.createCommandContext());
+              });
+          },
           extensionFactory(
             () => async (request) => {
               reviews++;
@@ -1035,8 +1302,9 @@ for (const mode of ["snapshots", "real-cli", "max-cap"] as const) {
           ),
           (pi) => {
             pi.registerProvider(provider, providerConfig);
-            pi.on("before_agent_start", () => {
+            pi.on("before_agent_start", (event) => {
               beforeStarts++;
+              prompts.push(event.prompt);
             });
             pi.on("session_stop", (event) => {
               stops.push(event.stop_hook_active);
@@ -1084,10 +1352,30 @@ for (const mode of ["snapshots", "real-cli", "max-cap"] as const) {
           },
         } as unknown as ExtensionUIContext,
       });
-      await session.prompt("/auto start fixture-change");
+      await session.prompt(
+        mode === "brief"
+          ? `/auto start fixture-change --brief example typescript -- ${guidance}`
+          : `/auto start fixture-change ${guidance}`,
+      );
       await Promise.all(sends);
       await session.waitForIdle();
       expect(errors).toEqual([]);
+      if (mode === "cancel-delivery") {
+        expect(requests).toBe(0);
+        expect(reads).toBe(1);
+        expect(decisions).toBe(0);
+        expect(reviews).toBe(0);
+        expect(session.isStreaming).toBe(false);
+        return;
+      }
+      for (const prompt of prompts) {
+        expect(prompt).toContain(guidance);
+        if (mode === "brief") expect(prompt).toContain(briefText);
+      }
+      for (const evidence of reviewEvidence) {
+        expect(JSON.parse(evidence).request).toContain(guidance);
+        if (mode === "brief") expect(JSON.parse(evidence).request).toContain(briefText);
+      }
       expect(confirms).toBe(1);
       expect(requests).toBe(mode === "max-cap" ? 2 : mode === "real-cli" ? 5 : 3);
       expect(reads).toBe(mode === "max-cap" ? 3 : 4);

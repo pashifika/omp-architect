@@ -64,7 +64,8 @@ configured provider; do not include secrets. These checks do not replace tool ap
 | Install, preview, update, or remove the local plugin | [Installation guide](docs/installation.md) |
 | Choose models and reasoning effort | Native OMP `modelRoles`; [model-role guide](docs/architect.md#one-source-of-truth-for-models-and-reasoning) |
 | Set review rounds, role names, and thresholds | Project `.omp/architect.json`; [review guide](docs/architect.md#bounded-review-rounds) and [sample settings](examples/architect.json) |
-| Enable automatic execution for a prepared Rasen change | [Rasen Auto setup and limits](docs/rasen-auto.md); requires pinned Rasen and TypeSafe authentication through OMP `/login` or `TYPESAFE_API_KEY` |
+| Run a prepared Rasen change, with extra instructions or existing brief packs | [Rasen Auto setup and limits](docs/rasen-auto.md); `.omp/auto.json` is optional; pinned Rasen and TypeSafe authentication through OMP `/login` or `TYPESAFE_API_KEY` are required |
+| Add the standalone `/brief` command with Tab completion | [Optional brief installation](docs/installation.md); use `bun run dev:install -- --with-brief` only when another `/brief` is not installed |
 | Understand tested behavior and reproduce verification | [Verification record](docs/rasen-auto-verification.md) |
 | Develop, run local checks, or submit a pull request | [Contributing](CONTRIBUTING.md) |
 
@@ -75,14 +76,14 @@ configured provider; do not include secrets. These checks do not replace tool ap
 - **Git** to clone this repository.
 
 OMP 18.5.1 is the minimum supported host version; there is no upper version bound.
-Development tracks the latest OMP SDK releases. To update all three SDK packages together:
+Development tracks the latest OMP SDK releases. To update all four SDK packages together:
 
 ```bash
-bun update @oh-my-pi/pi-ai @oh-my-pi/pi-coding-agent @oh-my-pi/pi-utils
+bun update @oh-my-pi/pi-ai @oh-my-pi/pi-coding-agent @oh-my-pi/pi-utils @oh-my-pi/pi-tui
 ```
 
-After updating, restore these three `devDependencies` to `"latest"` in `package.json`
-and keep the OMP peer range at `">=18.5.1"`; Bun may save concrete version ranges.
+After updating, restore these four `devDependencies` to `"latest"` in `package.json`
+and keep the OMP/TUI peer ranges at `">=18.5.1"`; Bun may save concrete version ranges.
 Then run `bun install --lockfile-only` to synchronize the lockfile with those declarations.
 Do not use `bun update --no-save` for a recorded update: it also skips saving the lockfile.
 

@@ -28,8 +28,9 @@ const evidence: DecisionEvidence = {
 };
 const good: DecisionProvider = async () => ({ choice: "continue", confidence: 0.95 });
 
-test("Auto is opt-in; strict config rejects unknown keys, selectors and unbounded limits", () => {
-  expect(parseAutoConfig({}).enabled).toBe(false);
+test("Auto allows explicit starts by default; strict config rejects unknown keys, selectors and unbounded limits", () => {
+  expect(parseAutoConfig({}).enabled).toBe(true);
+  expect(parseAutoConfig({ enabled: false }).enabled).toBe(false);
   for (const invalid of [
     { enabled: "true" },
     { unknown: 1 },

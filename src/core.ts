@@ -171,6 +171,12 @@ export class Orchestrator {
   #omittedEvidence = 0;
   constructor(readonly config: Config) {}
 
+  /** Conservative preflight for callers that require the whole request in every review. */
+  canRetainRequest(request: string): boolean {
+    const limit = Math.max(0, Math.floor((this.config.maxEvidenceChars - 512) / 6));
+    return boundedText(request, limit) === request;
+  }
+
   begin(request: string): void {
     this.request = request;
     this.revision++;

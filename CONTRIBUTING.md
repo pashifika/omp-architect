@@ -7,7 +7,7 @@ request. Use the toolchain and checks below before submitting.
 
 Use **Bun 1.3.14** and **TypeScript 5.9.3** from `package.json`; their pins remain
 unchanged. **OMP 18.5.1** is the minimum supported host version, with no upper bound.
-The three OMP SDK development dependencies track `latest`.
+The four OMP SDK development dependencies track `latest`.
 
 ```bash
 bun install --frozen-lockfile
@@ -21,15 +21,15 @@ bun run test:dev-install
 inspects, and loads the tarball against the checkout's installed OMP host; it does not publish.
 `check:workflows` validates workflow safety and the tracked branch policy.
 
-Update all three OMP SDK packages together, then run the checks above and the
+Update all four OMP SDK packages together, then run the checks above and the
 integration suite below before committing the resulting `bun.lock`:
 
 ```bash
-bun update @oh-my-pi/pi-ai @oh-my-pi/pi-coding-agent @oh-my-pi/pi-utils
+bun update @oh-my-pi/pi-ai @oh-my-pi/pi-coding-agent @oh-my-pi/pi-tui @oh-my-pi/pi-utils
 ```
 
 Bun may replace `latest` declarations with concrete version ranges during this
-update. Restore the three SDK `devDependencies` to `"latest"` in `package.json`
+update. Restore the four SDK `devDependencies` to `"latest"` in `package.json`
 and keep `peerDependencies["@oh-my-pi/pi-coding-agent"]` at `">=18.5.1"`, then synchronize:
 
 ```bash

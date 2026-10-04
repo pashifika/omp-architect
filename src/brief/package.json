@@ -1,0 +1,17 @@
+{
+  "name": "omp-architect-brief",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Optional standalone /brief command for OMP Architect",
+  "license": "Apache-2.0",
+  "omp": {
+    "extensions": [
+      "./extension.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@oh-my-pi/pi-coding-agent": ">=18.5.1",
+    "@oh-my-pi/pi-tui": ">=18.5.1"
+  }
+}

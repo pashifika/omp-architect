@@ -124,6 +124,7 @@ export function extensionFactory(
       if (!state && !configError) await initialize(ctx);
       if (!acceptedPrompt || event.prompt !== acceptedPrompt) {
         const autoStart = auto.beforeStart(event.prompt, ctx);
+        if (autoStart === "blocked") stopped = true;
         const expected = expectedContinuation;
         expectedContinuation = "";
         const unexpected = expected !== "" && event.prompt !== expected;
@@ -134,7 +135,7 @@ export function extensionFactory(
         if (!preserving) {
           stopped = false;
           generation++;
-          state?.begin(event.prompt);
+          state?.begin(auto.request() ?? event.prompt);
         }
         if (!unexpected && autoStart !== "blocked") acceptedPrompt = event.prompt;
         else acceptedPrompt = "";

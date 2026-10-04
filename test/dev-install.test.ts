@@ -21,6 +21,7 @@ import { fileURLToPath } from "node:url";
 
 const repository = fileURLToPath(new URL("..", import.meta.url));
 const name = "omp-architect";
+const briefName = "omp-architect-brief";
 const fixtures: string[] = [];
 const directoryLink = process.platform === "win32" ? "junction" : "dir";
 
@@ -383,6 +384,11 @@ describe("development installer against the installed native OMP host", () => {
   test.each([
     { label: "dry run", args: ["--dry-run"] },
     { label: "dry run without marketplace", args: ["--dry-run", "--no-marketplace"] },
+    { label: "dry run with optional brief", args: ["--dry-run", "--with-brief"] },
+    {
+      label: "optional brief dry run without marketplace",
+      args: ["--dry-run", "--no-marketplace", "--with-brief"],
+    },
     { label: "help", args: ["--help"] },
   ])("$label writes nothing", async ({ args }) => {
     const f = await fixture();
@@ -583,9 +589,12 @@ describe("development installer against the installed native OMP host", () => {
     await absent(f.link);
   });
 
-  test("native OMP lists the installed plugin and discovers its extension and package agents", async () => {
+  test.each([
+    false,
+    true,
+  ])("native OMP loads the linked extension pack, optional brief=%s", async (withBrief) => {
     const f = await fixture();
-    succeeded(install(f));
+    succeeded(install(f, ...(withBrief ? ["--with-brief"] : [])));
     const cli = fileURLToPath(
       new URL("../dist/cli.js", import.meta.resolve("@oh-my-pi/pi-coding-agent")),
     );
@@ -616,8 +625,11 @@ describe("development installer against the installed native OMP host", () => {
       const { getAllPluginExtensionPaths } = await import("@oh-my-pi/pi-coding-agent/extensibility/plugins/loader");
       const { discoverAgents } = await import("@oh-my-pi/pi-coding-agent/task/discovery");
       const extensions = await getAllPluginExtensionPaths(process.cwd());
+      const { loadExtensions } = await import("@oh-my-pi/pi-coding-agent/extensibility/extensions");
+      const loaded = await loadExtensions(extensions, process.cwd());
+      if (loaded.errors.length) throw new Error(JSON.stringify(loaded.errors));
       const { agents } = await discoverAgents(process.cwd());
-      console.log(JSON.stringify({ extensions, agents: agents.filter(agent => agent.name.startsWith("omp-")) }));
+      console.log(JSON.stringify({ extensions, commands: loaded.extensions.flatMap(extension => [...extension.commands.keys()]), agents: agents.filter(agent => agent.name.startsWith("omp-")) }));
     `,
     );
     const discovered = spawnSync(process.execPath, ["--no-env-file", probe], {
@@ -632,6 +644,10 @@ describe("development installer against the installed native OMP host", () => {
     const result = JSON.parse(discovered.stdout);
     expect(await Promise.all(result.extensions.map((file: string) => realpath(file)))).toContain(
       await realpath(path.join(f.checkout, "index.ts")),
+    );
+    expect(result.commands.filter((command: string) => command === "auto")).toHaveLength(1);
+    expect(result.commands.filter((command: string) => command === "brief")).toHaveLength(
+      withBrief ? 1 : 0,
     );
     expect(result.agents.find((agent: Json) => agent.name === "omp-worker")?.model).toEqual([
       "@implementation",
@@ -979,4 +995,140 @@ describe("development installer against the installed native OMP host", () => {
     for (const [file, content] of sources.slice(first))
       expect(await readFile(file!, "utf8")).toBe(content!);
   }, 30_000);
+});
+
+describe("optional standalone brief installation", () => {
+  test("default install leaves an existing brief extension and template pack untouched", async () => {
+    const f = await fixture();
+    const existing = path.join(f.agent, "extensions", "brief.ts");
+    const template = path.join(f.agent, "brief", "user-pack", "_shared.md");
+    await put(
+      existing,
+      'export default pi => pi.registerCommand("brief", {handler: async()=>{}});\n',
+    );
+    await put(template, "User-owned template, do not replace\n");
+    succeeded(install(f));
+    expect(await readFile(existing, "utf8")).toContain('registerCommand("brief"');
+    expect(await readFile(template, "utf8")).toBe("User-owned template, do not replace\n");
+    expect((await readJson(f.lock)).plugins[briefName]).toBeUndefined();
+    await absent(path.join(f.plugins, "node_modules", briefName));
+  }, 30_000);
+
+  test("opt-in links a separate package and repeat preserves its disabled state and external packs", async () => {
+    const f = await fixture({ profile: "work" });
+    const protectedFiles = await sentinels(f);
+    const template = path.join(f.agent, "brief", "user-pack", "_shared.md");
+    await put(template, "Keep my private template\n");
+    succeeded(install(f, "--with-brief"));
+    const link = path.join(f.plugins, "node_modules", briefName);
+    expect(await realpath(link)).toBe(await realpath(path.join(f.checkout, "src", "brief")));
+    const lock = await readJson(f.lock);
+    expect(lock.plugins[briefName]).toEqual(pluginState());
+    lock.plugins[briefName] = { ...pluginState(false), enabledFeatures: ["./extension.ts"] };
+    lock.settings[briefName] = { keep: true };
+    await put(f.lock, lock);
+    const before = await snapshot(f.base);
+    const result = install(f, "--with-brief");
+    succeeded(result);
+    expect(result.output).not.toContain("running: omp");
+    expect(await snapshot(f.base)).toEqual(before);
+    await unchanged(protectedFiles);
+    expect(await readFile(template, "utf8")).toBe("Keep my private template\n");
+    await absent(path.join(f.home, ".omp", "plugins"));
+    succeeded(install(f)); // Omitting the flag does not remove an already linked optional package.
+    expect((await readJson(f.lock)).plugins[briefName]).toEqual(lock.plugins[briefName]);
+  }, 30_000);
+
+  test.each([
+    "user extension",
+    "project extension",
+    "legacy project extension",
+    "relative configured source",
+    "legacy manifest",
+    "configured directory",
+    "direct optional config",
+    "file command",
+  ])("rejects existing %s before any writes", async (kind) => {
+    const f = await fixture();
+    const source = 'export default pi => pi.registerCommand("brief", {handler: async()=>{}});\n';
+    if (kind === "user extension") await put(path.join(f.agent, "extensions", "brief.ts"), source);
+    if (kind === "project extension")
+      await put(path.join(f.checkout, ".omp", "extensions", "custom.ts"), source);
+    if (kind === "legacy project extension")
+      await put(path.join(f.checkout, ".pi", "extensions", "custom.ts"), source);
+    if (kind === "file command")
+      await put(path.join(f.agent, "commands", "brief.md"), "User command\n");
+    if (kind === "relative configured source") {
+      await put(path.join(f.checkout, "custom.ts"), source);
+      await put(path.join(f.agent, "config.yml"), "extensions:\n  - ./custom.ts\n");
+    }
+    if (kind === "legacy manifest") {
+      const pkg = path.join(f.agent, "extensions", "older-package");
+      await put(path.join(pkg, "package.json"), {
+        name: "older-package",
+        pi: { extensions: ["./custom.ts"] },
+      });
+      await put(path.join(pkg, "custom.ts"), source);
+    }
+    if (kind === "configured directory") {
+      await put(path.join(f.checkout, "custom-extensions", "custom.ts"), source);
+      await put(path.join(f.agent, "config.yml"), "extensions:\n  - ./custom-extensions\n");
+    }
+    if (kind === "direct optional config") {
+      await put(path.join(f.agent, "config.yml"), "extensions:\n  - ./src/brief\n");
+    }
+    await rejectedWithoutWrites(f, /Existing brief/, "--with-brief");
+    await absent(f.link);
+  });
+
+  test.each([
+    "foreign link",
+    "dependency",
+    "stale state",
+    "marketplace",
+  ])("rejects optional package %s without changing native registries", async (kind) => {
+    const f = await fixture();
+    if (kind === "foreign link") {
+      const link = path.join(f.plugins, "node_modules", briefName);
+      await mkdir(path.dirname(link), { recursive: true });
+      await symlink(path.join(f.base, "other-brief"), link, directoryLink);
+    }
+    if (kind === "dependency") await put(f.package, { dependencies: { [briefName]: "^0.1.0" } });
+    if (kind === "stale state")
+      await put(f.lock, { plugins: { [briefName]: pluginState() }, settings: {} });
+    if (kind === "marketplace")
+      await put(f.installed, {
+        version: 2,
+        plugins: { [`${briefName}@catalog`]: [{ installPath: path.join(f.base, "missing") }] },
+      });
+    await rejectedWithoutWrites(
+      f,
+      /not a link|installed as a package|stale registration|installed from marketplace/,
+      "--with-brief",
+    );
+  });
+});
+
+test.each([
+  "empty extensions",
+  "feature entrypoint",
+])("optional brief conflict detection inspects native %s", async (kind) => {
+  const f = await fixture();
+  const pkg = path.join(f.agent, "extensions", "other-package");
+  const source = 'export default pi => pi.registerCommand("brief", {handler: async()=>{}});\n';
+  if (kind === "empty extensions") {
+    await put(path.join(pkg, "package.json"), { name: "other-package", omp: { extensions: [] } });
+    await put(path.join(pkg, "index.ts"), source);
+  } else {
+    await put(path.join(pkg, "package.json"), {
+      name: "other-package",
+      omp: {
+        extensions: ["./main.ts"],
+        features: { prompts: { default: false, extensions: ["./prompt-command.ts"] } },
+      },
+    });
+    await put(path.join(pkg, "main.ts"), "export default () => {};\n");
+    await put(path.join(pkg, "prompt-command.ts"), source);
+  }
+  await rejectedWithoutWrites(f, /Existing brief/, "--with-brief");
 });
