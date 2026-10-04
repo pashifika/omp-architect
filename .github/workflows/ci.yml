@@ -3,7 +3,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [master]
+    branches: [main]
   workflow_dispatch:
 
 # CI never needs repository write access, including on fork pull requests.
@@ -86,11 +86,40 @@ jobs:
         timeout-minutes: 5
         run: bun run check:package
 
+  dev-install:
+    name: dev-install (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2025]
+    steps:
+      - name: Check out the source tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Bun toolchain
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        timeout-minutes: 5
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install locked dependencies
+        timeout-minutes: 5
+        run: bun install --frozen-lockfile
+
+      - name: Verify native development installation in isolated homes
+        timeout-minutes: 5
+        run: bun run test:dev-install
+
   # Stable, single branch-protection target. Every prerequisite must succeed;
   # an unexpected skip, cancellation, or failure must produce a red gate.
   ci:
     name: ci
-    needs: [quality, integration]
+    needs: [quality, integration, dev-install]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5

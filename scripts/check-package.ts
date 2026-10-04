@@ -24,6 +24,8 @@ try {
   const files = listing.split("\n");
   for (const file of [
     "index.ts",
+    ".omp-plugin/marketplace.json",
+    "scripts/dev-install.ts",
     "src/extension.ts",
     "src/reviewer.ts",
     "src/auto/extension.ts",

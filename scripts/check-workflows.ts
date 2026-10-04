@@ -97,6 +97,13 @@ for (const file of files) {
   }
 
   if (file === "ci.yml") {
+    const triggers = mapping(workflow.on, `${file} triggers`);
+    const pushes = mapping(triggers.push, `${file} push trigger`);
+    assert(
+      JSON.stringify(pushes.branches) === JSON.stringify(["main"]) &&
+        Object.hasOwn(triggers, "pull_request"),
+      `${file}: run for pull requests and pushes to the main default branch`,
+    );
     const gate = mapping(jobs.ci, `${file} ci gate`);
     assert(gate.name === "ci", `${file}: preserve the stable ci check name`);
     assert(
@@ -119,3 +126,53 @@ assert(actions > 0, "No action references found; the pin check would verify noth
 console.log(
   `workflows: ${files.length} workflow(s), ${actions} immutable action reference(s) checked`,
 );
+
+// Desired-state files are reviewed with code, but this check neither applies
+// them nor queries GitHub's live settings. The aggregate name is shared policy.
+const ruleset = mapping(
+  JSON.parse(await readFile(new URL("../.github/rulesets/main.json", import.meta.url), "utf8")),
+  "main ruleset",
+);
+assert(
+  ruleset.name === "main" && ruleset.target === "branch" && ruleset.enforcement === "active",
+  "main ruleset: expected an active branch ruleset named main",
+);
+assert(
+  Array.isArray(ruleset.bypass_actors) && ruleset.bypass_actors.length === 0,
+  "main ruleset: no bypass actors are allowed",
+);
+const refs = mapping(mapping(ruleset.conditions, "ruleset conditions").ref_name, "ruleset refs");
+assert(
+  JSON.stringify(refs.include) === JSON.stringify(["~DEFAULT_BRANCH"]) &&
+    JSON.stringify(refs.exclude) === "[]",
+  "main ruleset: target only the default branch with no exclusions",
+);
+assert(Array.isArray(ruleset.rules), "main ruleset: expected rules");
+const rules = ruleset.rules.map((value) => mapping(value, "main ruleset rule"));
+assert(
+  JSON.stringify(rules.map((rule) => rule.type).sort()) ===
+    JSON.stringify(["deletion", "non_fast_forward", "pull_request", "required_status_checks"]),
+  "main ruleset: protect deletion, force pushes, pull requests and required checks exactly once",
+);
+const pullRequest = mapping(
+  rules.find((rule) => rule.type === "pull_request")?.parameters,
+  "main pull request parameters",
+);
+assert(
+  pullRequest.required_review_thread_resolution === true &&
+    JSON.stringify(pullRequest.allowed_merge_methods) === JSON.stringify(["merge"]),
+  "main ruleset: require resolved review threads and merge commits",
+);
+const checks = mapping(
+  rules.find((rule) => rule.type === "required_status_checks")?.parameters,
+  "main required checks",
+);
+assert(
+  checks.strict_required_status_checks_policy === true &&
+    checks.do_not_enforce_on_create === false &&
+    Array.isArray(checks.required_status_checks) &&
+    checks.required_status_checks.length === 1 &&
+    mapping(checks.required_status_checks[0], "main required check").context === "ci",
+  "main ruleset: require exactly the stable ci gate with strict up-to-date checks",
+);
+console.log("rulesets: main desired state validated (live GitHub enforcement is not checked)");
