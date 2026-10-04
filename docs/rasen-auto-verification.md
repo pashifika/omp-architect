@@ -28,6 +28,12 @@ Real-host testing exposed two lifecycle traps, now covered by regressions: OMP i
 
 Formatting and TypeScript passed; 51 unit tests (327 assertions) and 33 smoke tests (219 assertions) passed. The 24-entry packed extension loaded against locked OMP, workflow safety checks passed, and `git diff --check` was clean. CI must still verify the published commit separately.
 
+## CI packaging portability
+
+The first remote integration run exposed npm 10's `pack --ignore-scripts` behavior: `prepare` still ran, rebuilt Rasen after stamping, and mixed lifecycle output into `--json`. This behavior was fixed in [npm CLI #7850](https://github.com/npm/cli/pull/7850) for npm 11. The preparation script now installs **npm 11.9.0** beside **pnpm 9.15.9** in its isolated tools directory, verifies the selected versions, and uses that toolchain for the unmodified upstream pack helper and local tarball install.
+
+Before building Rasen, the script packs a tiny fixture in dry-run and real modes. Its `prepare` would print output, delete the stamp and fail if called. Both paths must return valid JSON without running it; the actual tarball must retain the stamp. This guards against silently accepting an unstamped or rebuilt artifact. Runtime versions are printed and saved with the local build provenance. The corrected fresh-clone build was reproduced starting with the CI image's Node 22.23.3 and npm 10.9.9; it selected npm 11.9.0, preserved the installed development stamp, and passed all 33 smoke tests under Node 22.23.3.
+
 ## Reproduce
 
 ```sh

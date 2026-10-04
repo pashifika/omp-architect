@@ -8,6 +8,8 @@ import * as path from "node:path";
 const SOURCE = "https://github.com/DumoeDss/rasen.git";
 const SHA = "f0ae20d19a30c265ad3f3ffaaa5bb3cd148d12dd";
 const VERSION = "0.1.8";
+const NPM_VERSION = "11.9.0";
+const PNPM_VERSION = "9.15.9";
 const repo = path.resolve(import.meta.dir, "..");
 const stampPath = path.join(repo, "node_modules", ".cache", "omp-architect", "rasen-build.json");
 const args = process.argv.slice(2);
@@ -55,6 +57,10 @@ function run(executable: string, argv: string[], cwd = workspace, quiet = false)
   return result.stdout.trim();
 }
 
+console.log(
+  `Rasen bootstrap: ${run("node", ["--version"], workspace, true)}, npm ${run("npm", ["--version"], workspace, true)}`,
+);
+
 if (!suppliedSource) {
   await fs.mkdir(source);
   run("git", ["init", "--quiet"], source);
@@ -81,12 +87,72 @@ run("npm", [
   "--ignore-scripts",
   "--no-audit",
   "--no-fund",
-  "pnpm@9.15.9",
+  `pnpm@${PNPM_VERSION}`,
+  `npm@${NPM_VERSION}`,
 ]);
 env.PATH = `${path.join(tooling, "node_modules", ".bin")}${path.delimiter}${process.env.PATH ?? ""}`;
 const pnpm = path.join(tooling, "node_modules", ".bin", "pnpm");
-if (run(pnpm, ["--version"], workspace, true) !== "9.15.9")
-  throw new Error("Wrong pnpm build tool");
+const npmVersion = run("npm", ["--version"], workspace, true);
+const pnpmVersion = run(pnpm, ["--version"], workspace, true);
+const nodeVersion = run("node", ["--version"], workspace, true);
+if (pnpmVersion !== PNPM_VERSION || npmVersion !== NPM_VERSION)
+  throw new Error("Wrong pinned Rasen package-manager toolchain");
+console.log(`Rasen build toolchain: ${nodeVersion}, npm ${npmVersion}, pnpm ${pnpmVersion}`);
+
+// npm 10's `pack --ignore-scripts` still runs prepare (npm/cli#7850), which
+// rebuilds Rasen after the helper stamps dist/ and contaminates --json stdout.
+// Prove both pack paths honor the pinned npm 11 lifecycle contract before using
+// the unchanged upstream helper. All fixture files remain in this private tempdir.
+const packFixture = path.join(workspace, "pack-contract");
+await fs.mkdir(path.join(packFixture, "dist"), { recursive: true });
+await fs.writeFile(
+  path.join(packFixture, "package.json"),
+  JSON.stringify({
+    name: "omp-rasen-pack-contract",
+    version: "1.0.0",
+    files: ["dist"],
+    scripts: {
+      prepare:
+        "node -e \"console.log('unexpected prepare lifecycle');require('node:fs').rmSync('dist/build-info.json');require('node:fs').writeFileSync('prepare-ran', 'unexpected');process.exit(42)\"",
+    },
+  }),
+);
+const marker = '{"stamp":"must-survive-pack"}\n';
+await fs.writeFile(path.join(packFixture, "dist", "build-info.json"), marker);
+for (const dryRun of [true, false]) {
+  const metadata = JSON.parse(
+    run(
+      "npm",
+      ["pack", "--ignore-scripts", "--json", ...(dryRun ? ["--dry-run"] : [])],
+      packFixture,
+      true,
+    ),
+  );
+  if (
+    !Array.isArray(metadata) ||
+    metadata.length !== 1 ||
+    !Array.isArray(metadata[0].files) ||
+    !metadata[0].files.some((file: { path?: string }) => file.path === "dist/build-info.json") ||
+    (await fs.readFile(path.join(packFixture, "dist", "build-info.json"), "utf8")) !== marker ||
+    (await Bun.file(path.join(packFixture, "prepare-ran")).exists())
+  )
+    throw new Error("npm pack lifecycle contract failed");
+  if (!dryRun) {
+    if (
+      metadata[0].filename !== "omp-rasen-pack-contract-1.0.0.tgz" ||
+      run(
+        "tar",
+        ["-xOf", path.join(packFixture, metadata[0].filename), "package/dist/build-info.json"],
+        packFixture,
+        true,
+      ) !== marker.trim()
+    )
+      throw new Error("npm pack did not preserve the fixture stamp in the tarball");
+  }
+}
+console.log(
+  "npm pack regression passed: dry-run/pack skip prepare, emit JSON, and preserve the stamp",
+);
 run(
   pnpm,
   [
@@ -144,6 +210,7 @@ const stamp = {
   commit: SHA,
   version,
   executable,
+  toolchain: { node: nodeVersion, npm: npmVersion, pnpm: pnpmVersion },
   archiveSha256: createHash("sha256")
     .update(await fs.readFile(archive))
     .digest("hex"),
