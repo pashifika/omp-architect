@@ -11,7 +11,7 @@ const NAME = "omp-architect";
 const root = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const help = `Usage: bun run dev:install [--dry-run] [--no-marketplace]
 
-Link this checkout and register its local marketplace catalog using pinned OMP.
+Link this checkout and register its local marketplace catalog using its installed OMP.
 --dry-run         Check ownership and show the plan without running OMP or changing its files
 --no-marketplace  Only link the checkout
 --help            Show this help
@@ -57,7 +57,7 @@ function objectField(doc: Mapping, key: string, context: string): Mapping {
 type HostDirs = typeof import("@oh-my-pi/pi-utils/dirs");
 
 /**
- * Read-only counterpart of pinned OMP 18.5.1's env bootstrap. Importing its env
+ * Read-only counterpart of OMP's env bootstrap, based on the 18.5.1 baseline. Importing its env
  * module calls getProjectDir, which stages a native addon on Windows. Its main
  * discovery module also loads that addon and can delete old native caches on
  * any platform. Neither side effect belongs in a preflight or dry run.
@@ -104,7 +104,7 @@ async function loadEnvironment(dirs: HostDirs, checkout: string): Promise<void> 
   dirs.refreshDirsFromEnv();
 }
 
-/** Filesystem-only equivalent of pinned OMP's resolveActiveProjectRegistryPath. */
+/** Filesystem-only equivalent of OMP's resolveActiveProjectRegistryPath. */
 async function projectRegistryPath(dirs: HostDirs, checkout: string): Promise<string | null> {
   const normalize = dirs.normalizePathForComparison;
   const home = normalize(homedir());
@@ -199,13 +199,26 @@ async function main(): Promise<void> {
   }
   await readFile(path.join(checkout, "index.ts"));
   const hostEntry = import.meta.resolve("@oh-my-pi/pi-coding-agent");
-  const expectedHost = mapping(manifest.peerDependencies, "package.json: peerDependencies")[
+  const requiredHost = mapping(manifest.peerDependencies, "package.json: peerDependencies")[
     "@oh-my-pi/pi-coding-agent"
   ];
+  // This checkout declares a stable minimum, not an arbitrary semver range.
+  // Bun treats unparseable ranges as wildcards, so validate before comparison.
+  if (
+    typeof requiredHost !== "string" ||
+    !/^>=(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(requiredHost) ||
+    !Bun.semver.satisfies(requiredHost.slice(2), "*")
+  ) {
+    throw new Error("Invalid or unsupported OMP peer range; expected >=major.minor.patch");
+  }
   const host = await json(fileURLToPath(new URL("../package.json", hostEntry)));
-  if (host?.version !== expectedHost || dirs.VERSION !== expectedHost) {
+  if (
+    typeof host?.version !== "string" ||
+    !Bun.semver.satisfies(host.version, requiredHost) ||
+    dirs.VERSION !== host.version
+  ) {
     throw new Error(
-      "Installed OMP dependencies differ from this checkout's pin; run bun install --frozen-lockfile first",
+      "Installed OMP dependencies do not satisfy the checkout's peer range or have mismatched versions; run bun install --frozen-lockfile first",
     );
   }
 
@@ -376,7 +389,7 @@ async function main(): Promise<void> {
   console.log(
     "  build: not needed (OMP loads TypeScript)\n  MCP: not applicable (no server in this package)",
   );
-  // Run the host pinned by this checkout, not whichever unrelated omp happens to
+  // Run the host installed in this checkout, not whichever unrelated omp happens to
   // be on PATH. Argument vectors and fileURLToPath support spaces/Unicode/Windows.
   const cli = fileURLToPath(new URL("../dist/cli.js", hostEntry));
   const run = (args: string[]) => {

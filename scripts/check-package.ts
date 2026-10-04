@@ -48,7 +48,7 @@ try {
   if (files.some((file) => /\/node_modules\/|\/\.env|\/test\/|\/smoke\//.test(file)))
     throw new Error("Package includes private or development-only files");
   await run(["tar", "-xzf", tarball, "-C", temp], root);
-  // Link exactly the locked host dependencies; then load the actual packed artifact.
+  // Link the checkout's installed host dependencies; then load the actual packed artifact.
   // This does not publish anything or claim npm registry installation was exercised.
   await fs.symlink(
     path.join(root, "node_modules"),
@@ -58,7 +58,7 @@ try {
   const check = `import {loadExtensions} from '@oh-my-pi/pi-coding-agent/extensibility/extensions'; const r=await loadExtensions([${JSON.stringify(path.join(temp, "package", "index.ts"))}],${JSON.stringify(temp)}); if(r.errors.length||!r.extensions[0]?.tools.has('architect_checkpoint')||!r.extensions[0]?.tools.has('auto_status')||!r.extensions[0]?.commands.has('auto'))throw new Error(JSON.stringify(r.errors));`;
   await run([process.execPath, "-e", check], path.join(temp, "package"));
   console.log(
-    `Package verified: ${files.length} entries, packed extension loads against locked OMP`,
+    `Package verified: ${files.length} entries, packed extension loads against the checkout's installed OMP`,
   );
 } finally {
   await fs.rm(temp, { recursive: true, force: true });

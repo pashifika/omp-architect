@@ -13,7 +13,7 @@ while a separate reviewer checks plans, recovery approaches, and completion evid
 
 ## Install
 
-Install [Bun](https://bun.sh) 1.3.14+ and [OMP](https://omp.sh) 18.5.1, then:
+Install [Bun](https://bun.sh) 1.3.14+ and [OMP](https://omp.sh) 18.5.1 or newer, then:
 
 ```bash
 git clone https://github.com/pashifika/omp-architect.git
@@ -70,12 +70,27 @@ configured provider; do not include secrets. These checks do not replace tool ap
 
 ## Requirements
 
-- **OMP 18.5.1** with an authenticated model provider.
+- **OMP 18.5.1 or newer** with an authenticated model provider.
 - **Bun 1.3.14 or newer** to install dependencies and run the checkout installer.
 - **Git** to clone this repository.
 
-The extension targets OMP 18.5.1 exactly. See [verification coverage](docs/rasen-auto-verification.md)
-for tested integrations and limitations; no live generative-model end-to-end run is claimed.
+OMP 18.5.1 is the minimum supported host version; there is no upper version bound.
+Development tracks the latest OMP SDK releases. To update all three SDK packages together:
+
+```bash
+bun update @oh-my-pi/pi-ai @oh-my-pi/pi-coding-agent @oh-my-pi/pi-utils
+```
+
+After updating, restore these three `devDependencies` to `"latest"` in `package.json`
+and keep the OMP peer range at `">=18.5.1"`; Bun may save concrete version ranges.
+Then run `bun install --lockfile-only` to synchronize the lockfile with those declarations.
+Do not use `bun update --no-save` for a recorded update: it also skips saving the lockfile.
+
+`bun.lock` records reproducible dependency resolutions, not a host-version restriction.
+CI uses `bun install --frozen-lockfile` and does not automatically fetch newer SDK releases.
+See [Contributing](CONTRIBUTING.md) for update checks. The [verification record](docs/rasen-auto-verification.md)
+describes historical coverage and limitations; it is not a current compatibility matrix.
+Scoped live checkpoint checks do not establish full live Rasen Auto end-to-end coverage.
 
 ## License
 

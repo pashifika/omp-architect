@@ -5,6 +5,15 @@ import { createReviewer } from "./reviewer.ts";
 import { createAutoController, type AutoDependencies } from "./auto/extension.ts";
 import instructions from "./prompts/orchestration.md" with { type: "text" };
 
+// Only the documented canonical devices share their native tool identity.
+function effectiveToolName(toolName: string, input: object): string {
+  if (toolName === "write" && "path" in input) {
+    if (input.path === "xd://architect_checkpoint") return "architect_checkpoint";
+    if (input.path === "xd://auto_status") return "auto_status";
+  }
+  return toolName;
+}
+
 type ReviewerFactory = (pi: ExtensionAPI, ctx: ExtensionContext, config: Config) => Reviewer;
 export function extensionFactory(
   reviewerFactory: ReviewerFactory = createReviewer,
@@ -155,30 +164,27 @@ export function extensionFactory(
     pi.on("tool_call", (event, ctx) => {
       if (ctx.agent.kind !== "main") return;
       if (configError) return { block: true, reason: configError };
-      if (stopped && event.toolName !== "auto_status")
+      const toolName = effectiveToolName(event.toolName, event.input);
+      if (stopped && toolName !== "auto_status")
         return {
           block: true,
           reason:
             "OMP Architect stopped this request; start a new user request after resolving the blocker",
         };
-      const autoReason = auto.toolCall(event.toolCallId, event.toolName, { ...event.input }, ctx);
+      const autoReason = auto.toolCall(event.toolCallId, toolName, { ...event.input }, ctx);
       if (autoReason) return { block: true, reason: autoReason };
-      const reason = state?.gate(event.toolName, { ...event.input });
+      const reason = state?.gate(toolName, { ...event.input });
       if (reason) return { block: true, reason };
     });
     pi.on("tool_result", (event, ctx) => {
-      if (ctx.agent.kind !== "main" || !state || event.toolName === "auto_status") return;
+      if (ctx.agent.kind !== "main" || !state) return;
+      const toolName = effectiveToolName(event.toolName, event.input);
+      if (toolName === "auto_status" || toolName === "architect_checkpoint") return;
       const text = event.content
         .filter((c) => c.type === "text")
         .map((c) => c.text)
         .join("\n");
-      const repeated = state.observe(
-        event.toolCallId,
-        event.toolName,
-        event.input,
-        text,
-        event.isError,
-      );
+      const repeated = state.observe(event.toolCallId, toolName, event.input, text, event.isError);
       if (repeated)
         return {
           additionalContext:
@@ -268,26 +274,14 @@ export function extensionFactory(
         return continueWith(
           "OMP Architect: unresolved repeated failure. Run architect_checkpoint phase=recovery, or report the blocker honestly. Do not claim completion.",
         );
-      const message = event.last_assistant_message;
-      const summary =
-        message && "content" in message && Array.isArray(message.content)
-          ? message.content.flatMap((c) => (c.type === "text" ? [c.text] : [])).join("\n")
-          : "No completion summary was supplied.";
-      const current = state;
-      const requestGeneration = generation;
-      const verdict = await review("completion", summary, ctx, event.signal);
-      if (event.signal.aborted || state !== current || generation !== requestGeneration) return;
-      if (
-        verdict.decision !== "approve" &&
-        state.phaseReviews.completion >= state.config.reviews.max
-      ) {
-        stopBlocked(verdict.summary, ctx);
-        return;
-      }
-      if (verdict.decision !== "approve")
+      const pendingPlan = state.gate("write", {});
+      if (pendingPlan)
         return continueWith(
-          `OMP Architect completion review: ${JSON.stringify(verdict)}. Address the findings and run architect_checkpoint, or clearly report that work is blocked.`,
+          `OMP Architect: ${pendingPlan} Resolve the pending checkpoint before completion. Do not claim completion.`,
         );
+      return continueWith(
+        "OMP Architect: completion remains unverified. Run architect_checkpoint phase=completion with factual evidence, address any findings, or report the blocker honestly. Do not claim completion before approval.",
+      );
     });
     pi.registerCommand("architect", {
       description: "Show role routing, review budget, and checkpoint status",

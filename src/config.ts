@@ -14,7 +14,7 @@ export const defaults: Config = {
   repeatedErrorThreshold: 2,
   substantialPlanSteps: 3,
   reviews: { min: 1, max: 3 },
-  reviewTimeoutMs: 25000,
+  reviewTimeoutMs: 120000,
   maxEvidenceChars: 24000,
 };
 
@@ -62,7 +62,7 @@ export function parseConfig(value: unknown): Config {
     repeatedErrorThreshold: [2, 10],
     substantialPlanSteps: [2, 20],
 
-    reviewTimeoutMs: [100, 25000],
+    reviewTimeoutMs: [100, 120000],
     maxEvidenceChars: [1000, 100000],
   };
   for (const [key, [min, max]] of Object.entries(limits)) {

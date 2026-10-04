@@ -1,6 +1,6 @@
 # Installation and plugin management
 
-Install Bun and OMP using their official installation instructions, then:
+Install Bun 1.3.14+ and OMP 18.5.1 or newer using their official installation instructions, then:
 
 ```bash
 git clone https://github.com/pashifika/omp-architect.git
@@ -9,7 +9,7 @@ bun install --frozen-lockfile
 bun run dev:install       # link this checkout and register its local catalog
 ```
 
-`dev:install` uses the checkout's pinned OMP CLI to link the package (including
+`dev:install` uses the checkout's installed OMP CLI to link the package (including
 its agents) and register `.omp-plugin/marketplace.json` from this checkout. It
 works offline after dependencies are installed, including before the catalog is
 published. Restart OMP after installing or changing source. No build is needed:
@@ -46,6 +46,29 @@ omp-architect` refreshes it manually. The catalog's GitHub source follows the
 repository's default branch (no branch name or unpublished release tag is
 hard-coded). Registering a catalog does not install from it. Linked checkouts
 use source changes directly and are not upgraded by `omp plugin upgrade`.
+
+## Updating OMP SDK dependencies
+
+OMP 18.5.1 is the minimum supported host version, with no upper bound. The
+development SDK dependencies track `latest`; update them together:
+
+```bash
+bun update @oh-my-pi/pi-ai @oh-my-pi/pi-coding-agent @oh-my-pi/pi-utils
+```
+
+Bun may save concrete version ranges during the update. Restore the three SDK
+`devDependencies` to `"latest"` in `package.json` and keep the OMP peer range at
+`">=18.5.1"`, then run `bun install --lockfile-only` to synchronize the lockfile.
+Do not use `bun update --no-save` for a recorded update: it also skips saving the lockfile.
+
+Run the [development and integration checks](../CONTRIBUTING.md#development-and-verification)
+after updating, and restart OMP. This updates the checkout's SDK dependencies,
+not a separately installed OMP CLI; update that installation through its own installer.
+`bun.lock` records the tested dependency resolutions for reproducibility, not a
+host-version restriction. CI uses `bun install --frozen-lockfile` to reproduce
+those resolutions rather than fetching newer SDK releases automatically.
+
+## Removal and alternative setups
 
 To remove this development installation, use OMP under the same profile:
 

@@ -78,7 +78,7 @@ jobs:
         timeout-minutes: 5
         run: bun run prepare:rasen
 
-      - name: Smoke-test against the pinned OMP runtime
+      - name: Smoke-test against the lockfile-resolved OMP runtime
         timeout-minutes: 5
         run: bun run test:smoke
 

@@ -73,7 +73,7 @@ async function fixture(
     await mkdir(path.dirname(target), { recursive: true });
     await copyFile(path.join(repository, file), target);
   }
-  // The native host and source dependencies are real, pinned repository deps.
+  // The native host and source dependencies are real, installed repository deps.
   await symlink(
     path.join(repository, "node_modules"),
     path.join(checkout, "node_modules"),
@@ -266,7 +266,7 @@ afterEach(async () => {
   for (const base of fixtures.splice(0)) await rm(base, { recursive: true, force: true });
 });
 
-describe("development installer against the pinned native OMP host", () => {
+describe("development installer against the installed native OMP host", () => {
   test("fresh install links the checkout, registers runtime state, and caches the local catalog", async () => {
     const f = await fixture();
     const protectedFiles = await sentinels(f);
@@ -799,13 +799,41 @@ describe("development installer against the pinned native OMP host", () => {
     await absent(f.link);
   });
 
-  test("rejects a checkout host pin that disagrees with the resolved native dependencies", async () => {
+  test("accepts the minimum OMP peer range for dry run and native installation", async () => {
     const f = await fixture();
     const file = path.join(f.checkout, "package.json");
     const manifest = await readJson(file);
-    manifest.peerDependencies["@oh-my-pi/pi-coding-agent"] = "0.0.0-test-mismatch";
+    manifest.peerDependencies["@oh-my-pi/pi-coding-agent"] = ">=18.5.1";
     await put(file, manifest);
-    await rejectedWithoutWrites(f, /pinned|pin|version|dependencies/i);
+    const protectedFiles = await sentinels(f);
+    const before = await snapshot(f.base);
+    succeeded(install(f, "--dry-run"));
+    expect(await snapshot(f.base)).toEqual(before);
+    await absent(f.link);
+    succeeded(install(f));
+    expect(await realpath(f.link)).toBe(await realpath(f.checkout));
+    expect((await readJson(f.lock)).plugins[name]).toEqual(pluginState());
+    const registry = await readJson(f.marketplaces);
+    expect(registry.marketplaces).toHaveLength(1);
+    expect(registry.marketplaces[0].name).toBe(name);
+    await unchanged(protectedFiles);
+  }, 30_000);
+
+  test.each([
+    { scenario: "incompatible minimum", range: ">=999.0.0" },
+    { scenario: "malformed range", range: "not-a-version" },
+    { scenario: "partially malformed range", range: ">=18.5.1 garbage" },
+    { scenario: "empty range", range: "" },
+    { scenario: "missing range", range: undefined },
+    { scenario: "null range", range: null },
+    { scenario: "non-string range", range: [">=18.5.1"] },
+  ])("rejects $scenario for the OMP host before writes", async ({ range }) => {
+    const f = await fixture();
+    const file = path.join(f.checkout, "package.json");
+    const manifest = await readJson(file);
+    manifest.peerDependencies["@oh-my-pi/pi-coding-agent"] = range;
+    await put(file, manifest);
+    await rejectedWithoutWrites(f, /version|dependencies|range/i);
     await absent(f.link);
   });
 
