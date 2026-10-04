@@ -1,0 +1,17 @@
+{
+  "name": "omp-architect",
+  "owner": { "name": "pashifika" },
+  "metadata": { "description": "Selective role-based orchestration for Oh My Pi" },
+  "plugins": [
+    {
+      "name": "omp-architect",
+      "version": "0.1.0",
+      "description": "Selective model roles, bounded architect reviews and opt-in Rasen Auto orchestration.",
+      "source": { "source": "github", "repo": "pashifika/omp-architect" },
+      "homepage": "https://github.com/pashifika/omp-architect",
+      "repository": "https://github.com/pashifika/omp-architect",
+      "license": "Apache-2.0",
+      "tags": ["orchestration", "architect", "review", "rasen"]
+    }
+  ]
+}
