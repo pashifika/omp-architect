@@ -93,3 +93,68 @@ test("explicit and automatic checkpoints at max publish blocked status and abort
     await fs.rm(cwd, { recursive: true, force: true });
   }
 });
+
+test("ordinary Architect preserves minimum rounds across host before_agent_start continuation delivery", async () => {
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-architect-continuation-"));
+  await Bun.write(
+    path.join(cwd, ".omp", "architect.json"),
+    JSON.stringify({ reviews: { min: 2, max: 2 } }),
+  );
+  const runtime = new ExtensionRuntime();
+  let reviews = 0;
+  runtime.sendMessage = () => {};
+  const extension = await loadExtensionFromFactory(
+    extensionFactory(() => async () => {
+      reviews++;
+      return { decision: "approve", summary: "Evidence reviewed", issues: [] };
+    }),
+    cwd,
+    new EventBus(),
+    runtime,
+  );
+  const ctx = {
+    cwd,
+    agent: { kind: "main", id: "main", name: "main", depth: 0 },
+    ui: { notify() {} },
+    abort() {},
+  } as unknown as ExtensionContext;
+  const before = extension.handlers.get("before_agent_start")![0];
+  const stop = extension.handlers.get("session_stop")![0];
+  const event = {
+    type: "session_stop",
+    signal: new AbortController().signal,
+    last_assistant_message: {
+      role: "assistant",
+      content: [{ type: "text", text: "Actual fixture evidence" }],
+    },
+  };
+  try {
+    await extension.handlers.get("session_start")![0]({ type: "session_start" }, ctx);
+    await before(
+      { type: "before_agent_start", prompt: "Real user request", systemPrompt: [] },
+      ctx,
+    );
+    const first = (await stop(event, ctx)) as { continue?: boolean; additionalContext: string };
+    expect(first.continue).toBe(true);
+    expect(reviews).toBe(1);
+    await before(
+      { type: "before_agent_start", prompt: first.additionalContext, systemPrompt: [] },
+      ctx,
+    );
+    expect(await stop(event, ctx)).toBeUndefined();
+    expect(reviews).toBe(2);
+    // A genuine interactive user input cannot impersonate the stored continuation.
+    await extension.handlers.get("input")![0](
+      { type: "input", text: first.additionalContext, source: "interactive" },
+      ctx,
+    );
+    await before(
+      { type: "before_agent_start", prompt: first.additionalContext, systemPrompt: [] },
+      ctx,
+    );
+    expect(((await stop(event, ctx)) as { continue?: boolean }).continue).toBe(true);
+    expect(reviews).toBe(3);
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});

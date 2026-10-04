@@ -74,6 +74,10 @@ jobs:
         timeout-minutes: 5
         run: bun install --frozen-lockfile
 
+      - name: Build and locally install the pinned Rasen development source
+        timeout-minutes: 5
+        run: bun run prepare:rasen
+
       - name: Smoke-test against the pinned OMP runtime
         timeout-minutes: 5
         run: bun run test:smoke

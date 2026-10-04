@@ -1,0 +1,5 @@
+# Merge only when opting in to /auto. This is a native OMP setting.
+# Auto uses foreground main-session tools so its deadline can abort them.
+bash:
+  autoBackground:
+    enabled: false

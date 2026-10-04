@@ -10,6 +10,8 @@ test("real OMP loader registers checkpoint, routing and stop handlers without in
   expect(loaded.errors).toEqual([]);
   const extension = loaded.extensions[0];
   expect(extension.tools.has("architect_checkpoint")).toBe(true);
+  expect(extension.tools.has("auto_status")).toBe(true);
+  expect(extension.commands.has("auto")).toBe(true);
   for (const name of [
     "before_agent_start",
     "before_subagent_spawn",

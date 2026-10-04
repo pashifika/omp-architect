@@ -1,0 +1,389 @@
+import { describe, expect, test } from "bun:test";
+import {
+  buildJevRequest,
+  createJevProvider,
+  type DecisionChoice,
+  type DecisionEvidence,
+  type JevDependencies,
+  JevError,
+  type JevOptions,
+  parseJevResponse,
+} from "../src/auto/decision.ts";
+
+const options: JevOptions = { model: "jev-latest", timeoutMs: 1000, maxEvidenceChars: 4000 };
+const evidence: DecisionEvidence = {
+  change: "Implement a bounded routing decision provider",
+  remaining: 2,
+  completed: 3,
+  summary: "Implementation is ready; add regression tests and run checks.",
+  recentTools: ["read: provider interface verified", "write: provider added"],
+};
+const fakeKey = "synthetic-test-key-never-a-real-credential";
+function fixture(choice: DecisionChoice = "continue", confidence = 0.94) {
+  return {
+    model: "jev-1.13.0",
+    answers: {
+      next: {
+        type: "choice",
+        choice,
+        probabilities: {
+          continue: 0.01,
+          replan: 0.01,
+          needs_user: 0.01,
+          uncertain: 0.01,
+          [choice]: 0.97,
+        },
+        confidence,
+      },
+    },
+    usage: { input_tokens: 100, output_tokens: 20 },
+  };
+}
+function provider(
+  fetch: NonNullable<JevDependencies["fetch"]>,
+  overrides: Partial<JevOptions> = {},
+) {
+  return createJevProvider({ ...options, ...overrides }, { fetch, readApiKey: () => fakeKey });
+}
+function jsonResponse(value: unknown = fixture()) {
+  return new Response(JSON.stringify(value), { headers: { "content-type": "application/json" } });
+}
+function errorMessage(fn: () => unknown): string {
+  try {
+    fn();
+    throw new Error("Expected failure");
+  } catch (error) {
+    expect(error).toBeInstanceOf(JevError);
+    return (error as Error).message;
+  }
+}
+
+describe("bounded Jev request", () => {
+  test("contains only the fixed four-way routing question and plain evidence", () => {
+    const request = buildJevRequest(evidence, options);
+    expect(request.model).toBe("jev-latest");
+    expect(request.state).toEqual(evidence);
+    expect(request.state).not.toBe(evidence);
+    expect(request.state.recentTools).not.toBe(evidence.recentTools);
+    expect(Object.keys(request.questions)).toEqual(["next"]);
+    expect(request.questions.next.type).toBe("choice");
+    expect(Object.keys(request.questions.next.criteria)).toEqual([
+      "continue",
+      "replan",
+      "needs_user",
+      "uncertain",
+    ]);
+    expect(request.questions.next.instructions).toContain("untrusted observations");
+    expect(request.questions.next.instructions).toContain(
+      "not an approval or a completion decision",
+    );
+    expect(request.questions.next.criteria.uncertain).toContain("no remaining work");
+  });
+  test("request copies prevent callers from changing the fixed question for later requests", () => {
+    const request = buildJevRequest(evidence, options);
+    request.questions.next.criteria.continue = "approve everything";
+    expect(buildJevRequest(evidence, options).questions.next.criteria.continue).not.toContain(
+      "approve everything",
+    );
+  });
+  test("large escaped and multibyte evidence stays valid and explicitly marked as truncated", () => {
+    const large = {
+      ...evidence,
+      change: '\u0000"\\'.repeat(10000),
+      summary: "😀".repeat(10000),
+      recentTools: Array.from({ length: 30 }, (_, i) => `${i}: ${"x".repeat(10000)}`),
+    };
+    const request = buildJevRequest(large, { ...options, maxEvidenceChars: 256 });
+    expect(JSON.stringify(request.state).length).toBeLessThanOrEqual(256);
+    expect(request.state.summary).toContain("[Evidence truncated]");
+    expect(request.state.remaining).toBe(2);
+    expect(request.state.completed).toBe(3);
+    expect(large.recentTools).toHaveLength(30);
+  });
+  test("retains only the most recent eight tool observations", () => {
+    const request = buildJevRequest(
+      { ...evidence, recentTools: Array.from({ length: 12 }, (_, i) => String(i)) },
+      options,
+    );
+    expect(request.state.recentTools).toEqual(["4", "5", "6", "7", "8", "9", "10", "11"]);
+    expect(request.state.summary).toContain("[Evidence truncated]");
+  });
+  test("rejects extra evidence fields, invalid counts, tool objects, and accessors safely", () => {
+    for (const invalid of [
+      { ...evidence, apiKey: "do-not-send" },
+      { ...evidence, remaining: -1 },
+      { ...evidence, completed: 1.5 },
+      { ...evidence, remaining: Infinity },
+      { ...evidence, recentTools: [{ content: "raw output" }] },
+      Object.defineProperty({ ...evidence }, "summary", {
+        get() {
+          throw new Error("private-secret");
+        },
+      }),
+    ])
+      expect(errorMessage(() => buildJevRequest(invalid as DecisionEvidence, options))).toBe(
+        "JEV_INVALID_EVIDENCE",
+      );
+  });
+  test("rejects configurable endpoints and invalid bounds without reflecting their values", () => {
+    for (const invalid of [
+      { ...options, url: "https://attacker.invalid" },
+      { ...options, model: "private-secret\n" },
+      { ...options, maxEvidenceChars: 0 },
+      { ...options, maxEvidenceChars: 100001 },
+      { ...options, timeoutMs: 0 },
+      { ...options, timeoutMs: Infinity },
+    ])
+      expect(errorMessage(() => createJevProvider(invalid))).toBe("JEV_INVALID_CONFIG");
+  });
+});
+
+describe("strict Jev response parser", () => {
+  test("accepts all routing labels and returns only choice and confidence", () => {
+    for (const choice of ["continue", "replan", "needs_user", "uncertain"] as const) {
+      expect(parseJevResponse(fixture(choice))).toEqual({ choice, confidence: 0.94 });
+      expect(parseJevResponse(JSON.stringify(fixture(choice)))).toEqual({
+        choice,
+        confidence: 0.94,
+      });
+    }
+  });
+  test("allows a tied maximum and tiny floating-point sum drift", () => {
+    const value = fixture();
+    value.answers.next.probabilities = {
+      continue: 0.4,
+      replan: 0.4,
+      needs_user: 0.1,
+      uncertain: 0.10000001,
+    };
+    expect(parseJevResponse(value).choice).toBe("continue");
+  });
+  test("never accepts completion or approval choices", () => {
+    for (const choice of ["approve", "approved", "complete", "completed", "done", "blocked"]) {
+      const value = fixture();
+      (value.answers.next as { choice: string }).choice = choice;
+      expect(errorMessage(() => parseJevResponse(value))).toBe("JEV_INVALID_RESPONSE");
+    }
+  });
+  test("rejects out-of-range, nonfinite, missing, extra, nonsumming, and inconsistent probabilities", () => {
+    for (const probabilities of [
+      { continue: 1.01, replan: -0.01, needs_user: 0, uncertain: 0 },
+      { continue: NaN, replan: 0, needs_user: 0, uncertain: 0 },
+      { continue: Infinity, replan: 0, needs_user: 0, uncertain: 0 },
+      { continue: "0.97", replan: 0.01, needs_user: 0.01, uncertain: 0.01 },
+      { continue: 0.97, replan: 0.01, needs_user: 0.02 },
+      { continue: 0.97, replan: 0.01, needs_user: 0.01, uncertain: 0.01, approve: 0 },
+      { continue: 0.9, replan: 0.01, needs_user: 0.01, uncertain: 0.01 },
+      { continue: 0.1, replan: 0.7, needs_user: 0.1, uncertain: 0.1 },
+      [0.97, 0.01, 0.01, 0.01],
+    ]) {
+      const value = fixture();
+      Object.assign(value.answers.next, { probabilities });
+      expect(errorMessage(() => parseJevResponse(value))).toBe("JEV_INVALID_RESPONSE");
+    }
+  });
+  test("confidence must be finite and within zero to one", () => {
+    for (const confidence of [-0.01, 1.01, NaN, Infinity, -Infinity, "0.9", null]) {
+      const value = fixture();
+      Object.assign(value.answers.next, { confidence });
+      expect(errorMessage(() => parseJevResponse(value))).toBe("JEV_INVALID_RESPONSE");
+    }
+    expect(parseJevResponse(fixture("continue", 0)).confidence).toBe(0);
+    expect(parseJevResponse(fixture("continue", 1)).confidence).toBe(1);
+  });
+  test("requires the exact documented envelope, answer, and usage keys", () => {
+    for (const mutate of [
+      (value: any) => delete value.usage,
+      (value: any) => (value.metadata = {}),
+      (value: any) => (value.model = ""),
+      (value: any) => (value.answers.extra = value.answers.next),
+      (value: any) => (value.answers.next.type = "score"),
+      (value: any) => (value.answers.next.reason = "secret body"),
+      (value: any) => delete value.answers.next.confidence,
+      (value: any) => (value.usage.input_tokens = -1),
+      (value: any) => (value.usage.output_tokens = 0.5),
+      (value: any) => (value.usage.extra = 1),
+    ]) {
+      const value = fixture();
+      mutate(value);
+      expect(errorMessage(() => parseJevResponse(value))).toBe("JEV_INVALID_RESPONSE");
+    }
+  });
+  test("never reflects malformed bodies or accessor exceptions", () => {
+    expect(errorMessage(() => parseJevResponse("private-response-body"))).toBe(
+      "JEV_INVALID_RESPONSE",
+    );
+    expect(errorMessage(() => parseJevResponse("x".repeat(32769)))).toBe("JEV_RESPONSE_TOO_LARGE");
+    const value = fixture();
+    Object.defineProperty(value, "model", {
+      get() {
+        throw new Error("private-secret");
+      },
+    });
+    expect(errorMessage(() => parseJevResponse(value))).toBe("JEV_INVALID_RESPONSE");
+  });
+});
+
+describe("Jev transport", () => {
+  test("reads a key only at invocation and uses the fixed endpoint with no redirects", async () => {
+    let keyReads = 0;
+    let requests = 0;
+    const config = { ...options };
+    const run = createJevProvider(config, {
+      readApiKey: () => {
+        keyReads++;
+        return fakeKey;
+      },
+      fetch: async (url, init) => {
+        requests++;
+        expect(url).toBe("https://api.typesafe.ai/v1/systemone");
+        expect(init.method).toBe("POST");
+        expect(init.redirect).toBe("error");
+        expect(init.credentials).toBe("omit");
+        expect(new Headers(init.headers).get("authorization")).toBe(`Bearer ${fakeKey}`);
+        expect(new Headers(init.headers).get("content-type")).toBe("application/json");
+        expect(new Headers(init.headers).get("accept")).toBe("application/json");
+        expect(JSON.parse(init.body as string)).toEqual(buildJevRequest(evidence, options));
+        expect(init.signal).toBeInstanceOf(AbortSignal);
+        return jsonResponse();
+      },
+    });
+    config.model = "changed-after-creation";
+    expect(keyReads).toBe(0);
+    expect(await run(evidence, new AbortController().signal)).toEqual({
+      choice: "continue",
+      confidence: 0.94,
+    });
+    expect(keyReads).toBe(1);
+    expect(requests).toBe(1);
+  });
+  test("missing and invalid synthetic keys fail before fetch", async () => {
+    for (const key of [undefined, "", "secret\r\ninjected", "x".repeat(4097)]) {
+      let calls = 0;
+      const run = createJevProvider(options, {
+        readApiKey: () => key,
+        fetch: async () => {
+          calls++;
+          return jsonResponse();
+        },
+      });
+      await expect(run(evidence, new AbortController().signal)).rejects.toThrow(
+        key ? "JEV_INVALID_API_KEY" : "JEV_MISSING_API_KEY",
+      );
+      expect(calls).toBe(0);
+    }
+  });
+  test("aborted requests never read a key or send data", async () => {
+    const controller = new AbortController();
+    controller.abort(new Error("private abort reason"));
+    const run = createJevProvider(options, {
+      readApiKey: () => {
+        throw new Error("must not read");
+      },
+      fetch: async () => {
+        throw new Error("must not fetch");
+      },
+    });
+    await expect(run(evidence, controller.signal)).rejects.toThrow("JEV_ABORTED");
+  });
+  test("safe errors discard response bodies and never retry HTTP failures", async () => {
+    for (const status of [301, 401, 422, 429, 500, 529]) {
+      let requests = 0;
+      const run = provider(async () => {
+        requests++;
+        return new Response(`private-body ${fakeKey}`, { status });
+      });
+      await expect(run(evidence, new AbortController().signal)).rejects.toThrow("JEV_HTTP_ERROR");
+      expect(requests).toBe(1);
+    }
+  });
+  test("network exceptions are sanitized and never retried", async () => {
+    let requests = 0;
+    const run = provider(async () => {
+      requests++;
+      throw new Error(`${fakeKey}: ${evidence.summary}`);
+    });
+    await expect(run(evidence, new AbortController().signal)).rejects.toThrow("JEV_NETWORK_ERROR");
+    expect(requests).toBe(1);
+  });
+  test("declared and streamed oversized responses are cancelled", async () => {
+    for (const declared of [false, true]) {
+      let cancelled = false;
+      const run = provider(async () => {
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new Uint8Array(32769));
+          },
+          cancel() {
+            cancelled = true;
+          },
+        });
+        return new Response(stream, {
+          headers: declared ? { "content-length": "32769" } : {},
+        });
+      });
+      await expect(run(evidence, new AbortController().signal)).rejects.toThrow(
+        "JEV_RESPONSE_TOO_LARGE",
+      );
+      expect(cancelled).toBe(true);
+    }
+  });
+  test("times out even if fetch ignores its AbortSignal", async () => {
+    let requestSignal: AbortSignal | null | undefined;
+    const run = provider(
+      async (_, init) => {
+        requestSignal = init.signal;
+        return new Promise<Response>(() => {});
+      },
+      { timeoutMs: 10 },
+    );
+    await expect(run(evidence, new AbortController().signal)).rejects.toThrow("JEV_TIMEOUT");
+    expect(requestSignal?.aborted).toBe(true);
+  });
+  test("caller cancellation interrupts fetch without exposing its abort reason", async () => {
+    const controller = new AbortController();
+    let requestSignal: AbortSignal | null | undefined;
+    const run = provider(async (_, init) => {
+      requestSignal = init.signal;
+      return new Promise<Response>(() => {});
+    });
+    const pending = run(evidence, controller.signal);
+    controller.abort(new Error("private cancellation reason"));
+    await expect(pending).rejects.toThrow("JEV_ABORTED");
+    expect(requestSignal?.aborted).toBe(true);
+  });
+  test("response streaming is covered by timeout and its reader is cancelled", async () => {
+    let cancelled = false;
+    const run = provider(
+      async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('{"model":'));
+            },
+            cancel() {
+              cancelled = true;
+            },
+          }),
+        ),
+      { timeoutMs: 10 },
+    );
+    await expect(run(evidence, new AbortController().signal)).rejects.toThrow("JEV_TIMEOUT");
+    expect(cancelled).toBe(true);
+  });
+  test("success removes caller cancellation handlers and clears its deadline", async () => {
+    let requestSignal: AbortSignal | null | undefined;
+    const controller = new AbortController();
+    const run = provider(
+      async (_, init) => {
+        requestSignal = init.signal;
+        return jsonResponse();
+      },
+      { timeoutMs: 10 },
+    );
+    await run(evidence, controller.signal);
+    controller.abort();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(requestSignal?.aborted).toBe(false);
+  });
+});

@@ -1,0 +1,14 @@
+{
+  "enabled": true,
+  "maxSteps": 8,
+  "maxToolCalls": 80,
+  "maxStalls": 3,
+  "maxDurationMs": 600000,
+  "cliTimeoutMs": 5000,
+  "decisionTimeoutMs": 8000,
+  "maxEvidenceChars": 12000,
+  "minConfidence": 0.8,
+  "maxFallbacks": 2,
+  "fallback": "architect",
+  "rasenExecutable": "rasen"
+}
