@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "skipLibCheck": true,
+    "types": ["bun"],
+    "resolveJsonModule": true
+  },
+  "include": ["index.ts", "src/**/*.ts", "test/**/*.ts", "smoke/**/*.ts", "scripts/**/*.ts"]
+}

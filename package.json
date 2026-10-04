@@ -1,0 +1,47 @@
+{
+  "name": "omp-architect",
+  "version": "0.1.0",
+  "description": "Selective role-based orchestration and bounded architect checkpoints for Oh My Pi",
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pashifika/omp-architect.git"
+  },
+  "engines": {
+    "bun": ">=1.3.14"
+  },
+  "files": [
+    "index.ts",
+    "src",
+    "agents",
+    "examples",
+    "README.md",
+    "LICENSE"
+  ],
+  "omp": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "bun test ./test",
+    "typecheck": "tsc --noEmit",
+    "format": "biome format --write .",
+    "format:check": "biome format .",
+    "check": "bun run format:check && bun run typecheck && bun run test",
+    "test:smoke": "bun test smoke --timeout 30000",
+    "check:package": "bun run scripts/check-package.ts",
+    "check:workflows": "bun run scripts/check-workflows.ts"
+  },
+  "peerDependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.5.1"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.5.1",
+    "@types/bun": "1.3.14",
+    "typescript": "5.9.3",
+    "@biomejs/biome": "2.3.14",
+    "@oh-my-pi/pi-ai": "18.5.1"
+  }
+}
