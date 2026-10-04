@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Config } from "./config.ts";
 
 export type Phase = "plan" | "recovery" | "completion";
@@ -7,12 +7,49 @@ export interface Verdict {
   summary: string;
   issues: string[];
 }
+export interface ReviewMaterial {
+  ref: string;
+  sha256: string;
+  bytes: number;
+  content: string;
+  source: "authored" | "auto";
+}
 export interface ReviewRequest {
   phase: Phase;
   evidence: string;
+  material: ReviewMaterial;
+  canonicalPlan: string[];
+  invocationId: string;
   revision: number;
 }
+export type ReviewStatus =
+  | "input_rejected"
+  | "provider_verdict"
+  | "caller_cancelled"
+  | "timed_out"
+  | "stale"
+  | "unavailable"
+  | "cache_hit"
+  | "budget_exhausted"
+  | "in_flight";
+export interface ReviewOutcome {
+  invocationId: string;
+  phase: Phase;
+  status: ReviewStatus;
+  charged: boolean;
+  attempt: number;
+  revision: number;
+  artifactRef: string | null;
+  sha256: string | null;
+  verdict: Verdict | null;
+}
 export type Reviewer = (request: ReviewRequest, signal: AbortSignal) => Promise<Verdict>;
+
+function cancellationStatus(signal: AbortSignal): "timed_out" | "caller_cancelled" {
+  return signal.reason instanceof Error && signal.reason.name === "TimeoutError"
+    ? "timed_out"
+    : "caller_cancelled";
+}
 
 export function digest(text: string): string {
   return createHash("sha256").update(text).digest("hex");
@@ -121,32 +158,64 @@ function boundedPlan(steps: string[], limit: number): string[] {
   }
   return result;
 }
+function boundedStructure(value: unknown, limit: number): unknown {
+  if (jsonSize(value, true) <= limit) return value;
+  const preview = { truncated: true, preview: "" };
+  if (jsonSize(preview, true) + jsonSize(omitted, true) - jsonSize("", true) > limit)
+    return jsonSize({ truncated: true }, true) <= limit ? { truncated: true } : null;
+  preview.preview = boundedText(
+    JSON.stringify(value),
+    limit - jsonSize(preview, true) + jsonSize("", true),
+    true,
+  );
+  return preview;
+}
 function boundedEvidence(
+  id: string,
   tool: string,
   input: Record<string, unknown>,
   output: string,
   isError: boolean,
   limit: number,
   denied = false,
+  hostMetadata?: unknown,
 ): string {
-  const record = {
-    tool: boundedText(tool, Math.min(100, Math.floor(limit / 8)), true),
-    input,
+  const record: {
+    tool: string;
+    toolCallId: string;
+    input: unknown;
+    output: string;
+    isError: boolean;
+    kind?: string;
+    executed?: boolean;
+    hostMetadata?: unknown;
+  } = {
+    tool: boundedText(tool, Math.min(100, Math.floor(limit / 10)), true),
+    toolCallId: boundedText(id, Math.min(200, Math.floor(limit / 10)), true),
+    input: {},
     output: "",
     isError,
     ...(denied ? { kind: "gate_denial", executed: false } : {}),
   };
-  const inputText = JSON.stringify(input);
-  const inputLimit = Math.floor(limit / 4);
-  if (inputText.length > inputLimit || jsonSize(inputText) > inputLimit) {
-    const preview = { truncated: true, preview: "" };
-    preview.preview = boundedText(
-      inputText,
-      inputLimit - jsonSize(preview, true) + jsonSize("", true),
-      true,
-    );
-    record.input = preview;
+  // Reserve the minimum explicit-loss output before assigning structured field budgets.
+  const outputReserve = jsonSize(omitted, true) - jsonSize("", true);
+  if (hostMetadata !== undefined) {
+    let metadata: unknown;
+    try {
+      metadata = JSON.parse(JSON.stringify(hostMetadata));
+    } catch {
+      metadata = { truncated: true };
+    }
+    record.hostMetadata = {};
+    const metadataLimit =
+      Math.floor((limit - jsonSize(record, true) - outputReserve) / 3) + jsonSize({}, true);
+    record.hostMetadata = boundedStructure(metadata, metadataLimit);
   }
+  const inputLimit = Math.min(
+    Math.floor(limit / 4),
+    limit - jsonSize(record, true) - outputReserve + jsonSize({}, true),
+  );
+  record.input = boundedStructure(input, inputLimit);
   // Include the second JSON encoding: evidence records remain strings in the snapshot.
   record.output = boundedText(output, limit - jsonSize(record, true) + jsonSize("", true), true);
   return JSON.stringify(record);
@@ -164,12 +233,14 @@ export class Orchestrator {
   approvedPlan = "";
   #approvedSteps: string[] = [];
   blocked = "";
+  lastReview: ReviewOutcome | null = null;
   request = "";
   evidence: string[] = [];
   #seen = new Set<string>();
   #failures = new Map<string, { key: string; count: number }>();
   #cache = new Map<string, Verdict>();
   #inFlight = false;
+  #latestInvocation = 0;
   #evidenceChars = 0;
   #omittedEvidence = 0;
   constructor(readonly config: Config) {}
@@ -183,6 +254,8 @@ export class Orchestrator {
   begin(request: string): void {
     this.request = request;
     this.revision++;
+    this.#latestInvocation++;
+    this.lastReview = null;
     this.reviewCount = 0;
     this.stopContinuations = 0;
     this.completionRevision = -1;
@@ -216,11 +289,12 @@ export class Orchestrator {
     input: Record<string, unknown>,
     output: string,
     isError: boolean,
+    hostMetadata?: unknown,
   ): boolean {
     if (tool === "architect_checkpoint" || this.#seen.has(id)) return false;
     this.#seen.add(id);
     this.invalidate();
-    this.recordEvidence(tool, input, output, isError);
+    this.recordEvidence(id, tool, input, output, isError, false, hostMetadata);
     if (!isError) {
       this.#failures.delete(tool);
       return false;
@@ -237,23 +311,27 @@ export class Orchestrator {
     if (this.#seen.has(id)) return;
     this.#seen.add(id);
     this.invalidate();
-    this.recordEvidence(tool, input, reason, true, true);
+    this.recordEvidence(id, tool, input, reason, true, true);
   }
   private recordEvidence(
+    id: string,
     tool: string,
     input: Record<string, unknown>,
     output: string,
     isError: boolean,
     denied = false,
+    hostMetadata?: unknown,
   ): void {
     // One record cannot consume the ring or the space reserved for checkpoint context.
     const entry = boundedEvidence(
+      id,
       tool,
       input,
       output,
       isError,
       Math.floor(this.config.maxEvidenceChars / 3),
       denied,
+      hostMetadata,
     );
     this.evidence.push(entry);
     this.#evidenceChars += jsonSize(entry) + 1;
@@ -292,8 +370,10 @@ export class Orchestrator {
       completion: !this.completionApproved,
     };
     for (const phase of ["plan", "recovery", "completion"] as const) {
-      if (unresolved[phase] && this.phaseReviews[phase] >= this.config.reviews.max)
-        return `Architect ${phase} review budget exhausted with unresolved work. ${this.blocked}`.trim();
+      if (unresolved[phase] && this.phaseReviews[phase] >= this.config.reviews.max) {
+        const detail = this.lastReview?.phase === phase ? this.lastReview.verdict?.summary : "";
+        return `Architect ${phase} review budget exhausted with unresolved work. ${detail ?? ""}`.trim();
+      }
     }
   }
   gate(tool: string, input: Record<string, unknown>): string | undefined {
@@ -326,11 +406,10 @@ export class Orchestrator {
       }
     }
   }
-  snapshot(phase: Phase, summary: string): string {
+  snapshot(phase: Phase): string {
     const snapshot = {
       phase,
       request: "",
-      summary: "",
       pendingPlan: [] as string[],
       pendingRecovery: this.pendingRecovery,
       recentToolEvidence: [] as string[],
@@ -339,7 +418,6 @@ export class Orchestrator {
     // Reserve at least half the available space for whole, newest-first evidence.
     const contextLimit = Math.floor((this.config.maxEvidenceChars - jsonSize(snapshot)) / 6);
     snapshot.request = boundedText(this.request, contextLimit);
-    snapshot.summary = boundedText(summary, contextLimit);
     snapshot.pendingPlan = boundedPlan(this.pendingPlan, contextLimit);
     let remaining = this.config.maxEvidenceChars - jsonSize(snapshot);
     for (let i = this.evidence.length - 1; i >= 0; i--) {
@@ -362,105 +440,216 @@ export class Orchestrator {
     }
     if (phase === "recovery") this.pendingRecovery = true;
   }
+  private recordReview(
+    invocation: number,
+    outcome: Omit<ReviewOutcome, "verdict">,
+    verdict: Verdict | null,
+  ): Verdict | null {
+    const bounded = verdict === null ? null : parseVerdict(JSON.stringify(verdict));
+    if (invocation === this.#latestInvocation) {
+      this.lastReview = { ...outcome, verdict: bounded };
+      this.blocked = bounded && bounded.decision !== "approve" ? bounded.summary : "";
+    }
+    return bounded;
+  }
+  /** Record an artifact/schema preflight failure without admitting a provider attempt. */
+  rejectReview(
+    phase: Phase,
+    invocationId: string,
+    message: string,
+    status: "input_rejected" | "caller_cancelled" = "input_rejected",
+  ): Verdict {
+    const invocation = ++this.#latestInvocation;
+    this.revokeApproval(phase);
+    if (this.#inFlight) this.invalidate();
+    return this.recordReview(
+      invocation,
+      {
+        invocationId: invocationId.slice(0, 200),
+        phase,
+        status,
+        charged: false,
+        attempt: this.phaseReviews[phase],
+        revision: this.revision,
+        artifactRef: null,
+        sha256: null,
+      },
+      {
+        decision: "blocked",
+        summary: message.trim() || "Architect review input rejected",
+        issues: [],
+      },
+    )!;
+  }
   async review(
     phase: Phase,
-    summary: string,
+    material: ReviewMaterial,
     reviewer: Reviewer,
     signal?: AbortSignal,
+    invocationId: string = randomUUID(),
   ): Promise<Verdict> {
+    const invocation = ++this.#latestInvocation;
+    const outcome: Omit<ReviewOutcome, "verdict"> = {
+      invocationId: invocationId.slice(0, 200),
+      phase,
+      status: "input_rejected",
+      charged: false,
+      attempt: this.phaseReviews[phase],
+      revision: this.revision,
+      artifactRef: typeof material?.ref === "string" ? material.ref.slice(0, 2000) : null,
+      sha256: typeof material?.sha256 === "string" ? material.sha256.slice(0, 64) : null,
+    };
+    const finish = (status: ReviewStatus, verdict: Verdict): Verdict =>
+      this.recordReview(invocation, { ...outcome, status }, verdict)!;
+    const reject = (summary: string, issues: string[] = []): Verdict => {
+      this.revokeApproval(phase);
+      if (this.#inFlight) this.invalidate();
+      outcome.revision = this.revision;
+      return finish("input_rejected", { decision: "blocked", summary, issues });
+    };
+    if (
+      !material ||
+      typeof material.ref !== "string" ||
+      !material.ref.trim() ||
+      typeof material.content !== "string" ||
+      !material.content.trim() ||
+      !Number.isSafeInteger(material.bytes) ||
+      material.bytes !== Buffer.byteLength(material.content, "utf8") ||
+      material.bytes > this.config.maxReviewBytes ||
+      typeof material.sha256 !== "string" ||
+      !/^[a-f0-9]{64}$/.test(material.sha256) ||
+      material.sha256 !== digest(material.content) ||
+      (material.source !== "authored" && material.source !== "auto")
+    )
+      return reject(
+        `Architect review requires a non-empty, verified artifact with matching SHA-256 and UTF-8 byte length, at most ${this.config.maxReviewBytes} bytes. No review round was charged.`,
+      );
+    // Take an immutable copy so the admitted body and cache identity cannot diverge.
+    const accepted = Object.freeze({ ...material });
     if (signal?.aborted) {
       this.revokeApproval(phase);
-      return { decision: "blocked", summary: "Architect review cancelled", issues: [] };
+      if (this.#inFlight) this.invalidate();
+      outcome.revision = this.revision;
+      const status = cancellationStatus(signal);
+      return finish(status, {
+        decision: "blocked",
+        summary: `Architect review ${status === "timed_out" ? "timed out" : "cancelled"} before admission. No review round was charged.`,
+        issues: [],
+      });
     }
     if (
       phase === "plan" &&
       (!this.pendingPlan.length || this.pendingPlan.some((step) => !step.trim()))
-    ) {
-      this.revokeApproval(phase);
-      return {
-        decision: "blocked",
-        summary:
-          "Plan checkpoint requires non-empty steps. Pass steps explicitly, or stage a substantial todo first. No review round was charged.",
-        issues: ["No valid canonical plan steps to approve"],
-      };
-    }
+    )
+      return reject(
+        "Plan checkpoint requires non-empty steps. Pass steps explicitly, or stage a substantial todo first. No review round was charged.",
+        ["No valid canonical plan steps to approve"],
+      );
+    if (
+      this.pendingPlan.length > 30 ||
+      this.pendingPlan.some((step) => step.length > 1000) ||
+      Buffer.byteLength(JSON.stringify(this.pendingPlan), "utf8") > this.config.maxReviewBytes
+    )
+      return reject(
+        `Canonical plan exceeds the review limit: at most 30 steps, 1000 characters per step, and ${this.config.maxReviewBytes} UTF-8 bytes. No review round was charged.`,
+      );
+    const canonicalPlan = [...this.pendingPlan];
+    Object.freeze(canonicalPlan);
+    const planKey = digest(JSON.stringify(canonicalPlan));
     if (
       phase === "completion" &&
       (this.pendingRecovery ||
         (this.pendingPlan.length && digest(JSON.stringify(this.pendingPlan)) !== this.approvedPlan))
-    ) {
-      this.completionRevision = -1;
-      return {
-        decision: "blocked",
-        summary: "Resolve the pending plan or recovery checkpoint before completion",
-        issues: ["Earlier checkpoint is unresolved"],
-      };
-    }
-    const evidence = this.snapshot(phase, summary);
-    const key = digest(`${this.revision}:${evidence}`);
+    )
+      return reject("Resolve the pending plan or recovery checkpoint before completion", [
+        "Earlier checkpoint is unresolved",
+      ]);
+    const evidence = this.snapshot(phase);
+    const key = digest(`${this.revision}:${accepted.sha256}:${planKey}:${evidence}`);
     const cached = this.#cache.get(key);
     if (
       cached &&
       (phase !== "completion" || cached.decision !== "approve" || this.completionApproved)
     )
-      return cached;
+      return finish("cache_hit", cached);
     this.revokeApproval(phase);
     if (this.#inFlight) {
       this.invalidate();
-      return {
+      outcome.revision = this.revision;
+      return finish("in_flight", {
         decision: "blocked",
-        summary: "Another architect review is in progress",
+        summary: "Another architect review is in progress. No review round was charged.",
         issues: [],
-      };
+      });
     }
     if (
       this.phaseReviews[phase] >= this.config.reviews.max ||
       this.reviewCount >= 3 * this.config.reviews.max
-    ) {
-      this.blocked =
-        "Architect review budget exhausted. Report the unresolved work; ask the operator for a new request.";
-      return { decision: "blocked", summary: this.blocked, issues: [] };
-    }
-    if (phase === "completion") this.completionRevision = -1;
-    this.#cache.clear();
+    )
+      return finish("budget_exhausted", {
+        decision: "blocked",
+        summary:
+          "Architect review budget exhausted. Report the unresolved work; ask the operator for a new request.",
+        issues: [],
+      });
     this.#inFlight = true;
     this.reviewCount++;
     this.phaseReviews[phase]++;
+    outcome.charged = true;
+    outcome.attempt = this.phaseReviews[phase];
+    this.recordReview(invocation, { ...outcome, status: "in_flight" }, null);
     const revision = this.revision;
     const timeout = new AbortController();
     const combined = signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal;
     const timer = setTimeout(
-      () => timeout.abort(new Error("Architect review timed out")),
+      () => timeout.abort(new DOMException("Architect review timed out", "TimeoutError")),
       this.config.reviewTimeoutMs,
     );
-    try {
-      const cancelled = new Promise<never>((_, reject) => {
-        combined.addEventListener(
-          "abort",
-          () => reject(combined.reason ?? new Error("Architect review cancelled")),
-          { once: true },
-        );
-      });
-      const verdict = await Promise.race([
-        reviewer({ phase, evidence, revision }, combined),
-        cancelled,
-      ]);
-      if (combined.aborted || this.revision !== revision)
-        return {
+    const interrupted = (): Verdict | undefined => {
+      if (
+        this.revision !== revision ||
+        invocation !== this.#latestInvocation ||
+        digest(JSON.stringify(this.pendingPlan)) !== planKey
+      )
+        return finish("stale", {
           decision: "blocked",
           summary: "Review became stale while evidence changed; run a new checkpoint",
           issues: [],
-        };
-
+        });
+      if (combined.aborted) {
+        const status = cancellationStatus(combined);
+        return finish(status, {
+          decision: "blocked",
+          summary:
+            status === "timed_out" ? "Architect review timed out" : "Architect review cancelled",
+          issues: [],
+        });
+      }
+    };
+    let onAbort: (() => void) | undefined;
+    try {
+      const cancelled = new Promise<never>((_, reject) => {
+        onAbort = () => reject(combined.reason ?? new Error("Architect review cancelled"));
+        combined.addEventListener("abort", onAbort, { once: true });
+      });
+      const returned = await Promise.race([
+        reviewer(
+          { phase, evidence, material: accepted, canonicalPlan, invocationId, revision },
+          combined,
+        ),
+        cancelled,
+      ]);
+      const interruption = interrupted();
+      if (interruption) return interruption;
+      const verdict = parseVerdict(JSON.stringify(returned));
       this.phaseRounds[phase]++;
-      this.blocked = verdict.decision === "blocked" ? verdict.summary : "";
       if (verdict.decision === "approve") {
         if (this.phaseRounds[phase] < this.config.reviews.min)
-          return {
+          return finish("provider_verdict", {
             decision: "revise",
             summary: `${phase} review round ${this.phaseRounds[phase]}/${this.config.reviews.min}; request an independent current-state or delta review`,
             issues: ["Minimum independent review rounds not yet met"],
-          };
+          });
         if (phase === "completion" && !this.pendingRecovery) this.completionRevision = revision;
         if (phase === "recovery") {
           this.pendingRecovery = false;
@@ -472,20 +661,18 @@ export class Orchestrator {
         }
       }
       this.#cache.set(key, verdict);
-      return verdict;
+      return finish("provider_verdict", verdict);
     } catch (error) {
-      if (this.revision !== revision)
-        return {
-          decision: "blocked",
-          summary: "Review became stale after cancellation or evidence change",
-          issues: [],
-        };
-      this.blocked = combined.aborted
-        ? "Architect review cancelled or timed out"
-        : `Architect unavailable: ${error instanceof Error ? error.message : String(error)}`;
-      return { decision: "blocked", summary: this.blocked, issues: [] };
+      const interruption = interrupted();
+      if (interruption) return interruption;
+      return finish("unavailable", {
+        decision: "blocked",
+        summary: `Architect unavailable: ${error instanceof Error ? error.message : String(error)}`,
+        issues: [],
+      });
     } finally {
       clearTimeout(timer);
+      if (onAbort) combined.removeEventListener("abort", onAbort);
       this.#inFlight = false;
     }
   }

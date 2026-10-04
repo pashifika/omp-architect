@@ -34,20 +34,26 @@ test("explicit checkpoints at max publish blocked status and abort without anoth
   }));
   try {
     await expect(
-      fixture.checkpoint.execute("first-completion", { phase: "completion", summary: "Done" }),
+      fixture.checkpoint.execute("first-completion", {
+        phase: "completion",
+        evidenceRef: await fixture.evidence("Done"),
+      }),
     ).resolves.toMatchObject({ isError: true, details: { decision: "revise" } });
     expect(fixture.requests).toHaveLength(1);
     expect(fixture.aborts()).toBe(1);
     expect(fixture.notices()).toBe(1);
     await expect(
-      fixture.checkpoint.execute("blocked-retry", { phase: "completion", summary: "Retry" }),
+      fixture.checkpoint.execute("blocked-retry", {
+        phase: "completion",
+        evidenceRef: await fixture.evidence("Retry"),
+      }),
     ).rejects.toThrow();
     expect(fixture.requests).toHaveLength(1);
     expect(fixture.notices()).toBe(1);
     await expect(
       fixture.childCheckpoint.execute("child-completion", {
         phase: "completion",
-        summary: "Worker",
+        evidenceRef: await fixture.evidence("Worker"),
       }),
     ).resolves.toMatchObject({ isError: true });
     expect(fixture.requests).toHaveLength(1);
@@ -61,7 +67,10 @@ test("explicit checkpoints at max publish blocked status and abort without anoth
     await expect(
       fixture.write.execute("continued-completion", {
         path: "xd://architect_checkpoint",
-        content: JSON.stringify({ phase: "completion", summary: "All done" }),
+        content: JSON.stringify({
+          phase: "completion",
+          evidenceRef: await fixture.evidence("All done"),
+        }),
       }),
     ).resolves.toMatchObject({
       isError: true,
@@ -86,7 +95,10 @@ test("ordinary Architect preserves minimum rounds across host before_agent_start
     await expect(
       fixture.write.execute("completion-round-1", {
         path: "xd://architect_checkpoint",
-        content: JSON.stringify({ phase: "completion", summary: "Actual fixture evidence" }),
+        content: JSON.stringify({
+          phase: "completion",
+          evidenceRef: await fixture.evidence("Actual fixture evidence"),
+        }),
       }),
     ).resolves.toMatchObject({
       isError: true,
@@ -102,7 +114,7 @@ test("ordinary Architect preserves minimum rounds across host before_agent_start
         path: "xd://architect_checkpoint",
         content: JSON.stringify({
           phase: "completion",
-          summary: "Independent current-state evidence",
+          evidenceRef: await fixture.evidence("Independent current-state evidence"),
         }),
       }),
     ).resolves.toMatchObject({
@@ -122,7 +134,7 @@ test("ordinary Architect preserves minimum rounds across host before_agent_start
     await expect(
       fixture.checkpoint.execute("new-request-round-1", {
         phase: "completion",
-        summary: "Evidence for the new request",
+        evidenceRef: await fixture.evidence("Evidence for the new request"),
       }),
     ).resolves.toMatchObject({ isError: true, details: { decision: "revise" } });
     expect(fixture.requests).toHaveLength(3);
@@ -158,7 +170,7 @@ async function xdCheckpointFixture(
       runtime,
     );
     const settings = Settings.isolated({ "tools.approvalMode": "yolo" });
-    const sessionManager = SessionManager.inMemory(cwd);
+    const sessionManager = SessionManager.create(cwd, path.join(cwd, ".test-sessions"));
     // No model or credentials are needed: only the independent reviewer is synthetic.
     const modelRegistry = { getAvailable: () => [] } as unknown as ModelRegistry;
     const runner = new ExtensionRunner(
@@ -253,6 +265,11 @@ async function xdCheckpointFixture(
     return {
       cwd,
       requests,
+      async evidence(content: string): Promise<string> {
+        const id = await sessionManager.saveArtifact(content, "architect-review");
+        if (!id) throw new Error("Fixture review artifact was not saved");
+        return `artifact://${id}`;
+      },
       checkpoint,
       childCheckpoint,
       status,
@@ -316,7 +333,10 @@ test("xd checkpoint reviews staged substantial todo before allowing filesystem e
     await expect(
       fixture.write.execute("plan-round-1", {
         path: "xd://architect_checkpoint",
-        content: JSON.stringify({ phase: "plan", summary: "Review the staged fixture steps" }),
+        content: JSON.stringify({
+          phase: "plan",
+          evidenceRef: await fixture.evidence("Review the staged fixture steps"),
+        }),
       }),
     ).resolves.toMatchObject({
       isError: true,
@@ -332,7 +352,7 @@ test("xd checkpoint reviews staged substantial todo before allowing filesystem e
         path: "xd://architect_checkpoint",
         content: JSON.stringify({
           phase: "plan",
-          summary: "Independent current-state fixture review",
+          evidenceRef: await fixture.evidence("Independent current-state fixture review"),
         }),
       }),
     ).resolves.toMatchObject({
@@ -369,7 +389,7 @@ test("xd completion approval survives its outer write result but fresh filesyste
         path: "xd://architect_checkpoint",
         content: JSON.stringify({
           phase: "completion",
-          summary: "Review the completed fixture evidence",
+          evidenceRef: await fixture.evidence("Review the completed fixture evidence"),
         }),
       }),
     ).resolves.toMatchObject({
@@ -393,7 +413,7 @@ test("xd completion approval survives its outer write result but fresh filesyste
         path: "xd://architect_checkpoint",
         content: JSON.stringify({
           phase: "completion",
-          summary: "Review the new filesystem evidence",
+          evidenceRef: await fixture.evidence("Review the new filesystem evidence"),
         }),
       }),
     ).resolves.toMatchObject({
@@ -455,7 +475,10 @@ test("xd completion reviews the newest actual write despite oversized input and 
     await expect(
       fixture.write.execute("approve-evidence-plan", {
         path: "xd://architect_checkpoint",
-        content: JSON.stringify({ phase: "plan", summary: "Review the staged evidence plan" }),
+        content: JSON.stringify({
+          phase: "plan",
+          evidenceRef: await fixture.evidence("Review the staged evidence plan"),
+        }),
       }),
     ).resolves.toMatchObject({
       isError: false,
@@ -489,8 +512,9 @@ test("xd completion reviews the newest actual write despite oversized input and 
         path: "xd://architect_checkpoint",
         content: JSON.stringify({
           phase: "completion",
-          summary:
+          evidenceRef: await fixture.evidence(
             "Review the current successful filesystem write and its observed result. ".repeat(100),
+          ),
         }),
       }),
     ).resolves.toMatchObject({
@@ -560,7 +584,9 @@ test("xd completion retains the beginning and final status of a real SDK read re
         path: "xd://architect_checkpoint",
         content: JSON.stringify({
           phase: "completion",
-          summary: "Review the actual report including its final verification status",
+          evidenceRef: await fixture.evidence(
+            "Review the actual report including its final verification status",
+          ),
         }),
       }),
     ).resolves.toMatchObject({
@@ -630,7 +656,7 @@ test("xd slow explicit plan checkpoint approves beyond timeout and hook budgets 
       path: "xd://architect_checkpoint",
       content: JSON.stringify({
         phase: "plan",
-        summary: "Independent review of the staged slow fixture plan",
+        evidenceRef: await fixture.evidence("Independent review of the staged slow fixture plan"),
         steps,
       }),
     });
@@ -729,12 +755,15 @@ test("native and xd status remain read-only through pending plans, approval, and
     await checkStatus("pending-plan");
     expect(fixture.requests).toHaveLength(0);
     await expect(
-      fixture.checkpoint.execute("approve-plan", { phase: "plan", summary: "Review staged steps" }),
+      fixture.checkpoint.execute("approve-plan", {
+        phase: "plan",
+        evidenceRef: await fixture.evidence("Review staged steps"),
+      }),
     ).resolves.toMatchObject({ isError: false });
     await expect(
       fixture.checkpoint.execute("approve-completion", {
         phase: "completion",
-        summary: "Review current fixture evidence",
+        evidenceRef: await fixture.evidence("Review current fixture evidence"),
       }),
     ).resolves.toMatchObject({ isError: false });
     await checkStatus("approved-completion");
@@ -780,14 +809,14 @@ test("xd checkpoint failures do not become ordinary repeated tool failures", asy
       : { decision: "approve", summary: "Current evidence reviewed", issues: [] };
   });
   try {
-    // Distinct summaries bypass the evidence cache without an ordinary tool result between reviews.
+    // Distinct review artifacts bypass the evidence cache without an ordinary tool result between reviews.
     for (const id of ["first-review", "second-review"])
       await expect(
         fixture.write.execute(id, {
           path: "xd://architect_checkpoint",
           content: JSON.stringify({
             phase: "completion",
-            summary: `Review current evidence independently (${id})`,
+            evidenceRef: await fixture.evidence(`Review current evidence independently (${id})`),
           }),
         }),
       ).resolves.toMatchObject({
@@ -806,7 +835,10 @@ test("xd checkpoint failures do not become ordinary repeated tool failures", asy
     await expect(
       fixture.write.execute("approved-review", {
         path: "xd://architect_checkpoint",
-        content: JSON.stringify({ phase: "completion", summary: "Review the new verification" }),
+        content: JSON.stringify({
+          phase: "completion",
+          evidenceRef: await fixture.evidence("Review the new verification"),
+        }),
       }),
     ).resolves.toMatchObject({ isError: false });
     expect(fixture.requests.map((request) => request.phase)).toEqual([
@@ -854,7 +886,7 @@ test("real host returns canonical plan identity, explains punctuation mismatch a
   try {
     const result = await f.checkpoint.execute("approve-canonical", {
       phase: "plan",
-      summary: "Planning only",
+      evidenceRef: await f.evidence("Planning only"),
       steps: canonicalSteps,
     });
     const content = result.content[0];
@@ -893,7 +925,7 @@ test("real host rejects prose-only and empty replacement plans without charging 
     expect(
       await f.checkpoint.execute("prose-only", {
         phase: "plan",
-        summary: "Inspect, implement, verify",
+        evidenceRef: await f.evidence("Inspect, implement, verify"),
       }),
     ).toMatchObject({ isError: true, details: { decision: "blocked" } });
     expect(f.requests).toHaveLength(0);
@@ -903,7 +935,7 @@ test("real host rejects prose-only and empty replacement plans without charging 
     expect(
       await f.checkpoint.execute("empty", {
         phase: "plan",
-        summary: "Empty replacement",
+        evidenceRef: await f.evidence("Empty replacement"),
         steps: [],
       }),
     ).toMatchObject({ isError: true });
@@ -914,7 +946,7 @@ test("real host rejects prose-only and empty replacement plans without charging 
     expect(
       await f.checkpoint.execute("review-staged", {
         phase: "plan",
-        summary: "Review staged actual steps",
+        evidenceRef: await f.evidence("Review staged actual steps"),
       }),
     ).toMatchObject({ isError: false });
     const snapshot = JSON.parse(f.requests[0].evidence);
@@ -939,7 +971,7 @@ for (const todoFirst of [true, false])
     try {
       await f.checkpoint.execute("approve", {
         phase: "plan",
-        summary: "Review",
+        evidenceRef: await f.evidence("Review"),
         steps: canonicalSteps,
       });
       const file = path.join(f.cwd, "batch.md");
@@ -978,16 +1010,16 @@ test.each([
     for (let i = 0; i < 2; i++)
       await f.checkpoint.execute(`review-${i}`, {
         phase,
-        summary: `Independent review ${i}`,
+        evidenceRef: await f.evidence(`Independent review ${i}`),
         ...(phase === "plan" ? { steps: canonicalSteps } : {}),
       });
     expect(f.aborts()).toBe(1);
     expect(f.notices()).toBe(1);
     expect(await f.stop()).toBeUndefined();
     expect(await f.stop()).toBeUndefined();
-    await expect(f.checkpoint.execute("retry", { phase, summary: "Futile retry" })).rejects.toThrow(
-      "stopped this request",
-    );
+    await expect(
+      f.checkpoint.execute("retry", { phase, evidenceRef: await f.evidence("Futile retry") }),
+    ).rejects.toThrow("stopped this request");
     expect(f.requests).toHaveLength(2);
     expect(f.aborts()).toBe(1);
     expect(f.notices()).toBe(1);
@@ -1015,7 +1047,7 @@ test.each([
           `cancel-${i}`,
           {
             phase,
-            summary: `Attempt ${i}`,
+            evidenceRef: await f.evidence(`Attempt ${i}`),
             ...(phase === "plan" ? { steps: canonicalSteps } : {}),
           },
           controller.signal,
@@ -1036,18 +1068,18 @@ test("last-round approvals remain usable across all three phases", async () => {
   try {
     await f.checkpoint.execute("plan", {
       phase: "plan",
-      summary: "Review exact plan",
+      evidenceRef: await f.evidence("Review exact plan"),
       steps: canonicalSteps,
     });
     await f.todo.execute("register", { op: "init", items: canonicalSteps });
     await f.checkpoint.execute("recovery", {
       phase: "recovery",
-      summary: "Review recovered approach",
+      evidenceRef: await f.evidence("Review recovered approach"),
     });
     await f.write.execute("execute", { path: path.join(f.cwd, "last-round"), content: "verified" });
     await f.checkpoint.execute("completion", {
       phase: "completion",
-      summary: "Review actual evidence",
+      evidenceRef: await f.evidence("Review actual evidence"),
     });
     expect(await f.stop()).toBeUndefined();
     expect(f.requests).toHaveLength(3);
@@ -1060,17 +1092,23 @@ test("last-round approvals remain usable across all three phases", async () => {
 
 test("below-budget blocked recovery remains retriable", async () => {
   const f = await xdCheckpointFixture({ min: 1, max: 2 }, async (request) =>
-    request.evidence.includes("Additional evidence")
+    request.material.content.includes("Additional evidence")
       ? { decision: "approve", summary: "Reviewed", issues: [] }
       : { decision: "blocked", summary: "Need evidence", issues: ["Inspect"] },
   );
   try {
-    await f.checkpoint.execute("first", { phase: "recovery", summary: "Initial evidence" });
+    await f.checkpoint.execute("first", {
+      phase: "recovery",
+      evidenceRef: await f.evidence("Initial evidence"),
+    });
     const next = await f.stop();
     expect(next?.continue).toBe(true);
     await f.before(next!.additionalContext!);
     expect(
-      await f.checkpoint.execute("second", { phase: "recovery", summary: "Additional evidence" }),
+      await f.checkpoint.execute("second", {
+        phase: "recovery",
+        evidenceRef: await f.evidence("Additional evidence"),
+      }),
     ).toMatchObject({ isError: false });
     expect(f.aborts()).toBe(0);
     expect(f.requests).toHaveLength(2);
@@ -1089,7 +1127,7 @@ test("new denial on final in-flight plan review is terminal stale evidence", asy
   try {
     const pending = f.checkpoint.execute("last-plan", {
       phase: "plan",
-      summary: "Review",
+      evidenceRef: await f.evidence("Review"),
       steps: canonicalSteps,
     });
     await started.promise;
@@ -1115,12 +1153,15 @@ test("structured blocked checkpoint ends an honest report without reviewing or c
   try {
     await f.checkpoint.execute("prior-approval", {
       phase: "completion",
-      summary: "Prior evidence",
+      evidenceRef: await f.evidence("Prior evidence"),
     });
     expect(
       await f.write.execute("honest-blocker", {
         path: "xd://architect_checkpoint",
-        content: JSON.stringify({ phase: "blocked", summary: "Operator authorization is missing" }),
+        content: JSON.stringify({
+          phase: "blocked",
+          evidenceRef: await f.evidence("Operator authorization is missing"),
+        }),
       }),
     ).toMatchObject({ isError: true });
     expect(await f.stop()).toBeUndefined();
@@ -1147,7 +1188,7 @@ test("final allowed review is not terminal while it is still in flight", async (
   try {
     const pending = f.checkpoint.execute("final-in-flight", {
       phase: "completion",
-      summary: "Review current evidence",
+      evidenceRef: await f.evidence("Review current evidence"),
     });
     await started.promise;
     const status = await f.status.execute("status-during-review", {});
@@ -1173,11 +1214,14 @@ test("stale ordinary continuation cannot restart a terminal request without genu
     expect(queued?.continue).toBe(true);
     await f.checkpoint.execute("stop-before-delivery", {
       phase: "blocked",
-      summary: "Need user decision",
+      evidenceRef: await f.evidence("Need user decision"),
     });
     await f.before(queued!.additionalContext!);
     await expect(
-      f.checkpoint.execute("stale-retry", { phase: "completion", summary: "Must not review" }),
+      f.checkpoint.execute("stale-retry", {
+        phase: "completion",
+        evidenceRef: await f.evidence("Must not review"),
+      }),
     ).rejects.toThrow("stopped this request");
     expect(await f.stop()).toBeUndefined();
     expect(f.requests).toHaveLength(0);
@@ -1188,7 +1232,7 @@ test("stale ordinary continuation cannot restart a terminal request without genu
     expect(
       await f.checkpoint.execute("new-user-review", {
         phase: "completion",
-        summary: "New request evidence",
+        evidenceRef: await f.evidence("New request evidence"),
       }),
     ).toMatchObject({ isError: false });
     expect(f.requests).toHaveLength(1);

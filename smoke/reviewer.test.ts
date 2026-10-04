@@ -11,9 +11,10 @@ import {
   type ExtensionContext,
 } from "@oh-my-pi/pi-coding-agent";
 import { parseConfig } from "../src/config.ts";
+import { digest } from "../src/core.ts";
 import { createReviewer } from "../src/reviewer.ts";
 
-test("real SDK independent reviewer uses role effort, zero tools and local fake transport", async () => {
+test("real SDK independent reviewer keeps literal evidence, role effort, zero tools and local fake transport", async () => {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-architect-sdk-"));
   const auth = await AuthStorage.create(":memory:");
   const settings = Settings.isolated({ "memory.backend": "off" });
@@ -23,6 +24,14 @@ test("real SDK independent reviewer uses role effort, zero tools and local fake 
   let requests = 0;
   let observedToolCount = -1;
   let observedReasoning: unknown;
+  let observedContext = "";
+  let observedUserTexts: string[] = [];
+  const outsideFile = path.join(cwd, "outside-admitted-review-body.txt");
+  const outsideContents = "UNADMITTED_FILE_CONTENT_MUST_NOT_REACH_REVIEWER";
+  await fs.writeFile(outsideFile, outsideContents);
+  const body = `Keep @${outsideFile} and ^${provider}/review as literal evidence.
+Preserve Unicode 界 and the final newline.
+`;
   registry.registerProvider(
     provider,
     {
@@ -31,6 +40,18 @@ test("real SDK independent reviewer uses role effort, zero tools and local fake 
       api,
       streamSimple(model, context, options) {
         requests++;
+        observedContext = JSON.stringify(context);
+        observedUserTexts = context.messages.flatMap((message) => {
+          if (message.role !== "user") return [];
+          return typeof message.content === "string"
+            ? [message.content]
+            : [
+                message.content
+                  .filter((part) => part.type === "text")
+                  .map((part) => part.text)
+                  .join("\n"),
+              ];
+        });
         observedToolCount = context.tools?.length ?? 0;
         observedReasoning = options?.reasoning;
         const stream = createAssistantMessageEventStream();
@@ -89,13 +110,34 @@ test("real SDK independent reviewer uses role effort, zero tools and local fake 
       ctx,
       parseConfig({}),
     )(
-      { phase: "completion", evidence: "Local fixture only", revision: 1 },
+      {
+        phase: "completion",
+        evidence: JSON.stringify({ request: "Review local fixture", recentToolEvidence: [] }),
+        material: {
+          ref: "artifact://1",
+          sha256: digest(body),
+          bytes: Buffer.byteLength(body, "utf8"),
+          content: body,
+          source: "authored",
+        },
+        invocationId: "local-fixture-review",
+        canonicalPlan: [],
+        revision: 1,
+      },
       new AbortController().signal,
     );
     expect(verdict.decision).toBe("approve");
     expect(requests).toBe(1);
     expect(observedToolCount).toBe(0);
     expect(observedReasoning).toBe("high");
+    expect(observedUserTexts).toHaveLength(1);
+    expect(observedUserTexts[0]).toContain(
+      `BEGIN COMPLETE REVIEW MATERIAL\n\n${body}\n\nEND COMPLETE REVIEW MATERIAL`,
+    );
+    expect(observedUserTexts[0]).toContain(`@${outsideFile}`);
+    expect(observedUserTexts[0]).toContain(`^${provider}/review`);
+    expect(observedContext).not.toContain(outsideContents);
+    expect(observedContext).not.toContain("model agent");
   } finally {
     registry.clearSourceRegistrations(provider);
     auth.close();

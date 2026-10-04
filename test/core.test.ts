@@ -1,12 +1,28 @@
 import { describe, expect, test } from "bun:test";
 import { parseConfig } from "../src/config.ts";
-import { Orchestrator, parseVerdict, routeAgent, type Verdict } from "../src/core.ts";
+import {
+  digest,
+  Orchestrator,
+  parseVerdict,
+  routeAgent,
+  type ReviewMaterial,
+  type Verdict,
+} from "../src/core.ts";
 
 const approved: Verdict = {
   decision: "approve",
   summary: "Evidence supports the checkpoint",
   issues: [],
 };
+function material(content: string): ReviewMaterial {
+  return {
+    ref: `artifact://review/${digest(content)}`,
+    sha256: digest(content),
+    bytes: Buffer.byteLength(content, "utf8"),
+    content,
+    source: "authored",
+  };
+}
 function controller() {
   const s = new Orchestrator(parseConfig({}));
   s.begin("Implement the requested fix");
@@ -22,7 +38,7 @@ describe("bounded review evidence", () => {
     }
     s.observe("latest", "bash", { command: "gh pr view 5" }, "LATEST_PR_CONFIRMED", false);
     let received = "";
-    await s.review("completion", "summary ".repeat(1000), async ({ evidence }) => {
+    await s.review("completion", material("summary ".repeat(1000)), async ({ evidence }) => {
       received = evidence;
       return approved;
     });
@@ -34,6 +50,7 @@ describe("bounded review evidence", () => {
     const records = snapshot.recentToolEvidence.map((entry: string) => JSON.parse(entry));
     expect(records.at(-1)).toEqual({
       tool: "bash",
+      toolCallId: "latest",
       input: { command: "gh pr view 5" },
       output: "LATEST_PR_CONFIRMED",
       isError: false,
@@ -56,10 +73,14 @@ describe("bounded review evidence", () => {
       "LATEST_WRITE_SUCCEEDED",
     ]);
     let received = "";
-    await s.review("completion", "Check both actual tool results", async ({ evidence }) => {
-      received = evidence;
-      return approved;
-    });
+    await s.review(
+      "completion",
+      material("Check both actual tool results"),
+      async ({ evidence }) => {
+        received = evidence;
+        return approved;
+      },
+    );
 
     const records = JSON.parse(received).recentToolEvidence.map((entry: string) =>
       JSON.parse(entry),
@@ -83,7 +104,7 @@ describe("bounded review evidence", () => {
       s.observe(`read-${i}`, "read", { index: i }, `result-${i}\n${"log ".repeat(100)}`, false);
     }
     let received = "";
-    await s.review("completion", "Review the latest result", async ({ evidence }) => {
+    await s.review("completion", material("Review the latest result"), async ({ evidence }) => {
       received = evidence;
       return approved;
     });
@@ -105,10 +126,14 @@ describe("bounded review evidence", () => {
     const output = `TEST_SUITE_STARTED\n${"intermediate log\n".repeat(2000)}TESTS_PASSED_EXIT_0`;
     s.observe("tests", "bash", { command: "bun test" }, output, false);
     let received = "";
-    await s.review("completion", "Verify the observed test exit", async ({ evidence }) => {
-      received = evidence;
-      return approved;
-    });
+    await s.review(
+      "completion",
+      material("Verify the observed test exit"),
+      async ({ evidence }) => {
+        received = evidence;
+        return approved;
+      },
+    );
 
     const [record] = JSON.parse(received).recentToolEvidence.map((entry: string) =>
       JSON.parse(entry),
@@ -140,11 +165,7 @@ describe("bounded review evidence", () => {
       `LOG_START\n${noise}\nLATEST_TEST_EXIT_0`,
       false,
     );
-    let received = "";
-    await s.review("recovery", `SUMMARY_START ${noise} SUMMARY_END`, async ({ evidence }) => {
-      received = evidence;
-      return approved;
-    });
+    const received = s.snapshot("recovery");
 
     expect(received.length).toBeLessThanOrEqual(maxEvidenceChars);
     expect(s.evidence.join("\n").length).toBeLessThanOrEqual(maxEvidenceChars);
@@ -152,9 +173,8 @@ describe("bounded review evidence", () => {
     expect(snapshot.phase).toBe("recovery");
     expect(snapshot.pendingRecovery).toBe(true);
     expect(snapshot.request).toContain("REQUEST_START");
-    expect(snapshot.summary).toContain("SUMMARY_START");
+    expect(snapshot).not.toHaveProperty("summary");
     expect(snapshot.request).toMatch(/omitted|truncated/i);
-    expect(snapshot.summary).toMatch(/omitted|truncated/i);
     expect(snapshot.pendingPlan.length).toBeGreaterThan(0);
     expect(JSON.stringify(snapshot.pendingPlan)).toMatch(/omitted|truncated/i);
     const records = snapshot.recentToolEvidence.map((entry: string) => JSON.parse(entry));
@@ -169,22 +189,23 @@ describe("bounded review evidence", () => {
     const s = controller();
     const steps = ["inspect", "fix", "verify"];
     const input = { command: "printf", args: ['"\\\n\u0000🧪'], metadata: { ok: true } };
-    s.setPendingPlan(steps);
+    s.setPendingPlan([...steps]);
     s.observe("short", "bash", input, "passed\n", false);
     let received = "";
-    await s.review("plan", "Review these exact steps", async ({ evidence }) => {
+    await s.review("plan", material("Review these exact steps"), async ({ evidence }) => {
       received = evidence;
       return approved;
     });
 
     const snapshot = JSON.parse(received);
     expect(snapshot.request).toBe("Implement the requested fix");
-    expect(snapshot.summary).toBe("Review these exact steps");
+    expect(snapshot).not.toHaveProperty("summary");
     expect(snapshot.pendingPlan).toEqual(steps);
     expect(snapshot.pendingRecovery).toBe(false);
     expect(snapshot.recentToolEvidence).toHaveLength(1);
     expect(JSON.parse(snapshot.recentToolEvidence[0])).toEqual({
       tool: "bash",
+      toolCallId: "short",
       input,
       output: "passed\n",
       isError: false,
@@ -224,7 +245,7 @@ describe("checkpoints", () => {
     const s = controller();
     const plan = { op: "init", items: ["inspect", "implement", "test"] };
     expect(s.gate("todo", plan)).toContain("Substantial plan");
-    await s.review("plan", "Review the staged plan", async () => approved);
+    await s.review("plan", material("Review the staged plan"), async () => approved);
     expect(s.gate("todo", plan)).toBeUndefined();
     expect(s.gate("todo", { ...plan, items: ["inspect", "rewrite", "test"] })).toBeDefined();
     expect(s.gate("todo", { op: "view" })).toBeUndefined();
@@ -236,15 +257,15 @@ describe("checkpoints", () => {
       calls++;
       return approved;
     };
-    await s.review("completion", "Tests passed", reviewer);
-    await s.review("completion", "Tests passed", reviewer);
+    await s.review("completion", material("Tests passed"), reviewer);
+    await s.review("completion", material("Tests passed"), reviewer);
     expect(calls).toBe(1);
     expect(s.completionApproved).toBe(true);
     s.observe("read-1", "read", { path: "a" }, "file", false);
     expect(s.completionApproved).toBe(false);
     s.observe("edit-1", "edit", { path: "a" }, "ok", false);
     expect(s.completionApproved).toBe(false);
-    await s.review("completion", "Tests passed again", reviewer);
+    await s.review("completion", material("Tests passed again"), reviewer);
     expect(calls).toBe(2);
     expect(s.completionApproved).toBe(true);
     s.observe("bad-read", "read", { path: "missing" }, "missing", true);
@@ -257,13 +278,13 @@ describe("checkpoints", () => {
     expect(s.observe("2", "edit", {}, "No matching text", true)).toBe(true);
     expect(s.gate("bash", { command: "retry" })).toBeDefined();
     expect(s.gate("read", { path: "file" })).toBeUndefined();
-    await s.review("recovery", "Try permission bypass", async () => ({
+    await s.review("recovery", material("Try permission bypass"), async () => ({
       decision: "blocked",
       summary: "Needs user permission",
       issues: ["Access denied"],
     }));
     expect(s.pendingRecovery).toBe(true);
-    await s.review("recovery", "Ask user for authorized access", async () => approved);
+    await s.review("recovery", material("Ask user for authorized access"), async () => approved);
     expect(s.pendingRecovery).toBe(false);
     expect(s.gate("bash", {})).toBeUndefined();
   });
@@ -278,13 +299,13 @@ describe("checkpoints", () => {
   test("failed requests never turn into approvals and budget ends retry loops", async () => {
     const s = new Orchestrator(parseConfig({ reviews: { min: 1, max: 1 } }));
     s.begin("work");
-    const first = await s.review("completion", "done", async () => {
+    const first = await s.review("completion", material("done"), async () => {
       throw new Error("provider down");
     });
     expect(first.decision).toBe("blocked");
     expect(s.completionApproved).toBe(false);
     let called = false;
-    const second = await s.review("completion", "try again", async () => {
+    const second = await s.review("completion", material("try again"), async () => {
       called = true;
       return approved;
     });
@@ -298,7 +319,7 @@ describe("checkpoints", () => {
     let aborted = false;
     const pending = s.review(
       "completion",
-      "done",
+      material("done"),
       async (_, signal) => {
         signal.addEventListener("abort", () => {
           aborted = true;
@@ -311,13 +332,14 @@ describe("checkpoints", () => {
     expect((await pending).decision).toBe("blocked");
     expect(aborted).toBe(true);
     expect(
-      (await s.review("completion", "retry", async () => new Promise<Verdict>(() => {}))).summary,
+      (await s.review("completion", material("retry"), async () => new Promise<Verdict>(() => {})))
+        .summary,
     ).toContain("timed out");
   });
   test("evidence changing during a review prevents a stale approval", async () => {
     const s = controller();
     const deferred = Promise.withResolvers<Verdict>();
-    const pending = s.review("completion", "done", async () => deferred.promise);
+    const pending = s.review("completion", material("done"), async () => deferred.promise);
     s.observe("later", "task", {}, "worker edited a file", false);
     deferred.resolve(approved);
     expect((await pending).summary).toContain("stale");
@@ -341,16 +363,16 @@ describe("checkpoints", () => {
 test("an unapproved pending plan blocks execution and a later rejected completion revokes approval", async () => {
   const s = controller();
   s.gate("todo", { op: "init", items: ["inspect", "implement", "test"] });
-  await s.review("plan", "plan", async () => ({
+  await s.review("plan", material("plan"), async () => ({
     decision: "revise",
     summary: "Test the risk",
     issues: ["Missing coverage"],
   }));
   expect(s.gate("write", { path: "a" })).toContain("not approved");
-  await s.review("plan", "fixed plan", async () => approved);
-  await s.review("completion", "all done", async () => approved);
+  await s.review("plan", material("fixed plan"), async () => approved);
+  await s.review("completion", material("all done"), async () => approved);
   expect(s.completionApproved).toBe(true);
-  await s.review("completion", "actually missing a test", async () => ({
+  await s.review("completion", material("actually missing a test"), async () => ({
     decision: "blocked",
     summary: "Run tests",
     issues: ["Unverified"],
@@ -374,15 +396,15 @@ test("min counts real review-fix rounds, phases share bounds but not allowances"
   const s = new Orchestrator(parseConfig({ reviews: { min: 2, max: 2 } }));
   s.begin("work");
   s.setPendingPlan(["inspect", "fix", "test"]);
-  await s.review("plan", "plan", async () => approved);
-  await s.review("plan", "independent plan review", async () => approved);
-  await s.review("completion", "first", async () => ({
+  await s.review("plan", material("plan"), async () => approved);
+  await s.review("plan", material("independent plan review"), async () => approved);
+  await s.review("completion", material("first"), async () => ({
     decision: "revise",
     summary: "Fix this",
     issues: ["Failure"],
   }));
   s.observe("edit", "edit", {}, "fixed", false);
-  await s.review("completion", "fixed and verified", async () => approved);
+  await s.review("completion", material("fixed and verified"), async () => approved);
   expect(s.completionApproved).toBe(true);
   expect(s.reviewCount).toBe(4);
   expect(s.phaseReviews.completion).toBe(2);
@@ -395,27 +417,27 @@ test("min>1 uses an independent current-state review and cannot count a cached a
     calls++;
     return approved;
   };
-  expect((await s.review("completion", "done", reviewer)).decision).toBe("revise");
+  expect((await s.review("completion", material("done"), reviewer)).decision).toBe("revise");
   expect(s.completionApproved).toBe(false);
-  await s.review("completion", "done", reviewer);
+  await s.review("completion", material("done"), reviewer);
   expect(s.completionApproved).toBe(true);
   expect(calls).toBe(2);
-  await s.review("completion", "done", reviewer);
+  await s.review("completion", material("done"), reviewer);
   expect(calls).toBe(2);
 });
 test("an already aborted replacement checkpoint cannot preserve prior approval", async () => {
   const s = controller();
-  await s.review("completion", "done", async () => approved);
+  await s.review("completion", material("done"), async () => approved);
   const c = new AbortController();
   c.abort();
-  await s.review("completion", "changed claim", async () => approved, c.signal);
+  await s.review("completion", material("changed claim"), async () => approved, c.signal);
   expect(s.completionApproved).toBe(false);
 });
 test("an in-flight plan review cannot approve replacement steps", async () => {
   const s = controller();
   s.setPendingPlan(["A", "B", "C"]);
   const d = Promise.withResolvers<Verdict>();
-  const pending = s.review("plan", "first plan", async () => d.promise);
+  const pending = s.review("plan", material("first plan"), async () => d.promise);
   s.setPendingPlan(["D", "E", "F"]);
   d.resolve(approved);
   expect((await pending).summary).toContain("stale");
@@ -425,10 +447,10 @@ test("an in-flight plan review cannot approve replacement steps", async () => {
 test("a newer rejected plan review revokes prior plan and completion approval", async () => {
   const s = controller();
   s.setPendingPlan(["inspect", "fix", "test"]);
-  await s.review("plan", "first", async () => approved);
+  await s.review("plan", material("first"), async () => approved);
   expect(s.gate("bash", {})).toBeUndefined();
-  await s.review("completion", "done", async () => approved);
-  await s.review("plan", "new risk discovered", async () => ({
+  await s.review("completion", material("done"), async () => approved);
+  await s.review("plan", material("new risk discovered"), async () => ({
     decision: "revise",
     summary: "Risk unresolved",
     issues: ["Fix design"],
@@ -445,12 +467,12 @@ test("a cancelled plan re-review cannot reuse its revoked cached approval", asyn
     calls++;
     return approved;
   };
-  await s.review("plan", "plan", reviewer);
+  await s.review("plan", material("plan"), reviewer);
   const c = new AbortController();
   c.abort();
-  await s.review("plan", "plan", reviewer, c.signal);
+  await s.review("plan", material("plan"), reviewer, c.signal);
   expect(s.gate("bash", {})).toBeDefined();
-  await s.review("plan", "plan", reviewer);
+  await s.review("plan", material("plan"), reviewer);
   expect(calls).toBe(2);
   expect(s.gate("bash", {})).toBeUndefined();
 });
@@ -469,8 +491,8 @@ describe("canonical plan recovery and admission evidence", () => {
     changed,
   }) => {
     const s = controller();
-    s.setPendingPlan(steps);
-    await s.review("plan", "Review exact steps", async () => approved);
+    s.setPendingPlan([...steps]);
+    await s.review("plan", material("Review exact steps"), async () => approved);
     const canonical = s.planStatus().approved!;
     expect(canonical.steps).toEqual(steps);
     const denial = s.gate("todo", { op: "init", items: changed });
@@ -492,7 +514,7 @@ describe("canonical plan recovery and admission evidence", () => {
     const s = controller();
     s.setPendingPlan([...steps]);
     let calls = 0;
-    const verdict = await s.review("plan", "Only prose", async () => {
+    const verdict = await s.review("plan", material("Only prose"), async () => {
       calls++;
       return approved;
     });
@@ -519,7 +541,7 @@ describe("canonical plan recovery and admission evidence", () => {
       s.observe(`denied-${i}`, "bash", {}, "same execution failure", true);
     }
     expect(s.pendingRecovery).toBe(false);
-    const snapshotText = s.snapshot("recovery", "Review admissions");
+    const snapshotText = s.snapshot("recovery");
     expect(snapshotText.length).toBeLessThanOrEqual(maxEvidenceChars);
     const snapshot = JSON.parse(snapshotText);
     const records = snapshot.recentToolEvidence.map((entry: string) => JSON.parse(entry));
@@ -532,15 +554,498 @@ describe("canonical plan recovery and admission evidence", () => {
   });
   test("new denied evidence makes an in-flight review stale", async () => {
     const s = controller();
-    s.setPendingPlan(steps);
+    s.setPendingPlan([...steps]);
     const deferred = Promise.withResolvers<Verdict>();
-    const pending = s.review("plan", "Review before denied attempt", async () => deferred.promise);
+    const pending = s.review(
+      "plan",
+      material("Review before denied attempt"),
+      async () => deferred.promise,
+    );
     s.deny("blocked-write", "write", {}, s.gate("write", {})!);
     deferred.resolve(approved);
     expect((await pending).summary).toContain("stale");
     expect(s.planApproved).toBe(false);
     expect(s.terminalReason).toBeUndefined();
-    await s.review("plan", "Include the denied attempt", async () => approved);
+    await s.review("plan", material("Include the denied attempt"), async () => approved);
     expect(s.planApproved).toBe(true);
+  });
+});
+
+describe("verified full review material", () => {
+  test("body bypasses bounded context without losing its middle, and canonical steps remain exact", async () => {
+    const s = new Orchestrator(parseConfig({ maxEvidenceChars: 1000 }));
+    s.begin("Review complete artifacts");
+    const steps = Array.from({ length: 30 }, (_, index) => `${index}: ${"step ".repeat(180)}`);
+    s.setPendingPlan([...steps]);
+    const content = `BODY_START\n${"section ".repeat(6000)}MIDDLE_REQUIREMENT\n${"section ".repeat(6000)}BODY_END`;
+    const body = material(content);
+    await s.review(
+      "plan",
+      body,
+      async (request) => {
+        expect(request.material).toEqual(body);
+        expect(request.material.content).toBe(content);
+        expect(request.canonicalPlan).toEqual(steps);
+        expect(request.invocationId).toBe("full-body-call");
+        expect(request.evidence.length).toBeLessThanOrEqual(1000);
+        expect(request.evidence).not.toContain("BODY_START");
+        expect(JSON.parse(request.evidence)).not.toHaveProperty("summary");
+        expect(JSON.parse(request.evidence).pendingPlan).not.toEqual(steps);
+        return approved;
+      },
+      undefined,
+      "full-body-call",
+    );
+    expect(s.planApproved).toBe(true);
+    expect(s.lastReview).toMatchObject({
+      invocationId: "full-body-call",
+      phase: "plan",
+      status: "provider_verdict",
+      charged: true,
+      attempt: 1,
+      revision: s.revision,
+      artifactRef: body.ref,
+      sha256: body.sha256,
+      verdict: approved,
+    });
+    expect(s.lastReview).not.toHaveProperty("content");
+  });
+
+  test("cache includes full body digest and current evidence revision", async () => {
+    const s = controller();
+    let calls = 0;
+    const reviewer = async () => {
+      calls++;
+      return approved;
+    };
+    const first = material(`${"prefix ".repeat(3000)}FIRST_MIDDLE${" suffix".repeat(3000)}`);
+    const second = material(first.content.replace("FIRST_MIDDLE", "OTHER_MIDDLE"));
+    await s.review("completion", first, reviewer, undefined, "first");
+    await s.review(
+      "completion",
+      { ...first, ref: "artifact://other-ref" },
+      reviewer,
+      undefined,
+      "cached",
+    );
+    expect(calls).toBe(1);
+    expect(s.lastReview).toMatchObject({
+      invocationId: "cached",
+      status: "cache_hit",
+      charged: false,
+      attempt: 1,
+      artifactRef: "artifact://other-ref",
+    });
+    await s.review("completion", second, reviewer);
+    expect(calls).toBe(2);
+    s.observe("new-result", "read", {}, "new evidence", false);
+    await s.review("completion", second, reviewer);
+    expect(calls).toBe(3);
+    expect(s.reviewCount).toBe(3);
+  });
+
+  test.each([
+    { name: "empty body", value: material("") },
+    { name: "blank body", value: material(" \n\t") },
+    { name: "missing reference", value: { ...material("body"), ref: "" } },
+    { name: "wrong digest", value: { ...material("body"), sha256: "0".repeat(64) } },
+    { name: "invalid digest", value: { ...material("body"), sha256: "not-a-digest" } },
+    { name: "wrong byte count", value: { ...material("🧪"), bytes: 2 } },
+    { name: "nonintegral byte count", value: { ...material("body"), bytes: 4.1 } },
+    { name: "invalid source", value: { ...material("body"), source: "external" } },
+    { name: "legacy string", value: "body" },
+    { name: "missing material", value: null },
+  ])("invalid $name is uncharged and revokes a previous approval", async ({ value }) => {
+    const s = controller();
+    await s.review("completion", material("approved body"), async () => approved);
+    let called = false;
+    const result = await s.review(
+      "completion",
+      value as ReviewMaterial,
+      async () => {
+        called = true;
+        return approved;
+      },
+      undefined,
+      "invalid-body",
+    );
+    expect(result.decision).toBe("blocked");
+    expect(called).toBe(false);
+    expect(s.completionApproved).toBe(false);
+    expect(s.reviewCount).toBe(1);
+    expect(s.lastReview).toMatchObject({
+      invocationId: "invalid-body",
+      status: "input_rejected",
+      charged: false,
+      attempt: 1,
+      verdict: result,
+    });
+  });
+
+  test("material byte limit counts UTF-8 exactly and permits the full boundary", async () => {
+    const s = new Orchestrator(parseConfig({ maxReviewBytes: 1024 }));
+    s.begin("Review unicode");
+    let calls = 0;
+    const reviewer = async () => {
+      calls++;
+      return approved;
+    };
+    const over = await s.review("completion", material("🧪".repeat(257)), reviewer);
+    expect(over.decision).toBe("blocked");
+    expect(s.reviewCount).toBe(0);
+    expect(calls).toBe(0);
+    const exact = await s.review("completion", material("🧪".repeat(256)), reviewer);
+    expect(exact.decision).toBe("approve");
+    expect(calls).toBe(1);
+    expect(s.reviewCount).toBe(1);
+  });
+
+  test.each([
+    { name: "step count", steps: Array.from({ length: 31 }, () => "step") },
+    { name: "step length", steps: ["x".repeat(1001)] },
+    { name: "UTF-8 plan bytes", steps: ["🧪".repeat(250), "🧪".repeat(250)] },
+  ])("canonical plan limits reject before admission: $name", async ({ steps }) => {
+    const s = new Orchestrator(parseConfig({ maxReviewBytes: 1024 }));
+    s.begin("Review bounded plan");
+    s.setPendingPlan([...steps]);
+    let calls = 0;
+    const result = await s.review("plan", material("Review exact plan"), async () => {
+      calls++;
+      return approved;
+    });
+    expect(result.summary).toContain("Canonical plan exceeds");
+    expect(calls).toBe(0);
+    expect(s.reviewCount).toBe(0);
+    expect(s.phaseRounds.plan).toBe(0);
+    expect(s.planApproved).toBe(false);
+    expect(s.lastReview?.status).toBe("input_rejected");
+  });
+
+  test("mutation cannot change the admitted body or approve a changed canonical plan", async () => {
+    const s = controller();
+    s.setPendingPlan(["first step"]);
+    const body = material("original body");
+    const original = { ...body };
+    const deferred = Promise.withResolvers<Verdict>();
+    const pending = s.review("plan", body, async ({ material: admitted, canonicalPlan }) => {
+      await deferred.promise;
+      expect(admitted).toEqual(original);
+      expect(canonicalPlan).toEqual(["first step"]);
+      return approved;
+    });
+    body.content = "changed after admission";
+    s.pendingPlan[0] = "changed without using the setter";
+    deferred.resolve(approved);
+    expect((await pending).decision).toBe("blocked");
+    expect(s.planApproved).toBe(false);
+    expect(s.lastReview?.status).toBe("stale");
+  });
+});
+
+describe("current invocation provenance", () => {
+  test("provider failures, budget exhaustion and input rejection have distinct fresh outcomes", async () => {
+    const s = new Orchestrator(parseConfig({ reviews: { min: 1, max: 1 } }));
+    s.begin("Review once");
+    const failed = await s.review(
+      "completion",
+      material("body"),
+      async () => {
+        throw new Error("provider unavailable now");
+      },
+      undefined,
+      "provider-failure",
+    );
+    expect(s.lastReview).toMatchObject({
+      invocationId: "provider-failure",
+      status: "unavailable",
+      charged: true,
+      attempt: 1,
+      verdict: failed,
+    });
+    const exhausted = await s.review(
+      "completion",
+      material("another body"),
+      async () => approved,
+      undefined,
+      "over-budget",
+    );
+    expect(s.lastReview).toMatchObject({
+      invocationId: "over-budget",
+      status: "budget_exhausted",
+      charged: false,
+      attempt: 1,
+      verdict: exhausted,
+    });
+    expect(s.blocked).toBe(exhausted.summary);
+    const rejected = s.rejectReview(
+      "completion",
+      "missing-artifact",
+      "Artifact does not exist. No round charged.",
+    );
+    expect(s.lastReview).toMatchObject({
+      invocationId: "missing-artifact",
+      status: "input_rejected",
+      charged: false,
+      artifactRef: null,
+      sha256: null,
+      verdict: rejected,
+    });
+    expect(s.reviewCount).toBe(1);
+    expect(s.terminalReason).toContain("Artifact does not exist");
+    expect(s.terminalReason).not.toContain("provider unavailable now");
+  });
+
+  test.each([
+    "caller_cancelled",
+    "timed_out",
+    "stale",
+  ] as const)("%s consumes admitted attempt and cannot leak prior verdict into terminal status", async (status) => {
+    const s = new Orchestrator(parseConfig({ reviews: { min: 1, max: 2 }, reviewTimeoutMs: 100 }));
+    s.begin("Review current attempt");
+    await s.review("completion", material("earlier"), async () => ({
+      decision: "blocked",
+      summary: "OLD_PROVIDER_CLAIM",
+      issues: [],
+    }));
+    const deferred = Promise.withResolvers<Verdict>();
+    const controller = new AbortController();
+    const pending = s.review(
+      "completion",
+      material("current"),
+      async () => deferred.promise,
+      controller.signal,
+      "current-attempt",
+    );
+    expect(s.lastReview).toMatchObject({
+      invocationId: "current-attempt",
+      status: "in_flight",
+      charged: true,
+      attempt: 2,
+      verdict: null,
+    });
+    expect(s.blocked).toBe("");
+    if (status === "caller_cancelled") controller.abort();
+    if (status === "stale") {
+      s.observe("changed", "edit", {}, "new changes", false);
+      deferred.resolve(approved);
+    }
+    const result = await pending;
+    expect(result.decision).toBe("blocked");
+    expect(s.lastReview).toMatchObject({
+      invocationId: "current-attempt",
+      status,
+      charged: true,
+      attempt: 2,
+      verdict: result,
+    });
+    expect(s.blocked).toBe(result.summary);
+    expect(s.terminalReason).toContain(result.summary);
+    expect(s.terminalReason).not.toContain("OLD_PROVIDER_CLAIM");
+    expect(s.reviewCount).toBe(2);
+    expect(s.completionApproved).toBe(false);
+    deferred.resolve(approved);
+    await Promise.resolve();
+    expect(s.lastReview?.verdict).toEqual(result);
+  });
+
+  test.each([
+    true,
+    false,
+  ])("boundary deadlines stay timed_out when already aborted=%p", async (preAborted) => {
+    const s = controller();
+    const caller = new AbortController();
+    const boundary = new AbortController();
+    const signal = AbortSignal.any([caller.signal, boundary.signal]);
+    const abort = () => boundary.abort(new DOMException("Boundary timed out", "TimeoutError"));
+    if (preAborted) abort();
+    let calls = 0;
+    const pending = s.review(
+      "completion",
+      material("body"),
+      async () => {
+        calls++;
+        return new Promise<Verdict>(() => {});
+      },
+      signal,
+      "boundary-timeout",
+    );
+    if (!preAborted) abort();
+    const result = await pending;
+    expect(result.summary).toContain("timed out");
+    expect(calls).toBe(preAborted ? 0 : 1);
+    expect(s.reviewCount).toBe(preAborted ? 0 : 1);
+    expect(s.lastReview).toMatchObject({
+      invocationId: "boundary-timeout",
+      status: "timed_out",
+      charged: !preAborted,
+      verdict: result,
+    });
+  });
+
+  test("artifact reads cancelled before admission remain uncharged", () => {
+    const s = controller();
+    const result = s.rejectReview(
+      "completion",
+      "cancelled-read",
+      "Artifact read cancelled",
+      "caller_cancelled",
+    );
+    expect(s.lastReview).toMatchObject({
+      invocationId: "cancelled-read",
+      status: "caller_cancelled",
+      charged: false,
+      attempt: 0,
+      artifactRef: null,
+      sha256: null,
+      verdict: result,
+    });
+    expect(s.reviewCount).toBe(0);
+  });
+
+  test("already cancelled calls have a current uncharged outcome", async () => {
+    const s = controller();
+    const cancelled = new AbortController();
+    cancelled.abort();
+    const result = await s.review(
+      "completion",
+      material("body"),
+      async () => approved,
+      cancelled.signal,
+      "pre-cancelled",
+    );
+    expect(s.reviewCount).toBe(0);
+    expect(s.lastReview).toMatchObject({
+      invocationId: "pre-cancelled",
+      status: "caller_cancelled",
+      charged: false,
+      attempt: 0,
+      verdict: result,
+    });
+  });
+
+  test.each([
+    "input rejection",
+    "concurrent review",
+  ])("an older result cannot overwrite a newer %s", async (kind) => {
+    const s = controller();
+    const deferred = Promise.withResolvers<Verdict>();
+    const pending = s.review(
+      "completion",
+      material("old"),
+      async () => deferred.promise,
+      undefined,
+      "old-call",
+    );
+    const replacement =
+      kind === "input rejection"
+        ? s.rejectReview("completion", "new-call", "New artifact preflight rejected")
+        : await s.review(
+            "completion",
+            material("new"),
+            async () => approved,
+            undefined,
+            "new-call",
+          );
+    const latest = s.lastReview;
+    expect(latest).toMatchObject({ invocationId: "new-call", charged: false });
+    deferred.resolve(approved);
+    expect((await pending).summary).toContain("stale");
+    expect(s.lastReview).toEqual(latest);
+    expect(s.blocked).toBe(replacement.summary);
+    expect(s.reviewCount).toBe(1);
+    expect(s.completionApproved).toBe(false);
+  });
+
+  test("begin clears prior provenance and a late old result cannot repopulate it", async () => {
+    const s = controller();
+    const deferred = Promise.withResolvers<Verdict>();
+    const pending = s.review("completion", material("old task"), async () => deferred.promise);
+    s.begin("A different task");
+    deferred.resolve(approved);
+    expect((await pending).summary).toContain("stale");
+    expect(s.lastReview).toBeNull();
+    expect(s.blocked).toBe("");
+    expect(s.reviewCount).toBe(0);
+    expect(s.completionApproved).toBe(false);
+  });
+
+  test("malformed provider responses consume one attempt and bounded provenance omits body", async () => {
+    const s = controller();
+    const bad = await s.review("completion", material("body"), async () => ({
+      decision: "approve",
+      summary: "ok",
+      issues: ["unresolved"],
+    }));
+    expect(bad.decision).toBe("blocked");
+    expect(s.lastReview?.status).toBe("unavailable");
+    expect(s.lastReview?.charged).toBe(true);
+    expect(s.phaseRounds.completion).toBe(0);
+    const body = { ...material("new body"), ref: "r".repeat(100000) };
+    await s.review(
+      "completion",
+      body,
+      async () => {
+        throw new Error("e".repeat(100000));
+      },
+      undefined,
+      "i".repeat(100000),
+    );
+    expect(s.lastReview!.invocationId.length).toBeLessThanOrEqual(200);
+    expect(s.lastReview!.artifactRef!.length).toBeLessThanOrEqual(2000);
+    expect(s.lastReview!.verdict!.summary.length).toBeLessThanOrEqual(4000);
+    expect(JSON.stringify(s.lastReview)).not.toContain("new body");
+  });
+});
+
+describe("tool execution provenance", () => {
+  test("records tool call identity and host truncation facts without importing artifact text", () => {
+    const s = controller();
+    const hostMetadata = {
+      truncation: {
+        artifactId: "tool-result-3",
+        artifactElidedBytes: 8000,
+        totalBytes: 10000,
+        outputBytes: 2000,
+      },
+      limits: { columnTruncated: { artifactId: "column-result-3", artifactElidedBytes: 200 } },
+    };
+    s.observe(
+      "actual-tool-call",
+      "bash",
+      { command: "bun test" },
+      "ACTUAL_EXECUTION_OUTPUT",
+      false,
+      hostMetadata,
+    );
+    const record = JSON.parse(JSON.parse(s.snapshot("completion")).recentToolEvidence[0]);
+    expect(record).toEqual({
+      tool: "bash",
+      toolCallId: "actual-tool-call",
+      input: { command: "bun test" },
+      output: "ACTUAL_EXECUTION_OUTPUT",
+      isError: false,
+      hostMetadata,
+    });
+  });
+
+  test.each([
+    1000, 24000, 100000,
+  ])("oversized IDs and host metadata remain bounded at %p", (maxEvidenceChars) => {
+    const s = new Orchestrator(parseConfig({ maxEvidenceChars }));
+    s.begin("Observe bounded provenance");
+    const noise = '"\\\n\t🧪'.repeat(20000);
+    s.observe(noise, noise, { huge: noise }, `OUTPUT_START ${noise} OUTPUT_END`, false, {
+      truncation: { artifactId: noise, totalBytes: 1000000 },
+    });
+    const snapshot = s.snapshot("completion");
+    expect(snapshot.length).toBeLessThanOrEqual(maxEvidenceChars);
+    expect(s.evidence.join("\n").length).toBeLessThanOrEqual(maxEvidenceChars);
+    const [record] = JSON.parse(snapshot).recentToolEvidence.map((entry: string) =>
+      JSON.parse(entry),
+    );
+    expect(record.toolCallId).toContain("omitted");
+    expect(JSON.stringify(record.hostMetadata)).toMatch(/omitted|truncated/);
+    expect(record.output).toContain("OUTPUT_START");
+    expect(record.output).toContain("OUTPUT_END");
   });
 });
