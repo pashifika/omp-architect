@@ -1,0 +1,170 @@
+import { expect, test } from "bun:test";
+import { AutoRun } from "../src/auto/core.ts";
+import { parseAutoConfig } from "../src/auto/config.ts";
+import type { RasenSnapshot } from "../src/auto/rasen.ts";
+import type { DecisionEvidence, DecisionProvider } from "../src/auto/decision.ts";
+
+const signal = () => new AbortController().signal;
+function snapshot(done: string[] = []): RasenSnapshot {
+  return {
+    change: "test-change",
+    root: "/fixture",
+    schema: "spec-driven",
+    state: done.length === 2 ? "all_done" : "ready",
+    progress: { total: 2, complete: done.length, remaining: 2 - done.length },
+    tasks: ["1.1", "1.2"].map((id) => ({ id, description: `Task ${id}`, done: done.includes(id) })),
+    instruction: "Apply the next task",
+    skill: "Generated apply guidance",
+    contextFiles: [],
+    fingerprint: done.join(","),
+  };
+}
+const evidence: DecisionEvidence = {
+  change: "test-change",
+  remaining: 2,
+  completed: 0,
+  summary: "A supported next task remains",
+  recentTools: [],
+};
+const good: DecisionProvider = async () => ({ choice: "continue", confidence: 0.95 });
+
+test("Auto is opt-in; strict config rejects unknown keys, selectors and unbounded limits", () => {
+  expect(parseAutoConfig({}).enabled).toBe(false);
+  for (const invalid of [
+    { enabled: "true" },
+    { unknown: 1 },
+    { maxSteps: 9 },
+    { maxToolCalls: 0 },
+    { minConfidence: NaN },
+    { minConfidence: 0.1 },
+    { fallback: "always" },
+    { rasenExecutable: "" },
+  ]) {
+    expect(() => parseAutoConfig(invalid)).toThrow();
+  }
+  expect(parseAutoConfig({ enabled: true, fallback: "stop", maxFallbacks: 0 }).enabled).toBe(true);
+});
+
+test("hard turn and tool caps count attempts; repeated delivery cannot reset budget", () => {
+  const run = new AutoRun(parseAutoConfig({ maxSteps: 2, maxToolCalls: 2 }), snapshot());
+  expect(run.toolCall("a")).toBe(true);
+  expect(run.toolCall("a")).toBe(true);
+  expect(run.toolCall("b")).toBe(true);
+  expect(run.toolCalls).toBe(2);
+  expect(run.continue()).toBe(true);
+  expect(run.continue()).toBe(false);
+  expect(run.status).toBe("budget_exhausted");
+  expect(run.toolCall("c")).toBe(false);
+  const tools = new AutoRun(parseAutoConfig({ maxToolCalls: 1 }), snapshot());
+  expect(tools.toolCall("1")).toBe(true);
+  expect(tools.toolCall("2")).toBe(false);
+  expect(tools.status).toBe("budget_exhausted");
+});
+
+test("deadline and cancellation remain terminal despite high-confidence decisions", async () => {
+  let now = 0;
+  const run = new AutoRun(parseAutoConfig({ maxDurationMs: 1000 }), snapshot(), () => now);
+  now = 1000;
+  expect(await run.decide(evidence, good, good, signal())).toBeUndefined();
+  expect(run.status).toBe("budget_exhausted");
+  expect(run.decisions).toBe(0);
+  run.stop("completed", "Model says done");
+  expect(run.status).toBe("budget_exhausted");
+  const cancelled = new AutoRun(parseAutoConfig({}), snapshot());
+  const abort = new AbortController();
+  abort.abort();
+  expect(await cancelled.decide(evidence, good, good, abort.signal)).toBeUndefined();
+  expect(cancelled.status).toBe("cancelled");
+  expect(cancelled.fallbacks).toBe(0);
+});
+
+test("stall budget uses new completed task IDs, not instruction/fingerprint churn or checkbox toggling", () => {
+  const run = new AutoRun(parseAutoConfig({ maxStalls: 2 }), snapshot());
+  run.observe({ ...snapshot(), fingerprint: "changed", instruction: "different" });
+  expect(run.stalls).toBe(1);
+  run.observe(snapshot(["1.1"]));
+  expect(run.stalls).toBe(0);
+  run.observe(snapshot());
+  run.observe(snapshot(["1.1"]));
+  expect(run.continue()).toBe(false);
+  expect(run.status).toBe("stalled");
+});
+
+test("changing scope or removing tasks requires a new user start; all_done never self-approves", () => {
+  const run = new AutoRun(parseAutoConfig({}), snapshot());
+  const changed = snapshot();
+  changed.tasks.pop();
+  run.observe(changed);
+  expect(run.status).toBe("needs_user");
+  const renamed = new AutoRun(parseAutoConfig({}), snapshot());
+  const changedText = snapshot();
+  changedText.tasks[0].description = "Different objective";
+  renamed.observe(changedText);
+  expect(renamed.status).toBe("needs_user");
+  for (const changedIdentity of [{ root: "/other" }, { schema: "other-schema" }]) {
+    const identity = new AutoRun(parseAutoConfig({}), snapshot());
+    identity.observe({ ...snapshot(), ...changedIdentity });
+    expect(identity.status).toBe("needs_user");
+  }
+  const done = new AutoRun(parseAutoConfig({}), snapshot());
+  done.observe(snapshot(["1.1", "1.2"]));
+  expect(done.status).toBe("running");
+  expect(done.statusView().completionVerified).toBe(false);
+});
+
+test("uncertain primary uses one bounded fallback, then uncertainty stops explicitly", async () => {
+  const run = new AutoRun(parseAutoConfig({ maxFallbacks: 1 }), snapshot());
+  const weak: DecisionProvider = async () => ({ choice: "continue", confidence: 0.2 });
+  expect((await run.decide(evidence, weak, good, signal()))?.choice).toBe("continue");
+  expect(run.fallbacks).toBe(1);
+  expect(await run.decide(evidence, weak, good, signal())).toBeUndefined();
+  expect(run.status).toBe("uncertain");
+  expect(run.decisions).toBe(2);
+  expect(run.fallbacks).toBe(1);
+});
+
+test("provider errors, unknown decisions, timeout, and disabled fallback fail closed", async () => {
+  for (const primary of [
+    async () => {
+      throw new Error("private provider details");
+    },
+    async () => ({ choice: "approve", confidence: 1 }),
+    async () => ({ choice: "continue", confidence: Infinity }),
+    async () => ({ choice: "uncertain", confidence: 1 }),
+    () => new Promise(() => {}),
+  ]) {
+    const run = new AutoRun(
+      parseAutoConfig({ fallback: "stop", decisionTimeoutMs: 100 }),
+      snapshot(),
+    );
+    expect(await run.decide(evidence, primary as DecisionProvider, good, signal())).toBeUndefined();
+    expect(run.status).toBe("uncertain");
+    expect(run.reason).not.toContain("private");
+    expect(run.fallbacks).toBe(0);
+  }
+});
+
+test("needs_user cannot authorize a tool or turn; concurrent decisions stop", async () => {
+  const run = new AutoRun(parseAutoConfig({}), snapshot());
+  await run.decide(evidence, async () => ({ choice: "needs_user", confidence: 1 }), good, signal());
+  expect(run.status).toBe("needs_user");
+  expect(run.continue()).toBe(false);
+  expect(run.toolCall("mutation")).toBe(false);
+  const concurrent = new AutoRun(parseAutoConfig({ decisionTimeoutMs: 100 }), snapshot());
+  const pending = concurrent.decide(evidence, () => new Promise(() => {}), undefined, signal());
+  expect(await concurrent.decide(evidence, good, good, signal())).toBeUndefined();
+  expect(concurrent.status).toBe("blocked");
+  await pending;
+  expect(concurrent.status).toBe("blocked");
+});
+
+test("a provider's synchronous caller abort cannot escape the core deadline", async () => {
+  const controller = new AbortController();
+  const run = new AutoRun(parseAutoConfig({ decisionTimeoutMs: 100 }), snapshot());
+  const provider: DecisionProvider = () => {
+    controller.abort();
+    return new Promise(() => {});
+  };
+  expect(await run.decide(evidence, provider, undefined, controller.signal)).toBeUndefined();
+  expect(run.status).toBe("cancelled");
+});

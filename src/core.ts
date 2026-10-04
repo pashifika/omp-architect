@@ -58,6 +58,7 @@ const readOnlyTools = new Set([
   "web_search",
   "fetch",
   "architect_checkpoint",
+  "auto_status",
 ]);
 export function planSteps(input: Record<string, unknown>): string[] {
   if (input.op !== "init" && input.op !== "append") return [];

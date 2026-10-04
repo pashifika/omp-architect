@@ -26,6 +26,14 @@ try {
     "index.ts",
     "src/extension.ts",
     "src/reviewer.ts",
+    "src/auto/extension.ts",
+    "src/auto/core.ts",
+    "src/auto/rasen.ts",
+    "src/auto/decision.ts",
+    "src/auto/fallback.ts",
+    "examples/auto.json",
+    "examples/auto-config.yml",
+    "docs/rasen-auto-verification.md",
     "src/prompts/architect.md",
     "src/prompts/orchestration.md",
     "agents/omp-worker.md",
@@ -45,7 +53,7 @@ try {
     path.join(temp, "package", "node_modules"),
     "dir",
   );
-  const check = `import {loadExtensions} from '@oh-my-pi/pi-coding-agent/extensibility/extensions'; const r=await loadExtensions([${JSON.stringify(path.join(temp, "package", "index.ts"))}],${JSON.stringify(temp)}); if(r.errors.length||!r.extensions[0]?.tools.has('architect_checkpoint'))throw new Error(JSON.stringify(r.errors));`;
+  const check = `import {loadExtensions} from '@oh-my-pi/pi-coding-agent/extensibility/extensions'; const r=await loadExtensions([${JSON.stringify(path.join(temp, "package", "index.ts"))}],${JSON.stringify(temp)}); if(r.errors.length||!r.extensions[0]?.tools.has('architect_checkpoint')||!r.extensions[0]?.tools.has('auto_status')||!r.extensions[0]?.commands.has('auto'))throw new Error(JSON.stringify(r.errors));`;
   await run([process.execPath, "-e", check], path.join(temp, "package"));
   console.log(
     `Package verified: ${files.length} entries, packed extension loads against locked OMP`,
