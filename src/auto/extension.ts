@@ -8,7 +8,7 @@ import { createDecisionFallback } from "./fallback.ts";
 import { readRasenSnapshot, validateRasenChange, type RasenSnapshot } from "./rasen.ts";
 import { autoRequest, autoUsage, briefRoot, parseAutoStart, renderBrief } from "./instructions.ts";
 import { completeAuto } from "./completion.ts";
-import { commandEditor } from "../brief/editor.ts";
+import { createCommandEditor } from "../brief/editor.ts";
 
 export interface AutoDependencies {
   snapshot?: typeof readRasenSnapshot;
@@ -358,7 +358,7 @@ export function createAutoController(
   return {
     async initialize(ctx: ExtensionContext) {
       cwd = ctx.cwd;
-      ctx.ui.setEditorComponent?.(commandEditor);
+      ctx.ui.setEditorComponent?.(createCommandEditor(pi.pi.CustomEditor));
       stop("Session changed; Auto does not resume automatically");
       run = undefined;
       ownsTurn = false;

@@ -70,7 +70,8 @@ if (process.env[childFlag] !== "1") {
   const { KeybindingsManager } = await import("@oh-my-pi/pi-tui/app-keybindings");
   const { setKeybindings } = await import("@oh-my-pi/pi-tui/keybindings");
   const { getEditorTheme, initThemeSync } = await import("@oh-my-pi/pi-tui/theme/theme");
-  const { commandEditor } = await import("../src/brief/editor.ts");
+  const { createCommandEditor } = await import("../src/brief/editor.ts");
+  const commandEditor = createCommandEditor(CustomEditor);
   const { completeAuto } = await import("../src/auto/completion.ts");
   const { default: brief } = await import("../src/brief/runtime.ts");
 

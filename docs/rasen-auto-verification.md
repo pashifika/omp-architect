@@ -39,6 +39,12 @@ The final frozen-lockfile run on OMP **18.6.0** / Bun **1.3.14** passed formatti
 
 The main-model and reviewer answers and Jev HTTP responses are local fixtures. No new paid live-provider run, real project publishing/merging, or macOS/Windows execution is claimed by this local result; CI covers platform-specific installer jobs. The minimum 18.5.1 editor export/API was inspected in cached upstream source, but the new native runtime cases were executed on locked 18.6.0. Existing private packs were compared locally for compatibility without copying their contents into the repository.
 
+## Bundled-host extension loading regression (2026-10-04)
+
+A real installed-host failure exposed a gap in the earlier verification: the installer test used the bundled CLI for `plugin list`, but loaded extensions through the source SDK. The new TUI editor and directory-helper subpath imports could fall back to checkout source packages and fail with a missing `@oh-my-pi/pi-natives`, even when OMP itself had its native addon. Both entries now use the running host's injected `CustomEditor` and `getAgentDir` exports instead.
+
+The regression runs the actual locked OMP **18.6.0** CLI bundle from a separate host installation, discovers the native installer-created plugin links from an unrelated project, and checks Auto, Architect, and optional Brief registration through RPC. It covers both incomplete source peers (without the native dependency) and entirely absent source peers, with and without `--with-brief`. The optional case installs the main plugin first, adds Brief later, and verifies a repeated opt-in changes nothing. The previous code fails with the reported missing-native errors even in the base-only case; the corrected code passes all four loading cases. No prompt is sent, credentials are synthetic, and `fetch` is blocked. The existing dry-run and native-cache preservation tests remain unchanged.
+
 ## CI packaging portability
 
 The first remote integration run exposed npm 10's `pack --ignore-scripts` behavior: `prepare` still ran, rebuilt Rasen after stamping, and mixed lifecycle output into `--json`. This behavior was fixed in [npm CLI #7850](https://github.com/npm/cli/pull/7850) for npm 11. The preparation script now installs **npm 11.9.0** beside **pnpm 9.15.9** in its isolated tools directory, verifies the selected versions, and uses that toolchain for the unmodified upstream pack helper and local tarball install.

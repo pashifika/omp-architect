@@ -658,6 +658,105 @@ describe("development installer against the installed native OMP host", () => {
   }, 30_000);
 
   test.each([
+    false,
+    true,
+  ])("bundled CLI loads installed plugins without source SDK natives, optional brief=%s", async (withBrief) => {
+    const f = await fixture();
+    succeeded(install(f));
+    if (withBrief) {
+      // Match an existing main installation opting into brief later, then rerun
+      // that opt-in to prove it is idempotent before checking the actual host.
+      succeeded(install(f, "--with-brief"));
+      const before = await snapshot(f.base);
+      const repeated = install(f, "--with-brief");
+      succeeded(repeated);
+      expect(repeated.output).not.toContain("running: omp");
+      expect(await snapshot(f.base)).toEqual(before);
+    }
+
+    // The source SDK loader above can hide bundled-host resolution bugs. Run
+    // the real npm CLI bundle from a separate installation containing only its
+    // external runtime dependencies, not the host's source SDK packages.
+    const host = path.join(f.base, "bundled host");
+    const dist = path.join(host, "dist");
+    await cp(path.join(repository, "node_modules", "@oh-my-pi", "pi-coding-agent", "dist"), dist, {
+      recursive: true,
+    });
+    for (const dependency of ["@oh-my-pi/pi-natives", "@babel/parser", "puppeteer-core"]) {
+      const link = path.join(host, "node_modules", dependency);
+      await mkdir(path.dirname(link), { recursive: true });
+      await symlink(path.join(repository, "node_modules", dependency), link, directoryLink);
+    }
+
+    // Leave the old non-bundled subpath targets available but no native package.
+    // Before the fix, BOTH installed entries failed here with missing pi-natives
+    // (or pi-natives/path), despite the running host already having its addon.
+    await rm(path.join(f.checkout, "node_modules"), { recursive: true });
+    for (const dependency of ["@oh-my-pi/pi-tui", "@oh-my-pi/pi-utils"]) {
+      await cp(
+        path.join(repository, "node_modules", dependency),
+        path.join(f.checkout, "node_modules", dependency),
+        { recursive: true },
+      );
+    }
+    const project = path.join(f.base, "unrelated project");
+    await mkdir(path.join(project, ".git"), { recursive: true });
+    const networkGuard = path.join(f.base, "no-network.ts");
+    await put(
+      networkGuard,
+      `globalThis.fetch = (() => { throw new Error("Unexpected network request in load test"); }) as typeof fetch;`,
+    );
+    for (const sourcePeers of ["incomplete", "absent"]) {
+      if (sourcePeers === "absent")
+        await rm(path.join(f.checkout, "node_modules"), { recursive: true });
+      const result = spawnSync(
+        process.execPath,
+        [
+          "--no-env-file",
+          "--preload",
+          networkGuard,
+          path.join(dist, "cli.js"),
+          "--mode",
+          "rpc",
+          "--no-session",
+          "--no-tools",
+          "--no-lsp",
+          "--no-skills",
+          "--no-rules",
+          "--no-title",
+          "--no-ui",
+        ],
+        {
+          cwd: project,
+          // A placeholder unlocks the bundled model list; no prompt is sent and
+          // fetch is blocked. Never inherit real credentials from the developer.
+          env: { ...f.env, OPENAI_API_KEY: "test-placeholder-never-sent" },
+          input: `${JSON.stringify({ id: "commands", type: "get_available_commands" })}\n`,
+          encoding: "utf8",
+          timeout: 25_000,
+          maxBuffer: 1024 * 1024,
+        },
+      );
+      const output = `${result.stdout}\n${result.stderr}`;
+      expect(result.error, output).toBeUndefined();
+      expect(result.status, output).toBe(0);
+      expect(result.stderr, output).toBe("");
+      const frames = result.stdout
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      const response = frames.find((frame) => frame.id === "commands");
+      expect(response?.success, output).toBe(true);
+      const commands = response.data.commands.map((command: Json) => command.name);
+      expect(commands.filter((command: string) => command === "auto")).toHaveLength(1);
+      expect(commands.filter((command: string) => command === "architect")).toHaveLength(1);
+      expect(commands.filter((command: string) => command === "brief")).toHaveLength(
+        withBrief ? 1 : 0,
+      );
+    }
+  }, 60_000);
+
+  test.each([
     "home",
     "project",
     "agent",
