@@ -19,6 +19,7 @@ import {
   loadExtensionFromFactory,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
+import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
 import { cfgBashAutoBackgroundEnabled } from "@oh-my-pi/pi-coding-agent/exec/settings";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import type { AutoConfig } from "../src/auto/config.ts";
@@ -112,8 +113,10 @@ async function loaderFixture(
     new EventBus(),
     runtime,
   );
+  const sessionManager = SessionManager.create(cwd, path.join(cwd, ".test-sessions"));
   const ctx = {
     cwd,
+    sessionManager,
     modelRegistry: overrides.modelRegistry,
     agent: { kind: "main", id: "main", name: "main", depth: 0 },
     hasUI: true,
@@ -164,6 +167,11 @@ async function loaderFixture(
     cwd,
     extension,
     ctx,
+    async evidence(content: string): Promise<string> {
+      const id = await sessionManager.saveArtifact(content, "architect-review");
+      if (!id) throw new Error("Fixture review artifact was not saved");
+      return `artifact://${id}`;
+    },
     messages,
     bootstraps,
     status,
@@ -829,7 +837,10 @@ for (const valid of [true, false]) {
         .get("architect_checkpoint")!
         .definition.execute(
           "completion",
-          { phase: "completion", summary: "Claimed done before CLI validation" },
+          {
+            phase: "completion",
+            evidenceRef: await fixture.evidence("Claimed done before CLI validation"),
+          },
           undefined,
           undefined,
           fixture.ctx,
@@ -1272,6 +1283,9 @@ for (const mode of [
       // SDK callers can isolate settings without binding OMP's process-global CLI settings.
       backgroundEnabled: () => cfgBashAutoBackgroundEnabled.get(settings),
     };
+    // Keep the journal isolated in memory while native review artifacts remain readable on disk.
+    const sessionManager = SessionManager.inMemory(cwd);
+    sessionManager.adoptArtifactManager(new ArtifactManager(path.join(cwd, ".test-artifacts")));
     let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
     try {
       const created = await createAgentSession({
@@ -1281,7 +1295,7 @@ for (const mode of [
         modelRegistry: registry,
         model: registry.getAvailable().find((model) => model.provider === provider),
         settings,
-        sessionManager: SessionManager.inMemory(cwd),
+        sessionManager,
         extensions: [
           (pi) => {
             if (mode === "cancel-delivery")
@@ -1455,7 +1469,7 @@ test.each([
       "terminal",
       {
         phase,
-        summary: "Operator decision required",
+        evidenceRef: await f.evidence("Operator decision required"),
         ...(phase === "plan" ? { steps: ["Inspect", "Implement", "Verify"] } : {}),
       },
       undefined,
@@ -1516,7 +1530,7 @@ test("Auto cancelled final recovery attempt stops without CLI or decision retry"
       .get("architect_checkpoint")!
       .definition.execute(
         "cancelled",
-        { phase: "recovery", summary: "Attempt recovery" },
+        { phase: "recovery", evidenceRef: await f.evidence("Attempt recovery") },
         c.signal,
         undefined,
         f.ctx,
@@ -1537,7 +1551,7 @@ test("explicitly confirmed Auto restart can begin after a terminal architect sto
       .get("architect_checkpoint")!
       .definition.execute(
         "stop",
-        { phase: "blocked", summary: "Old run needs a decision" },
+        { phase: "blocked", evidenceRef: await f.evidence("Old run needs a decision") },
         undefined,
         undefined,
         f.ctx,
@@ -1602,6 +1616,61 @@ test("active Auto status calls keep their tool budget, and terminal diagnostics 
     expect(await f.stop()).toBeUndefined();
     expect(f.counts()).toEqual({ reads: 1, decisions: 0, aborts: 1 });
   } finally {
+    await f.close();
+  }
+});
+
+test("delayed Auto native artifact admission cannot alter a newer request after session switch", async () => {
+  let reviews = 0;
+  const f = await loaderFixture(
+    {},
+    {
+      reviewer: async () => {
+        reviews++;
+        return approved;
+      },
+      dependencies: { snapshot: async () => snapshot(2), validate: async () => {} },
+    },
+  );
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const manager = f.ctx.sessionManager;
+  const original = manager.saveArtifact.bind(manager);
+  let stopping: ReturnType<typeof f.stop> | undefined;
+  try {
+    await f.start();
+    manager.saveArtifact = async (content, kind) => {
+      entered.resolve();
+      await release.promise;
+      return original(content, kind);
+    };
+    stopping = f.stop();
+    await entered.promise;
+    await f.extension.handlers.get("session_switch")![0](
+      { type: "session_switch", reason: "resume", previousSessionFile: undefined },
+      f.ctx,
+    );
+    await f.extension.handlers.get("before_agent_start")![0](
+      { type: "before_agent_start", prompt: "A completely new request", systemPrompt: [] },
+      f.ctx,
+    );
+    const before = await f.status();
+    expect(before.architect).toMatchObject({
+      completionApproved: false,
+      lastReview: null,
+      attempts: { completion: 0 },
+    });
+    release.resolve();
+    await stopping;
+    const after = await f.status();
+    expect(after.architect).toEqual(before.architect);
+    expect(after.status).toBe("idle");
+    expect(reviews).toBe(0);
+    expect(f.counts().aborts).toBe(0);
+  } finally {
+    release.resolve();
+    await stopping?.catch(() => {});
+    manager.saveArtifact = original;
     await f.close();
   }
 });

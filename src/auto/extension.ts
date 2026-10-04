@@ -26,6 +26,7 @@ interface ArchitectBridge {
     summary: string,
     ctx: ExtensionContext,
     signal?: AbortSignal,
+    invocationId?: string,
   ): Promise<Verdict>;
 }
 
@@ -343,6 +344,9 @@ export function createAutoController(
                     completionApproved: bridge.state()!.completionApproved,
                     blocked: bridge.state()!.blocked || null,
                     terminalReason: bridge.state()!.terminalReason ?? null,
+                    lastReview: bridge.state()!.lastReview,
+                    attempts: { ...bridge.state()!.phaseReviews },
+                    rounds: { ...bridge.state()!.phaseRounds },
                   }
                 : null,
             }),
@@ -491,7 +495,10 @@ export function createAutoController(
       inFlight = true;
       const boundaryGeneration = generation;
       const timeout = new AbortController();
-      const timer = setTimeout(() => timeout.abort(), 24000);
+      const timer = setTimeout(
+        () => timeout.abort(new DOMException("Auto boundary timed out", "TimeoutError")),
+        24000,
+      );
       const signal = AbortSignal.any([event.signal, lifetime.signal, timeout.signal]);
       try {
         const snapshot = await readSnapshot(ctx.cwd, current.snapshot.change, cliOptions(), signal);
@@ -531,7 +538,22 @@ export function createAutoController(
             `Strict CLI artifact validation passed; tasks ${JSON.stringify(snapshot.tasks)}; progress ${JSON.stringify(snapshot.progress)}; fingerprint ${snapshot.fingerprint}`,
             false,
           );
-          const verdict = await bridge.review("completion", summary, ctx, signal);
+          const verdict = await bridge.review(
+            "completion",
+            JSON.stringify({
+              progressSummary: { source: "assistant-authored claim", content: summary },
+              rasen: { source: "fresh host-read context", ...snapshot },
+              validation: {
+                source: "host-executed strict CLI validation",
+                change: snapshot.change,
+                passed: true,
+                fingerprint: snapshot.fingerprint,
+              },
+            }),
+            ctx,
+            signal,
+            `auto:${current.id}:${boundaryGeneration}:${architect.reviewCount + 1}`,
+          );
           if (run !== current || !ownsTurn || signal.aborted) return { handled: true };
           if (verdict.decision === "approve" && architect.completionApproved) {
             current.stop(

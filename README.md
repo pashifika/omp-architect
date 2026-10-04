@@ -7,7 +7,7 @@ while a separate reviewer checks plans, recovery approaches, and completion evid
 ## Features
 
 - **Role-based agents:** Send coding tasks to `omp-worker` and read-only research to `omp-explorer`.
-- **Independent reviews:** Ask an architect model to review meaningful checkpoints before proceeding.
+- **Independent reviews:** Hand a complete native OMP file to an architect model at meaningful checkpoints.
 - **Bounded review rounds:** Set minimum and maximum rounds; unresolved findings stop the workflow.
 - **Optional Rasen Auto:** Run prepared [Rasen](https://github.com/DumoeDss/rasen) changes through limited implementation turns and completion review.
 
@@ -52,10 +52,23 @@ for previews, alternative setups, and conflict handling.
    /model
    ```
 
-The main agent uses `architect_checkpoint` for plan, recovery, and completion reviews.
-Use `/architect` to inspect blocked work and review status. The extension does not
-silently switch your active main model. Reviews send bounded task evidence to your
-configured provider; do not include secrets. These checks do not replace tool approvals.
+The main agent writes review material with OMP's existing `write` tool to
+`local://architect-review/NAME.md`, then calls `architect_checkpoint` with
+`{ phase, evidenceRef, steps? }`. An originating-session `artifact://ID` is also
+accepted; inline `summary` is not. The checkpoint snapshots the complete file into
+native session artifacts. The default `maxReviewBytes` is 131072 UTF-8 bytes;
+oversized or invalid input is rejected without spending a review, never truncated.
+See the [native-file handoff examples](docs/architect.md#native-file-handoff) for
+direct and `xd://` calls. Restricted Eval carriers require `language: "js"` and
+`reset: true` on each outer Eval call, which discards previous Eval variables.
+
+Use `/architect` or `auto_status` to inspect blocked work and review status.
+Completion requested inside Eval is queued without approval and reviewed once at
+the turn boundary after outer results arrive. Wait for background jobs to finish
+and submit fresh evidence before completion review. The extension does not silently
+switch your active main model. Reviews send the full admitted file and bounded
+host evidence to your configured provider; do not include secrets. These checks
+do not replace tool approvals or prove that assistant-authored claims occurred.
 
 ## Configuration and guides
 

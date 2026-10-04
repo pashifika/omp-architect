@@ -172,7 +172,7 @@ test("whole escaped instructions fit architect evidence or are rejected, with im
   const text = autoRequest("my-change", "  Begin\n" + '日本語\\"'.repeat(200) + "\n  End\n");
   expect(core.canRetainRequest(text)).toBe(true);
   core.begin(text);
-  expect(JSON.parse(core.snapshot("plan", "summary")).request).toBe(text);
+  expect(JSON.parse(core.snapshot("plan")).request).toBe(text);
   expect(core.canRetainRequest(autoRequest("my-change", "x".repeat(12000)))).toBe(false);
 });
 

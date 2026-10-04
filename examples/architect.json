@@ -8,5 +8,6 @@
   "repeatedErrorThreshold": 2,
   "substantialPlanSteps": 3,
   "reviewTimeoutMs": 120000,
-  "maxEvidenceChars": 24000
+  "maxEvidenceChars": 24000,
+  "maxReviewBytes": 131072
 }

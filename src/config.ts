@@ -7,6 +7,7 @@ export interface Config {
   reviews: { min: number; max: number };
   reviewTimeoutMs: number;
   maxEvidenceChars: number;
+  maxReviewBytes: number;
 }
 
 export const defaults: Config = {
@@ -16,6 +17,7 @@ export const defaults: Config = {
   reviews: { min: 1, max: 3 },
   reviewTimeoutMs: 120000,
   maxEvidenceChars: 24000,
+  maxReviewBytes: 131072,
 };
 
 export function parseConfig(value: unknown): Config {
@@ -64,6 +66,7 @@ export function parseConfig(value: unknown): Config {
 
     reviewTimeoutMs: [100, 120000],
     maxEvidenceChars: [1000, 100000],
+    maxReviewBytes: [1024, 1048576],
   };
   for (const [key, [min, max]] of Object.entries(limits)) {
     if (input[key] === undefined) continue;

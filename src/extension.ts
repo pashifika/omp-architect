@@ -1,6 +1,13 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { loadConfig, type Config } from "./config.ts";
-import { Orchestrator, routeAgent, type Reviewer, type Phase } from "./core.ts";
+import {
+  Orchestrator,
+  routeAgent,
+  type Reviewer,
+  type Phase,
+  type ReviewMaterial,
+} from "./core.ts";
+import { loadReviewMaterial, saveReviewMaterial, reviewWrite, reviewCarrier } from "./artifacts.ts";
 import { createReviewer } from "./reviewer.ts";
 import { createAutoController, type AutoDependencies } from "./auto/extension.ts";
 import instructions from "./prompts/orchestration.md" with { type: "text" };
@@ -15,6 +22,40 @@ function effectiveToolName(toolName: string, input: object): string {
 }
 
 type ReviewerFactory = (pi: ExtensionAPI, ctx: ExtensionContext, config: Config) => Reviewer;
+function captureMetadata(details: unknown): unknown {
+  if (!details || typeof details !== "object" || !("meta" in details)) return;
+  const meta = details.meta;
+  if (!meta || typeof meta !== "object") return;
+  const pick = (value: unknown) => {
+    if (!value || typeof value !== "object") return;
+    const result: Record<string, string | number | boolean> = {};
+    for (const key of [
+      "artifactId",
+      "artifactElidedBytes",
+      "totalBytes",
+      "outputBytes",
+      "elidedBytes",
+      "partialLine",
+    ])
+      if (key in value) {
+        const field = (value as Record<string, unknown>)[key];
+        if (
+          typeof field === "number" ||
+          typeof field === "boolean" ||
+          (typeof field === "string" && field.length <= 100)
+        )
+          result[key] = field;
+      }
+    return result;
+  };
+  const source = meta as Record<string, unknown>;
+  const limits = source.limits as { columnTruncated?: unknown } | undefined;
+  return {
+    truncation: pick(source.truncation),
+    columnTruncated: pick(limits?.columnTruncated),
+    artifactCaptureFailed: !!source.artifactError,
+  };
+}
 export function extensionFactory(
   reviewerFactory: ReviewerFactory = createReviewer,
   autoDependencies?: AutoDependencies,
@@ -28,6 +69,20 @@ export function extensionFactory(
     let expectedContinuation = "";
     let acceptedPrompt = "";
     let newUserRequest = false;
+    const activeEvals = new Map<string, Record<string, unknown>>();
+    let queuedCompletion:
+      | {
+          material: ReviewMaterial;
+          invocationId: string;
+          generation: number;
+          signal: AbortSignal;
+          detach: () => void;
+        }
+      | undefined;
+    const clearQueuedCompletion = () => {
+      queuedCompletion?.detach();
+      queuedCompletion = undefined;
+    };
     const continueWith = (text: string) => {
       acceptedPrompt = "";
       expectedContinuation = `${text}\n\nArchitect continuation: ${crypto.randomUUID()}`;
@@ -37,6 +92,7 @@ export function extensionFactory(
       if (stopped) return;
       stopped = true;
       newUserRequest = false;
+      clearQueuedCompletion();
       if (state) {
         state.blocked = reason;
         state.invalidate();
@@ -47,7 +103,7 @@ export function extensionFactory(
       pi.sendMessage(
         {
           customType: "omp-architect",
-          content: `Blocked: ${reason}. Completion remains unverified. Start a new request after resolving the blocker.`,
+          content: `Blocked: ${reason}. Completion remains unverified. Start a new request after resolving the blocker.\n${JSON.stringify({ lastReview: state?.lastReview ?? null, stopOrigin: "architect_terminal" })}`,
           display: true,
         },
         { triggerTurn: false, deliverAs: "nextTurn" },
@@ -57,6 +113,8 @@ export function extensionFactory(
     };
     const initialize = async (ctx: ExtensionContext) => {
       generation++;
+      activeEvals.clear();
+      clearQueuedCompletion();
       stopped = false;
       newUserRequest = false;
       acceptedPrompt = "";
@@ -75,9 +133,10 @@ export function extensionFactory(
     };
     const review = async (
       phase: Phase,
-      summary: string,
+      material: ReviewMaterial,
       ctx: ExtensionContext,
       signal?: AbortSignal,
+      invocationId?: string,
     ) => {
       if (!state)
         return {
@@ -86,13 +145,52 @@ export function extensionFactory(
           issues: [],
         };
       const combined = signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal;
-      return state.review(phase, summary, reviewerFactory(pi, ctx, state.config), combined);
+      return state.review(
+        phase,
+        material,
+        reviewerFactory(pi, ctx, state.config),
+        combined,
+        invocationId,
+      );
     };
     const auto = createAutoController(
       pi,
       {
         state: () => state,
-        review,
+        review: async (phase, body, ctx, signal, invocationId) => {
+          const current = state;
+          const requestGeneration = generation;
+          if (!current) return review(phase, {} as ReviewMaterial, ctx, signal, invocationId);
+          try {
+            const material = await saveReviewMaterial(
+              ctx,
+              body,
+              current.config.maxReviewBytes,
+              "auto",
+              signal,
+            );
+            if (state !== current || generation !== requestGeneration)
+              return {
+                decision: "blocked",
+                summary: "Auto review input was superseded",
+                issues: [],
+              };
+            return await review(phase, material, ctx, signal, invocationId);
+          } catch (error) {
+            if (state !== current || generation !== requestGeneration)
+              return {
+                decision: "blocked",
+                summary: "Auto review input was superseded",
+                issues: [],
+              };
+            return current.rejectReview(
+              phase,
+              invocationId ?? crypto.randomUUID(),
+              error instanceof Error ? error.message : String(error),
+              signal?.aborted ? "caller_cancelled" : "input_rejected",
+            );
+          }
+        },
         invalidateStart: () => {
           acceptedPrompt = "";
         },
@@ -111,6 +209,8 @@ export function extensionFactory(
     pi.on("session_shutdown", () => {
       auto.shutdown();
       lifetime.abort();
+      clearQueuedCompletion();
+      activeEvals.clear();
     });
     pi.on("input", (event, ctx) => {
       if (ctx.agent.kind !== "main" || event.source === "extension") return;
@@ -123,6 +223,7 @@ export function extensionFactory(
       acceptedPrompt = "";
       expectedContinuation = "";
       newUserRequest = true;
+      clearQueuedCompletion();
       auto.userInput();
     });
     pi.on("turn_start", (_, ctx) => {
@@ -153,6 +254,8 @@ export function extensionFactory(
         if (!preserving) {
           stopped = false;
           generation++;
+          activeEvals.clear();
+          clearQueuedCompletion();
           state?.begin(auto.request() ?? event.prompt);
         }
         if (!unexpected && autoStart !== "blocked") acceptedPrompt = event.prompt;
@@ -196,44 +299,118 @@ export function extensionFactory(
         );
       const autoReason = auto.toolCall(event.toolCallId, toolName, { ...event.input }, ctx);
       if (autoReason) return deny(autoReason);
-      const reason = state?.gate(toolName, { ...event.input });
+      const input: Record<string, unknown> = { ...event.input };
+      if (toolName === "architect_checkpoint") {
+        let checkpointInput: unknown = input;
+        if (event.toolName === "write" && typeof input.content === "string") {
+          try {
+            checkpointInput = JSON.parse(input.content);
+          } catch {
+            checkpointInput = undefined;
+          }
+        }
+        if (
+          checkpointInput &&
+          typeof checkpointInput === "object" &&
+          !Array.isArray(checkpointInput) &&
+          Object.keys(checkpointInput).some(
+            (key) => !["phase", "evidenceRef", "steps"].includes(key),
+          )
+        ) {
+          const reason =
+            "Checkpoint accepts only phase, evidenceRef and optional canonical steps; inline summary/body is unsupported";
+          const phase = (checkpointInput as { phase?: string }).phase;
+          state?.rejectReview(
+            phase === "plan" || phase === "recovery" ? phase : "completion",
+            `${ctx.sessionManager.getSessionId()}:${generation}:${event.toolCallId}`.slice(0, 200),
+            reason,
+          );
+          return deny(reason);
+        }
+      }
+      const reviewOnly =
+        state &&
+        ((toolName === "write" && reviewWrite(input, state.config.maxReviewBytes)) ||
+          (toolName === "eval" && reviewCarrier(input, state.config.maxReviewBytes)));
+      const reason = state?.gate(reviewOnly ? "architect_checkpoint" : toolName, input);
       if (reason) return deny(reason);
+      if (toolName === "eval") activeEvals.set(event.toolCallId, input);
     });
     pi.on("tool_result", (event, ctx) => {
       if (ctx.agent.kind !== "main" || !state) return;
       const toolName = effectiveToolName(event.toolName, event.input);
+      if (toolName === "eval") activeEvals.delete(event.toolCallId);
       if (toolName === "auto_status" || toolName === "architect_checkpoint") return;
       const text = event.content
         .filter((c) => c.type === "text")
         .map((c) => c.text)
         .join("\n");
-      const repeated = state.observe(event.toolCallId, toolName, event.input, text, event.isError);
+      const repeated = state.observe(
+        event.toolCallId,
+        toolName,
+        event.input,
+        text,
+        event.isError,
+        captureMetadata(event.details),
+      );
       if (repeated)
         return {
           additionalContext:
             "OMP Architect detected repeated tool failure. Call architect_checkpoint phase=recovery with the failure and a different approach before further execution. A review never grants permission.",
         };
     });
+    pi.on("agent_end", (event, ctx) => {
+      if (ctx.agent.kind === "main" && !event.willContinue) clearQueuedCompletion();
+    });
+    pi.on("tool_execution_end", (event, ctx) => {
+      if (ctx.agent.kind !== "main" || event.toolName !== "eval") return;
+      const input = activeEvals.get(event.toolCallId);
+      if (!input) return; // The normal tool_result already recorded this execution.
+      activeEvals.delete(event.toolCallId);
+      state?.observe(
+        event.toolCallId,
+        "eval",
+        input,
+        "Eval execution ended without an observed tool_result; its output and effects are unverified",
+        true,
+      );
+      clearQueuedCompletion();
+    });
     const { Type } = pi.typebox;
     pi.registerTool({
       name: "architect_checkpoint",
       label: "Architect checkpoint",
       description:
-        "Independent architect review before a substantial plan, after repeated failure, or before claiming completion. Uses configured architect model; no tools, mutations, or recursive agents. Pass factual evidence, not unsupported success claims. Plan reviews require non-empty canonical steps. Use phase=blocked to report an honest blocker and stop without a review or approval.",
+        "Independent bounded review using a complete native OMP file. Write the body to local://architect-review/NAME.md, then pass evidenceRef only (or an artifact://ID from this session). Default maxReviewBytes is 131072 UTF-8 bytes; oversized files are rejected, never truncated. Inline summary is unsupported. Plan requires canonical steps. Completion inside Eval is queued until its outer execution finishes. Use phase=blocked with a file describing the blocker to stop without review.",
       approval: "read",
-      parameters: Type.Object({
-        phase: Type.Union([
-          Type.Literal("plan"),
-          Type.Literal("recovery"),
-          Type.Literal("completion"),
-          Type.Literal("blocked"),
-        ]),
-        summary: Type.String({ minLength: 1, maxLength: 8000 }),
-        steps: Type.Optional(
-          Type.Array(Type.String({ minLength: 1, maxLength: 1000 }), { minItems: 1, maxItems: 30 }),
-        ),
-      }),
-      async execute(_id, params, signal, _update, ctx) {
+      parameters: Type.Object(
+        {
+          phase: Type.Union([
+            Type.Literal("plan"),
+            Type.Literal("recovery"),
+            Type.Literal("completion"),
+            Type.Literal("blocked"),
+          ]),
+          evidenceRef: Type.String({
+            minLength: 1,
+            maxLength: 160,
+            description:
+              "Complete native file reference: artifact://ID from the originating session or local://architect-review/NAME.md (NAME: 1–80 letters, digits, underscores or hyphens). Default 131072-byte full-body limit; no inline body or summary.",
+          }),
+          steps: Type.Optional(
+            Type.Array(
+              Type.String({
+                minLength: 1,
+                maxLength: 1000,
+                description: "Exact canonical step, 1–1000 characters",
+              }),
+              { minItems: 1, maxItems: 30, description: "1–30 exact canonical steps" },
+            ),
+          ),
+        },
+        { additionalProperties: false },
+      ),
+      async execute(id, params, signal, _update, ctx) {
         if (ctx.agent.kind !== "main")
           return {
             content: [
@@ -244,12 +421,20 @@ export function extensionFactory(
             ],
             isError: true,
           };
-        if (params.phase === "blocked") {
-          stopBlocked(params.summary, ctx);
-          const verdict = { decision: "blocked" as const, summary: params.summary, issues: [] };
+        if (Object.keys(params).some((key) => !["phase", "evidenceRef", "steps"].includes(key))) {
+          const invocationId = `${ctx.sessionManager.getSessionId()}:${generation}:${id}`.slice(
+            0,
+            200,
+          );
+          const verdict = state?.rejectReview(
+            params.phase === "blocked" ? "completion" : params.phase,
+            invocationId,
+            "Checkpoint accepts only phase, evidenceRef and optional canonical steps; inline summary/body is unsupported",
+          );
+          const result = { ...verdict, status: "input_rejected", charged: false, invocationId };
           return {
-            content: [{ type: "text", text: JSON.stringify(verdict) }],
-            details: verdict,
+            content: [{ type: "text", text: JSON.stringify(result) }],
+            details: result,
             isError: true,
           };
         }
@@ -263,6 +448,142 @@ export function extensionFactory(
             ],
             isError: false,
           };
+        const admissionState = state;
+        const admissionGeneration = generation;
+        const invocationId = `${ctx.sessionManager.getSessionId()}:${generation}:${id}`.slice(
+          0,
+          200,
+        );
+        let material: ReviewMaterial;
+        try {
+          material = await loadReviewMaterial(
+            ctx,
+            params.evidenceRef,
+            state?.config.maxReviewBytes ?? 131072,
+            signal,
+          );
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const verdict =
+            state === admissionState && generation === admissionGeneration
+              ? state?.rejectReview(
+                  params.phase === "blocked" ? "completion" : params.phase,
+                  invocationId,
+                  message,
+                  signal?.aborted ? "caller_cancelled" : "input_rejected",
+                )
+              : undefined;
+          const result = {
+            ...(verdict ?? { decision: "blocked", summary: message, issues: [] }),
+            invocationId,
+            status: signal?.aborted ? "caller_cancelled" : "input_rejected",
+            charged: false,
+          };
+          return {
+            content: [{ type: "text", text: JSON.stringify(result) }],
+            details: result,
+            isError: true,
+          };
+        }
+        if (
+          state !== admissionState ||
+          generation !== admissionGeneration ||
+          newUserRequest ||
+          signal?.aborted
+        ) {
+          const result = {
+            decision: "blocked",
+            status: "caller_cancelled",
+            charged: false,
+            invocationId,
+            summary: "Checkpoint input belongs to a cancelled or superseded request",
+          };
+          return {
+            content: [{ type: "text", text: JSON.stringify(result) }],
+            details: result,
+            isError: true,
+          };
+        }
+        if (params.phase === "blocked") {
+          const reason =
+            material.content.length > 4000
+              ? `${material.content.slice(0, 3900)} [continued in ${material.ref}]`
+              : material.content;
+          stopBlocked(reason, ctx);
+          const result = {
+            decision: "blocked",
+            summary: reason,
+            issues: [],
+            invocationId,
+            status: "operator_blocked",
+            charged: false,
+            artifactRef: material.ref,
+            sha256: material.sha256,
+          };
+          return {
+            content: [{ type: "text", text: JSON.stringify(result) }],
+            details: result,
+            isError: true,
+          };
+        }
+        if (
+          params.phase === "completion" &&
+          (ctx.getAsyncJobSnapshot?.()?.running.length ?? 0) > 0
+        ) {
+          const verdict = state?.rejectReview(
+            "completion",
+            invocationId,
+            "Background jobs remain active; await their completion and submit fresh review evidence",
+          );
+          const result = { ...verdict, invocationId, status: "input_rejected", charged: false };
+          return {
+            content: [{ type: "text", text: JSON.stringify(result) }],
+            details: result,
+            isError: true,
+          };
+        }
+        if (params.phase === "completion" && activeEvals.size) {
+          if (queuedCompletion) {
+            const result = {
+              decision: "blocked",
+              status: "input_rejected",
+              charged: false,
+              invocationId,
+              summary: "A completion checkpoint is already queued for this boundary",
+            };
+            return {
+              content: [{ type: "text", text: JSON.stringify(result) }],
+              details: result,
+              isError: true,
+            };
+          }
+          const queueSignal = signal ?? lifetime.signal;
+          const onAbort = () => {
+            if (queuedCompletion?.invocationId === invocationId) clearQueuedCompletion();
+          };
+          queuedCompletion = {
+            material,
+            invocationId,
+            generation,
+            signal: queueSignal,
+            detach: () => queueSignal.removeEventListener("abort", onAbort),
+          };
+          queueSignal.addEventListener("abort", onAbort, { once: true });
+          const result = {
+            status: "queued",
+            charged: false,
+            invocationId,
+            artifactRef: material.ref,
+            sha256: material.sha256,
+            summary:
+              "Completion is unverified. Review will run once at the turn boundary after all Eval results are observed. Return factual progress; do not claim approval.",
+          };
+          return {
+            content: [{ type: "text", text: JSON.stringify(result) }],
+            details: result,
+            isError: false,
+          };
+        }
         if (params.phase === "plan" && params.steps !== undefined && !params.steps.length) {
           // Do not erase an existing gate when rejecting an empty replacement plan.
           state?.revokeApproval("plan");
@@ -281,20 +602,24 @@ export function extensionFactory(
           state.setPendingPlan(params.steps);
         const current = state;
         const requestGeneration = generation;
-        const verdict = await review(params.phase, params.summary, ctx, signal);
+        const verdict = await review(params.phase, material, ctx, signal, invocationId);
         if (state && state === current && generation === requestGeneration && state.terminalReason)
           stopBlocked(state.terminalReason, ctx);
+        const reviewOutcome =
+          state?.lastReview?.invocationId === invocationId ? state.lastReview : null;
         const result =
           params.phase === "plan" && state === current
             ? {
                 ...verdict,
+                invocationId,
+                review: reviewOutcome,
                 plan: state?.planStatus(),
                 next:
                   verdict.decision === "approve"
                     ? "Copy the canonical approved steps exactly into todo; await successful registration before execution. Do not batch todo registration with execution."
                     : "Review the pending canonical steps with phase=plan and address the findings, or stop with phase=blocked. Approval requires exact steps, including punctuation, whitespace and order.",
               }
-            : verdict;
+            : { ...verdict, invocationId, review: reviewOutcome };
         return {
           content: [{ type: "text", text: JSON.stringify(result) }],
           details: result,
@@ -308,6 +633,57 @@ export function extensionFactory(
       if (state?.terminalReason) {
         stopBlocked(state.terminalReason, ctx);
         return;
+      }
+      const queued = queuedCompletion;
+      clearQueuedCompletion();
+      if (
+        queued &&
+        !event.signal.aborted &&
+        !queued.signal.aborted &&
+        queued.generation === generation &&
+        !activeEvals.size &&
+        !auto.handlesCompletion() &&
+        !(ctx.getAsyncJobSnapshot?.()?.running.length ?? 0)
+      ) {
+        const current = state;
+        const timeout = new AbortController();
+        const timer = setTimeout(
+          () =>
+            timeout.abort(
+              new DOMException("Deferred completion boundary timed out", "TimeoutError"),
+            ),
+          24000,
+        );
+        let verdict;
+        try {
+          verdict = await review(
+            "completion",
+            queued.material,
+            ctx,
+            AbortSignal.any([event.signal, queued.signal, timeout.signal]),
+            queued.invocationId,
+          );
+        } finally {
+          clearTimeout(timer);
+        }
+        if (state !== current || queued.generation !== generation) return;
+        if (state?.terminalReason) {
+          stopBlocked(state.terminalReason, ctx);
+          return;
+        }
+        pi.sendMessage(
+          {
+            customType: "omp-architect",
+            content: JSON.stringify({
+              ...verdict,
+              invocationId: queued.invocationId,
+              review:
+                state?.lastReview?.invocationId === queued.invocationId ? state.lastReview : null,
+            }),
+            display: true,
+          },
+          { triggerTurn: false, deliverAs: "nextTurn" },
+        );
       }
       const autoResult = await auto.onStop(event, ctx);
       if (autoResult.handled) return autoResult.result;
@@ -347,6 +723,7 @@ export function extensionFactory(
           ? {
               roles: state.config.roles,
               reviews: `${state.reviewCount}/${3 * state.config.reviews.max}`,
+              lastReview: state.lastReview,
               completionApproved: state.completionApproved,
               pendingRecovery: state.pendingRecovery,
               plan: state.planStatus(),
