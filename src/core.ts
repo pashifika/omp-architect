@@ -127,12 +127,14 @@ function boundedEvidence(
   output: string,
   isError: boolean,
   limit: number,
+  denied = false,
 ): string {
   const record = {
     tool: boundedText(tool, Math.min(100, Math.floor(limit / 8)), true),
     input,
     output: "",
     isError,
+    ...(denied ? { kind: "gate_denial", executed: false } : {}),
   };
   const inputText = JSON.stringify(input);
   const inputLimit = Math.floor(limit / 4);
@@ -160,6 +162,7 @@ export class Orchestrator {
   pendingRecovery = false;
   pendingPlan: string[] = [];
   approvedPlan = "";
+  #approvedSteps: string[] = [];
   blocked = "";
   request = "";
   evidence: string[] = [];
@@ -188,6 +191,7 @@ export class Orchestrator {
     this.pendingRecovery = false;
     this.pendingPlan = [];
     this.approvedPlan = "";
+    this.#approvedSteps = [];
     this.blocked = "";
     this.evidence = [];
     this.#evidenceChars = 0;
@@ -216,20 +220,7 @@ export class Orchestrator {
     if (tool === "architect_checkpoint" || this.#seen.has(id)) return false;
     this.#seen.add(id);
     this.invalidate();
-    // One record cannot consume the ring or the space reserved for checkpoint context.
-    const entry = boundedEvidence(
-      tool,
-      input,
-      output,
-      isError,
-      Math.floor(this.config.maxEvidenceChars / 3),
-    );
-    this.evidence.push(entry);
-    this.#evidenceChars += jsonSize(entry) + 1;
-    while (this.#evidenceChars > this.config.maxEvidenceChars) {
-      this.#evidenceChars -= jsonSize(this.evidence.shift()!) + 1;
-      this.#omittedEvidence++;
-    }
+    this.recordEvidence(tool, input, output, isError);
     if (!isError) {
       this.#failures.delete(tool);
       return false;
@@ -241,25 +232,97 @@ export class Orchestrator {
     if (count >= this.config.repeatedErrorThreshold) this.pendingRecovery = true;
     return this.pendingRecovery;
   }
+  /** Admission denials are evidence, not executed tool errors or recovery streaks. */
+  deny(id: string, tool: string, input: Record<string, unknown>, reason: string): void {
+    if (this.#seen.has(id)) return;
+    this.#seen.add(id);
+    this.invalidate();
+    this.recordEvidence(tool, input, reason, true, true);
+  }
+  private recordEvidence(
+    tool: string,
+    input: Record<string, unknown>,
+    output: string,
+    isError: boolean,
+    denied = false,
+  ): void {
+    // One record cannot consume the ring or the space reserved for checkpoint context.
+    const entry = boundedEvidence(
+      tool,
+      input,
+      output,
+      isError,
+      Math.floor(this.config.maxEvidenceChars / 3),
+      denied,
+    );
+    this.evidence.push(entry);
+    this.#evidenceChars += jsonSize(entry) + 1;
+    while (this.#evidenceChars > this.config.maxEvidenceChars) {
+      this.#evidenceChars -= jsonSize(this.evidence.shift()!) + 1;
+      this.#omittedEvidence++;
+    }
+  }
+  get planApproved(): boolean {
+    return (
+      this.pendingPlan.length > 0 && digest(JSON.stringify(this.pendingPlan)) === this.approvedPlan
+    );
+  }
+  planStatus() {
+    return {
+      pending: this.pendingPlan.length
+        ? {
+            id: digest(JSON.stringify(this.pendingPlan)),
+            steps: [...this.pendingPlan],
+            approved: this.planApproved,
+          }
+        : null,
+      approved: this.approvedPlan
+        ? { id: this.approvedPlan, steps: [...this.#approvedSteps] }
+        : null,
+    };
+  }
+  get reviewInProgress(): boolean {
+    return this.#inFlight;
+  }
+  get terminalReason(): string | undefined {
+    if (this.#inFlight) return;
+    const unresolved: Record<Phase, boolean> = {
+      plan: this.pendingPlan.length > 0 && !this.planApproved,
+      recovery: this.pendingRecovery,
+      completion: !this.completionApproved,
+    };
+    for (const phase of ["plan", "recovery", "completion"] as const) {
+      if (unresolved[phase] && this.phaseReviews[phase] >= this.config.reviews.max)
+        return `Architect ${phase} review budget exhausted with unresolved work. ${this.blocked}`.trim();
+    }
+  }
   gate(tool: string, input: Record<string, unknown>): string | undefined {
     if (tool === "architect_checkpoint") return;
     if (
       this.pendingPlan.length &&
-      digest(JSON.stringify(this.pendingPlan)) !== this.approvedPlan &&
+      !this.planApproved &&
       !readOnlyTools.has(tool) &&
       tool !== "todo"
     )
-      return "Pending plan is not approved. Call architect_checkpoint phase=plan before execution.";
+      return `Pending plan is not approved. Call architect_checkpoint phase=plan before execution. Pending plan ID: ${digest(JSON.stringify(this.pendingPlan))}; approved plan ID: ${this.approvedPlan || "none"}. Read auto_status for canonical steps; review the pending steps or restore the exact approved steps with todo. Await successful todo registration before executing; do not batch them.`;
     if (this.pendingRecovery && !readOnlyTools.has(tool))
       return "Repeated tool failure: call architect_checkpoint with phase recovery before retrying or changing files.";
     if (tool === "todo") {
       const steps = planSteps(input);
-      if (
-        steps.length >= this.config.substantialPlanSteps &&
-        digest(JSON.stringify(steps)) !== this.approvedPlan
+      if (steps.length && digest(JSON.stringify(steps)) === this.approvedPlan) {
+        // Restoring the exact approved payload is safe; never infer semantic equivalence.
+        this.setPendingPlan(steps);
+      } else if (
+        steps.length &&
+        (steps.length >= this.config.substantialPlanSteps || this.pendingPlan.length)
       ) {
         this.setPendingPlan(steps);
-        return "Substantial plan: call architect_checkpoint with phase plan to review these pending steps before recording or executing them.";
+        const mismatch = this.approvedPlan
+          ? steps.length !== this.#approvedSteps.length
+            ? `Step count differs: approved ${this.#approvedSteps.length}, received ${steps.length}.`
+            : `Step ${steps.findIndex((step, index) => step !== this.#approvedSteps[index]) + 1} differs from the approved text (including punctuation and whitespace).`
+          : "No exact plan has been approved.";
+        return `Substantial plan: call architect_checkpoint with phase plan to review these pending steps before recording or executing them. ${mismatch} Pending plan ID: ${digest(JSON.stringify(steps))}; approved plan ID: ${this.approvedPlan || "none"}. Read auto_status for canonical steps. Retry todo with the exact approved steps, or review the changed pending steps. Await todo success before execution; never batch registration with execution.`;
       }
     }
   }
@@ -293,7 +356,10 @@ export class Orchestrator {
   revokeApproval(phase: Phase): void {
     this.#cache.clear();
     this.completionRevision = -1;
-    if (phase === "plan") this.approvedPlan = "";
+    if (phase === "plan") {
+      this.approvedPlan = "";
+      this.#approvedSteps = [];
+    }
     if (phase === "recovery") this.pendingRecovery = true;
   }
   async review(
@@ -305,6 +371,18 @@ export class Orchestrator {
     if (signal?.aborted) {
       this.revokeApproval(phase);
       return { decision: "blocked", summary: "Architect review cancelled", issues: [] };
+    }
+    if (
+      phase === "plan" &&
+      (!this.pendingPlan.length || this.pendingPlan.some((step) => !step.trim()))
+    ) {
+      this.revokeApproval(phase);
+      return {
+        decision: "blocked",
+        summary:
+          "Plan checkpoint requires non-empty steps. Pass steps explicitly, or stage a substantial todo first. No review round was charged.",
+        issues: ["No valid canonical plan steps to approve"],
+      };
     }
     if (
       phase === "completion" &&
@@ -388,7 +466,10 @@ export class Orchestrator {
           this.pendingRecovery = false;
           this.#failures.clear();
         }
-        if (phase === "plan") this.approvedPlan = digest(JSON.stringify(this.pendingPlan));
+        if (phase === "plan") {
+          this.approvedPlan = digest(JSON.stringify(this.pendingPlan));
+          this.#approvedSteps = [...this.pendingPlan];
+        }
       }
       this.#cache.set(key, verdict);
       return verdict;

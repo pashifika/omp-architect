@@ -27,6 +27,7 @@ export function extensionFactory(
     let generation = 0;
     let expectedContinuation = "";
     let acceptedPrompt = "";
+    let newUserRequest = false;
     const continueWith = (text: string) => {
       acceptedPrompt = "";
       expectedContinuation = `${text}\n\nArchitect continuation: ${crypto.randomUUID()}`;
@@ -35,6 +36,11 @@ export function extensionFactory(
     const stopBlocked = (reason: string, ctx: ExtensionContext) => {
       if (stopped) return;
       stopped = true;
+      newUserRequest = false;
+      if (state) {
+        state.blocked = reason;
+        state.invalidate();
+      }
       acceptedPrompt = "";
       expectedContinuation = "";
       auto.architectBlocked(reason, ctx);
@@ -51,6 +57,8 @@ export function extensionFactory(
     };
     const initialize = async (ctx: ExtensionContext) => {
       generation++;
+      stopped = false;
+      newUserRequest = false;
       acceptedPrompt = "";
       expectedContinuation = "";
       lifetime.abort();
@@ -114,6 +122,7 @@ export function extensionFactory(
       }
       acceptedPrompt = "";
       expectedContinuation = "";
+      newUserRequest = true;
       auto.userInput();
     });
     pi.on("turn_start", (_, ctx) => {
@@ -125,6 +134,15 @@ export function extensionFactory(
       if (!acceptedPrompt || event.prompt !== acceptedPrompt) {
         const autoStart = auto.beforeStart(event.prompt, ctx);
         if (autoStart === "blocked") stopped = true;
+        // A preparation/queued-delivery hook alone is not a new user request.
+        // A confirmed Auto start has its own exact bootstrap ownership check.
+        if (stopped && autoStart !== "blocked" && !newUserRequest && !auto.request()) {
+          acceptedPrompt = "";
+          expectedContinuation = "";
+          ctx.abort();
+          return;
+        }
+        newUserRequest = false;
         const expected = expectedContinuation;
         expectedContinuation = "";
         const unexpected = expected !== "" && event.prompt !== expected;
@@ -166,16 +184,20 @@ export function extensionFactory(
       if (ctx.agent.kind !== "main") return;
       if (configError) return { block: true, reason: configError };
       const toolName = effectiveToolName(event.toolName, event.input);
-      if (stopped && toolName !== "auto_status")
-        return {
-          block: true,
-          reason:
-            "OMP Architect stopped this request; start a new user request after resolving the blocker",
-        };
+      // Diagnostics must remain available even after Auto or Architect stops.
+      if (toolName === "auto_status" && (stopped || !auto.isRunning())) return;
+      const deny = (reason: string) => {
+        state?.deny(event.toolCallId, toolName, { ...event.input }, reason);
+        return { block: true as const, reason };
+      };
+      if (stopped)
+        return deny(
+          "OMP Architect stopped this request; start a new user request after resolving the blocker",
+        );
       const autoReason = auto.toolCall(event.toolCallId, toolName, { ...event.input }, ctx);
-      if (autoReason) return { block: true, reason: autoReason };
+      if (autoReason) return deny(autoReason);
       const reason = state?.gate(toolName, { ...event.input });
-      if (reason) return { block: true, reason };
+      if (reason) return deny(reason);
     });
     pi.on("tool_result", (event, ctx) => {
       if (ctx.agent.kind !== "main" || !state) return;
@@ -197,17 +219,18 @@ export function extensionFactory(
       name: "architect_checkpoint",
       label: "Architect checkpoint",
       description:
-        "Independent architect review before a substantial plan, after repeated failure, or before claiming completion. Uses configured architect model; no tools, mutations, or recursive agents. Pass factual evidence, not unsupported success claims.",
+        "Independent architect review before a substantial plan, after repeated failure, or before claiming completion. Uses configured architect model; no tools, mutations, or recursive agents. Pass factual evidence, not unsupported success claims. Plan reviews require non-empty canonical steps. Use phase=blocked to report an honest blocker and stop without a review or approval.",
       approval: "read",
       parameters: Type.Object({
         phase: Type.Union([
           Type.Literal("plan"),
           Type.Literal("recovery"),
           Type.Literal("completion"),
+          Type.Literal("blocked"),
         ]),
         summary: Type.String({ minLength: 1, maxLength: 8000 }),
         steps: Type.Optional(
-          Type.Array(Type.String({ minLength: 1, maxLength: 1000 }), { maxItems: 30 }),
+          Type.Array(Type.String({ minLength: 1, maxLength: 1000 }), { minItems: 1, maxItems: 30 }),
         ),
       }),
       async execute(_id, params, signal, _update, ctx) {
@@ -221,6 +244,15 @@ export function extensionFactory(
             ],
             isError: true,
           };
+        if (params.phase === "blocked") {
+          stopBlocked(params.summary, ctx);
+          const verdict = { decision: "blocked" as const, summary: params.summary, issues: [] };
+          return {
+            content: [{ type: "text", text: JSON.stringify(verdict) }],
+            details: verdict,
+            isError: true,
+          };
+        }
         if (params.phase === "completion" && auto.handlesCompletion())
           return {
             content: [
@@ -231,29 +263,52 @@ export function extensionFactory(
             ],
             isError: false,
           };
-        if (params.phase === "plan" && params.steps?.length && state)
+        if (params.phase === "plan" && params.steps !== undefined && !params.steps.length) {
+          // Do not erase an existing gate when rejecting an empty replacement plan.
+          state?.revokeApproval("plan");
+          const verdict = {
+            decision: "blocked" as const,
+            summary: "Plan checkpoint requires non-empty steps. No review round was charged.",
+            issues: ["An empty replacement plan cannot clear the pending checkpoint"],
+          };
+          return {
+            content: [{ type: "text", text: JSON.stringify(verdict) }],
+            details: verdict,
+            isError: true,
+          };
+        }
+        if (params.phase === "plan" && params.steps !== undefined && state)
           state.setPendingPlan(params.steps);
         const current = state;
         const requestGeneration = generation;
         const verdict = await review(params.phase, params.summary, ctx, signal);
-        if (
-          state &&
-          state === current &&
-          generation === requestGeneration &&
-          !signal?.aborted &&
-          verdict.decision !== "approve" &&
-          state.phaseReviews[params.phase] >= state.config.reviews.max
-        )
-          stopBlocked(verdict.summary, ctx);
+        if (state && state === current && generation === requestGeneration && state.terminalReason)
+          stopBlocked(state.terminalReason, ctx);
+        const result =
+          params.phase === "plan" && state === current
+            ? {
+                ...verdict,
+                plan: state?.planStatus(),
+                next:
+                  verdict.decision === "approve"
+                    ? "Copy the canonical approved steps exactly into todo; await successful registration before execution. Do not batch todo registration with execution."
+                    : "Review the pending canonical steps with phase=plan and address the findings, or stop with phase=blocked. Approval requires exact steps, including punctuation, whitespace and order.",
+              }
+            : verdict;
         return {
-          content: [{ type: "text", text: JSON.stringify(verdict) }],
-          details: verdict,
+          content: [{ type: "text", text: JSON.stringify(result) }],
+          details: result,
           isError: verdict.decision !== "approve",
         };
       },
     });
     pi.on("session_stop", async (event, ctx) => {
       if (ctx.agent.kind !== "main") return;
+      if (stopped || state?.reviewInProgress) return;
+      if (state?.terminalReason) {
+        stopBlocked(state.terminalReason, ctx);
+        return;
+      }
       const autoResult = await auto.onStop(event, ctx);
       if (autoResult.handled) return autoResult.result;
       if (event.signal.aborted || state?.completionApproved) return;
@@ -273,7 +328,7 @@ export function extensionFactory(
       state.stopContinuations++;
       if (state.pendingRecovery)
         return continueWith(
-          "OMP Architect: unresolved repeated failure. Run architect_checkpoint phase=recovery, or report the blocker honestly. Do not claim completion.",
+          "OMP Architect: unresolved repeated failure. Run architect_checkpoint phase=recovery, or call architect_checkpoint phase=blocked with the honest blocker to stop. Do not claim completion.",
         );
       const pendingPlan = state.gate("write", {});
       if (pendingPlan)
@@ -281,7 +336,7 @@ export function extensionFactory(
           `OMP Architect: ${pendingPlan} Resolve the pending checkpoint before completion. Do not claim completion.`,
         );
       return continueWith(
-        "OMP Architect: completion remains unverified. Run architect_checkpoint phase=completion with factual evidence, address any findings, or report the blocker honestly. Do not claim completion before approval.",
+        "OMP Architect: completion remains unverified. Run architect_checkpoint phase=completion with factual evidence, address any findings, or report the blocker honestly. Do not claim completion before approval. To stop with an honest blocker, call architect_checkpoint phase=blocked.",
       );
     });
     pi.registerCommand("architect", {
@@ -294,6 +349,8 @@ export function extensionFactory(
               reviews: `${state.reviewCount}/${3 * state.config.reviews.max}`,
               completionApproved: state.completionApproved,
               pendingRecovery: state.pendingRecovery,
+              plan: state.planStatus(),
+              stopped,
               blocked: state.blocked || null,
               mainModel: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null,
             }

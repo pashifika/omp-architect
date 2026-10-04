@@ -1427,3 +1427,181 @@ for (const mode of [
     }
   }, 30000);
 }
+
+test.each([
+  "blocked",
+  "plan",
+  "recovery",
+] as const)("Auto respects terminal architect %s before additional boundary work", async (phase) => {
+  let reviews = 0;
+  const f = await loaderFixture(
+    {},
+    {
+      maxReviews: 1,
+      reviewer: async () => {
+        reviews++;
+        return {
+          decision: "blocked",
+          summary: "Unresolved fixture blocker",
+          issues: ["Need operator input"],
+        };
+      },
+    },
+  );
+  try {
+    await f.start();
+    const tool = f.extension.tools.get("architect_checkpoint")!.definition;
+    const result = await tool.execute(
+      "terminal",
+      {
+        phase,
+        summary: "Operator decision required",
+        ...(phase === "plan" ? { steps: ["Inspect", "Implement", "Verify"] } : {}),
+      },
+      undefined,
+      undefined,
+      f.ctx,
+    );
+    expect(result.isError).toBe(true);
+    expect(await f.status()).toMatchObject({
+      status: "blocked",
+      architect: { completionApproved: false },
+    });
+    expect(await f.stop()).toBeUndefined();
+    expect(await f.stop()).toBeUndefined();
+    expect(f.counts()).toEqual({ reads: 1, decisions: 0, aborts: 1 });
+    expect(reviews).toBe(phase === "blocked" ? 0 : 1);
+    const messages = f.messages.length;
+    const gate = f.extension.handlers.get("tool_call")![0];
+    for (const event of [
+      { toolName: "auto_status", input: {} },
+      { toolName: "write", input: { path: "xd://auto_status", content: "{}" } },
+    ])
+      expect(
+        await gate({ type: "tool_call", toolCallId: crypto.randomUUID(), ...event }, f.ctx),
+      ).toBeUndefined();
+    expect(
+      await gate(
+        {
+          type: "tool_call",
+          toolCallId: "blocked-file",
+          toolName: "write",
+          input: { path: "proposal.md", content: "x" },
+        },
+        f.ctx,
+      ),
+    ).toMatchObject({ block: true });
+    expect(f.messages).toHaveLength(messages);
+    expect(f.counts()).toEqual({ reads: 1, decisions: 0, aborts: 1 });
+  } finally {
+    await f.close();
+  }
+});
+
+test("Auto cancelled final recovery attempt stops without CLI or decision retry", async () => {
+  const c = new AbortController();
+  const f = await loaderFixture(
+    {},
+    {
+      maxReviews: 1,
+      reviewer: async () => {
+        queueMicrotask(() => c.abort());
+        return new Promise(() => {});
+      },
+    },
+  );
+  try {
+    await f.start();
+    await f.extension.tools
+      .get("architect_checkpoint")!
+      .definition.execute(
+        "cancelled",
+        { phase: "recovery", summary: "Attempt recovery" },
+        c.signal,
+        undefined,
+        f.ctx,
+      );
+    expect(await f.status()).toMatchObject({ status: "blocked" });
+    expect(await f.stop()).toBeUndefined();
+    expect(f.counts()).toEqual({ reads: 1, decisions: 0, aborts: 1 });
+  } finally {
+    await f.close();
+  }
+});
+
+test("explicitly confirmed Auto restart can begin after a terminal architect stop", async () => {
+  const f = await loaderFixture();
+  try {
+    await f.start();
+    await f.extension.tools
+      .get("architect_checkpoint")!
+      .definition.execute(
+        "stop",
+        { phase: "blocked", summary: "Old run needs a decision" },
+        undefined,
+        undefined,
+        f.ctx,
+      );
+    await f.extension.commands.get("auto")!.handler("start fixture-change", f.ctx);
+    expect(f.bootstraps).toHaveLength(2);
+    await f.extension.handlers.get("before_agent_start")![0](
+      { type: "before_agent_start", prompt: f.bootstraps[1], systemPrompt: [] },
+      f.ctx,
+    );
+    const gate = await f.extension.handlers.get("tool_call")![0](
+      {
+        type: "tool_call",
+        toolCallId: "new-run-read",
+        toolName: "read",
+        input: { path: "context.md" },
+      },
+      f.ctx,
+    );
+    expect(gate).toBeUndefined();
+    expect(await f.status()).toMatchObject({ status: "running", architect: { blocked: null } });
+  } finally {
+    await f.close();
+  }
+});
+
+test("active Auto status calls keep their tool budget, and terminal diagnostics remain available", async () => {
+  const f = await loaderFixture({ maxToolCalls: 1 });
+  try {
+    await f.start();
+    const gate = f.extension.handlers.get("tool_call")![0];
+    expect(
+      await gate(
+        { type: "tool_call", toolCallId: "active-status", toolName: "auto_status", input: {} },
+        f.ctx,
+      ),
+    ).toBeUndefined();
+    expect(
+      await gate(
+        { type: "tool_call", toolCallId: "exhaust-budget", toolName: "auto_status", input: {} },
+        f.ctx,
+      ),
+    ).toMatchObject({ block: true });
+    expect(await f.status()).toMatchObject({ status: "budget_exhausted" });
+    expect(
+      await gate(
+        { type: "tool_call", toolCallId: "terminal-status", toolName: "auto_status", input: {} },
+        f.ctx,
+      ),
+    ).toBeUndefined();
+    expect(
+      await gate(
+        {
+          type: "tool_call",
+          toolCallId: "terminal-xd-status",
+          toolName: "write",
+          input: { path: "xd://auto_status", content: "{}" },
+        },
+        f.ctx,
+      ),
+    ).toBeUndefined();
+    expect(await f.stop()).toBeUndefined();
+    expect(f.counts()).toEqual({ reads: 1, decisions: 0, aborts: 1 });
+  } finally {
+    await f.close();
+  }
+});

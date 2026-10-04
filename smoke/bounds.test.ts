@@ -52,6 +52,7 @@ test("explicit checkpoints at max publish blocked status and abort without anoth
     ).resolves.toMatchObject({ isError: true });
     expect(fixture.requests).toHaveLength(1);
 
+    await fixture.input("New request");
     await fixture.before("New request");
     const continuation = await fixture.stop();
     expect(continuation?.continue).toBe(true);
@@ -613,6 +614,16 @@ test("xd slow explicit plan checkpoint approves beyond timeout and hook budgets 
   const file = path.join(fixture.cwd, "slow-result.txt");
   let checkpoint: Promise<unknown> | undefined;
   try {
+    // Gate denials are now evidence; stage them before review so it stays current.
+    await expect(
+      fixture.todo.execute("stage-slow-plan", { op: "init", items: steps }),
+    ).rejects.toThrow("Substantial plan");
+    await expect(
+      fixture.write.execute("blocked-before-slow-review", {
+        path: file,
+        content: "slow evidence\n",
+      }),
+    ).rejects.toThrow("Pending plan is not approved");
     jest.useFakeTimers();
     let settled = false;
     checkpoint = fixture.write.execute("slow-plan-review", {
@@ -634,14 +645,7 @@ test("xd slow explicit plan checkpoint approves beyond timeout and hook budgets 
     await started;
     expect(fixture.requests).toHaveLength(1);
     expect(JSON.parse(fixture.requests[0].evidence).pendingPlan).toEqual(steps);
-    await expect(
-      fixture.write.execute("blocked-during-slow-review", {
-        path: file,
-        content: "slow evidence\n",
-      }),
-    ).rejects.toThrow(
-      "Pending plan is not approved. Call architect_checkpoint phase=plan before execution.",
-    );
+
     jest.advanceTimersByTime(24_999);
     await Promise.resolve();
     expect(settled).toBe(false);
@@ -836,5 +840,360 @@ test("ordinary stop returns a continuation without invoking or waiting on the pr
     provider.resolve({ decision: "approve", summary: "Fixture cleanup", issues: [] });
     await stopping.catch(() => {});
     await fixture.close();
+  }
+});
+
+const canonicalSteps = [
+  "Inspect proposal context",
+  "Draft planning artifacts",
+  "Validate artifacts",
+];
+
+test("real host returns canonical plan identity, explains punctuation mismatch and restores approved todo", async () => {
+  const f = await xdCheckpointFixture();
+  try {
+    const result = await f.checkpoint.execute("approve-canonical", {
+      phase: "plan",
+      summary: "Planning only",
+      steps: canonicalSteps,
+    });
+    const content = result.content[0];
+    if (content.type !== "text") throw new Error("Missing plan result");
+    const approved = JSON.parse(content.text).plan.approved;
+    expect(approved.steps).toEqual(canonicalSteps);
+    expect(approved.id).toMatch(/^[a-f0-9]{64}$/);
+    await expect(
+      f.todo.execute("mismatch", {
+        op: "init",
+        items: [canonicalSteps[0] + ".", ...canonicalSteps.slice(1)],
+      }),
+    ).rejects.toThrow("Step 1 differs");
+    await expect(
+      f.write.execute("blocked-proposal", {
+        path: path.join(f.cwd, "proposal.md"),
+        content: "Draft",
+      }),
+    ).rejects.toThrow(approved.id);
+    const status = await f.status.execute("diagnose", {});
+    const statusContent = status.content[0];
+    if (statusContent.type !== "text") throw new Error("Missing status");
+    expect(JSON.parse(statusContent.text).architect.plan.approved).toEqual(approved);
+    await f.todo.execute("restore", { op: "init", items: approved.steps });
+    await f.write.execute("proposal", { path: path.join(f.cwd, "proposal.md"), content: "Draft" });
+    expect(f.phases().flatMap((p) => p.tasks.map((t) => t.content))).toEqual(canonicalSteps);
+    expect(f.requests).toHaveLength(1);
+  } finally {
+    await f.close();
+  }
+});
+
+test("real host rejects prose-only and empty replacement plans without charging or clearing a gate", async () => {
+  const f = await xdCheckpointFixture();
+  try {
+    expect(
+      await f.checkpoint.execute("prose-only", {
+        phase: "plan",
+        summary: "Inspect, implement, verify",
+      }),
+    ).toMatchObject({ isError: true, details: { decision: "blocked" } });
+    expect(f.requests).toHaveLength(0);
+    await expect(f.todo.execute("stage", { op: "init", items: canonicalSteps })).rejects.toThrow(
+      "Substantial plan",
+    );
+    expect(
+      await f.checkpoint.execute("empty", {
+        phase: "plan",
+        summary: "Empty replacement",
+        steps: [],
+      }),
+    ).toMatchObject({ isError: true });
+    await expect(
+      f.write.execute("must-stay-blocked", { path: path.join(f.cwd, "blocked"), content: "x" }),
+    ).rejects.toThrow("Pending plan");
+    expect(f.requests).toHaveLength(0);
+    expect(
+      await f.checkpoint.execute("review-staged", {
+        phase: "plan",
+        summary: "Review staged actual steps",
+      }),
+    ).toMatchObject({ isError: false });
+    const snapshot = JSON.parse(f.requests[0].evidence);
+    expect(snapshot.pendingPlan).toEqual(canonicalSteps);
+    expect(snapshot.pendingRecovery).toBe(false);
+    const denied = snapshot.recentToolEvidence.map((item: string) => JSON.parse(item));
+    expect(denied).toHaveLength(2);
+    expect(
+      denied.every(
+        (item: { kind: string; executed: boolean }) =>
+          item.kind === "gate_denial" && item.executed === false,
+      ),
+    ).toBe(true);
+  } finally {
+    await f.close();
+  }
+});
+
+for (const todoFirst of [true, false])
+  test(`host batch admission remains order-dependent; sequential canonical registration is required (${todoFirst})`, async () => {
+    const f = await xdCheckpointFixture();
+    try {
+      await f.checkpoint.execute("approve", {
+        phase: "plan",
+        summary: "Review",
+        steps: canonicalSteps,
+      });
+      const file = path.join(f.cwd, "batch.md");
+      const todo = () =>
+        f.todo.execute("changed-todo", {
+          op: "init",
+          items: [canonicalSteps[0] + ".", ...canonicalSteps.slice(1)],
+        });
+      const write = () => f.write.execute("batch-write", { path: file, content: "Fixture" });
+      const results = await Promise.allSettled(todoFirst ? [todo(), write()] : [write(), todo()]);
+      expect(results[todoFirst ? 0 : 1].status).toBe("rejected");
+      expect(results[todoFirst ? 1 : 0].status).toBe(todoFirst ? "rejected" : "fulfilled");
+      expect(await Bun.file(file).exists()).toBe(!todoFirst);
+      await f.todo.execute("restore-exact", { op: "init", items: canonicalSteps });
+      await f.write.execute("sequential-write", {
+        path: file,
+        content: "Sequential canonical fixture",
+      });
+      expect(await Bun.file(file).text()).toBe("Sequential canonical fixture");
+    } finally {
+      await f.close();
+    }
+  });
+
+test.each([
+  "plan",
+  "recovery",
+  "completion",
+] as const)("terminal %s stops once without futile continuations", async (phase) => {
+  const f = await xdCheckpointFixture({ min: 1, max: 2 }, async () => ({
+    decision: "blocked",
+    summary: "Unresolved fixture blocker",
+    issues: ["Need evidence"],
+  }));
+  try {
+    for (let i = 0; i < 2; i++)
+      await f.checkpoint.execute(`review-${i}`, {
+        phase,
+        summary: `Independent review ${i}`,
+        ...(phase === "plan" ? { steps: canonicalSteps } : {}),
+      });
+    expect(f.aborts()).toBe(1);
+    expect(f.notices()).toBe(1);
+    expect(await f.stop()).toBeUndefined();
+    expect(await f.stop()).toBeUndefined();
+    await expect(f.checkpoint.execute("retry", { phase, summary: "Futile retry" })).rejects.toThrow(
+      "stopped this request",
+    );
+    expect(f.requests).toHaveLength(2);
+    expect(f.aborts()).toBe(1);
+    expect(f.notices()).toBe(1);
+    expect((await f.status.execute("stopped-status", {})).isError).not.toBe(true);
+  } finally {
+    await f.close();
+  }
+});
+
+test.each([
+  "plan",
+  "recovery",
+  "completion",
+] as const)("cancelled final %s attempt is terminal without another provider call", async (phase) => {
+  let controller: AbortController;
+  const f = await xdCheckpointFixture({ min: 1, max: 2 }, async () => {
+    queueMicrotask(() => controller.abort(new Error("Fixture cancellation")));
+    return new Promise<Verdict>(() => {});
+  });
+  try {
+    for (let i = 0; i < 2; i++) {
+      controller = new AbortController();
+      expect(
+        await f.checkpoint.execute(
+          `cancel-${i}`,
+          {
+            phase,
+            summary: `Attempt ${i}`,
+            ...(phase === "plan" ? { steps: canonicalSteps } : {}),
+          },
+          controller.signal,
+        ),
+      ).toMatchObject({ isError: true });
+      expect(f.aborts()).toBe(i === 0 ? 0 : 1);
+    }
+    expect(await f.stop()).toBeUndefined();
+    expect(f.requests).toHaveLength(2);
+    expect(f.notices()).toBe(1);
+  } finally {
+    await f.close();
+  }
+});
+
+test("last-round approvals remain usable across all three phases", async () => {
+  const f = await xdCheckpointFixture({ min: 1, max: 1 });
+  try {
+    await f.checkpoint.execute("plan", {
+      phase: "plan",
+      summary: "Review exact plan",
+      steps: canonicalSteps,
+    });
+    await f.todo.execute("register", { op: "init", items: canonicalSteps });
+    await f.checkpoint.execute("recovery", {
+      phase: "recovery",
+      summary: "Review recovered approach",
+    });
+    await f.write.execute("execute", { path: path.join(f.cwd, "last-round"), content: "verified" });
+    await f.checkpoint.execute("completion", {
+      phase: "completion",
+      summary: "Review actual evidence",
+    });
+    expect(await f.stop()).toBeUndefined();
+    expect(f.requests).toHaveLength(3);
+    expect(f.aborts()).toBe(0);
+    expect(f.notices()).toBe(0);
+  } finally {
+    await f.close();
+  }
+});
+
+test("below-budget blocked recovery remains retriable", async () => {
+  const f = await xdCheckpointFixture({ min: 1, max: 2 }, async (request) =>
+    request.evidence.includes("Additional evidence")
+      ? { decision: "approve", summary: "Reviewed", issues: [] }
+      : { decision: "blocked", summary: "Need evidence", issues: ["Inspect"] },
+  );
+  try {
+    await f.checkpoint.execute("first", { phase: "recovery", summary: "Initial evidence" });
+    const next = await f.stop();
+    expect(next?.continue).toBe(true);
+    await f.before(next!.additionalContext!);
+    expect(
+      await f.checkpoint.execute("second", { phase: "recovery", summary: "Additional evidence" }),
+    ).toMatchObject({ isError: false });
+    expect(f.aborts()).toBe(0);
+    expect(f.requests).toHaveLength(2);
+  } finally {
+    await f.close();
+  }
+});
+
+test("new denial on final in-flight plan review is terminal stale evidence", async () => {
+  const deferred = Promise.withResolvers<Verdict>();
+  const started = Promise.withResolvers<void>();
+  const f = await xdCheckpointFixture({ min: 1, max: 1 }, async () => {
+    started.resolve();
+    return deferred.promise;
+  });
+  try {
+    const pending = f.checkpoint.execute("last-plan", {
+      phase: "plan",
+      summary: "Review",
+      steps: canonicalSteps,
+    });
+    await started.promise;
+    await expect(
+      f.write.execute("blocked-during-review", { path: path.join(f.cwd, "denied"), content: "x" }),
+    ).rejects.toThrow("Pending plan");
+    deferred.resolve({ decision: "approve", summary: "Stale approval", issues: [] });
+    expect(await pending).toMatchObject({
+      isError: true,
+      details: { summary: expect.stringContaining("stale") },
+    });
+    expect(await f.stop()).toBeUndefined();
+    expect(f.aborts()).toBe(1);
+    expect(f.requests).toHaveLength(1);
+  } finally {
+    deferred.resolve({ decision: "blocked", summary: "Cleanup", issues: [] });
+    await f.close();
+  }
+});
+
+test("structured blocked checkpoint ends an honest report without reviewing or claiming completion", async () => {
+  const f = await xdCheckpointFixture();
+  try {
+    await f.checkpoint.execute("prior-approval", {
+      phase: "completion",
+      summary: "Prior evidence",
+    });
+    expect(
+      await f.write.execute("honest-blocker", {
+        path: "xd://architect_checkpoint",
+        content: JSON.stringify({ phase: "blocked", summary: "Operator authorization is missing" }),
+      }),
+    ).toMatchObject({ isError: true });
+    expect(await f.stop()).toBeUndefined();
+    expect(await f.stop()).toBeUndefined();
+    expect(f.requests).toHaveLength(1);
+    expect(f.aborts()).toBe(1);
+    expect(f.notices()).toBe(1);
+    const status = await f.status.execute("status", {});
+    const content = status.content[0];
+    if (content.type !== "text") throw new Error("Missing status");
+    expect(JSON.parse(content.text).architect.completionApproved).toBe(false);
+  } finally {
+    await f.close();
+  }
+});
+
+test("final allowed review is not terminal while it is still in flight", async () => {
+  const deferred = Promise.withResolvers<Verdict>();
+  const started = Promise.withResolvers<void>();
+  const f = await xdCheckpointFixture({ min: 1, max: 1 }, async () => {
+    started.resolve();
+    return deferred.promise;
+  });
+  try {
+    const pending = f.checkpoint.execute("final-in-flight", {
+      phase: "completion",
+      summary: "Review current evidence",
+    });
+    await started.promise;
+    const status = await f.status.execute("status-during-review", {});
+    const content = status.content[0];
+    if (content.type !== "text") throw new Error("Missing status");
+    expect(JSON.parse(content.text).architect.terminalReason).toBeNull();
+    expect(await f.stop()).toBeUndefined();
+    expect(f.aborts()).toBe(0);
+    deferred.resolve({ decision: "approve", summary: "Current evidence approved", issues: [] });
+    expect(await pending).toMatchObject({ isError: false });
+    expect(await f.stop()).toBeUndefined();
+    expect(f.aborts()).toBe(0);
+  } finally {
+    deferred.resolve({ decision: "blocked", summary: "Cleanup", issues: [] });
+    await f.close();
+  }
+});
+
+test("stale ordinary continuation cannot restart a terminal request without genuine user input", async () => {
+  const f = await xdCheckpointFixture();
+  try {
+    const queued = await f.stop();
+    expect(queued?.continue).toBe(true);
+    await f.checkpoint.execute("stop-before-delivery", {
+      phase: "blocked",
+      summary: "Need user decision",
+    });
+    await f.before(queued!.additionalContext!);
+    await expect(
+      f.checkpoint.execute("stale-retry", { phase: "completion", summary: "Must not review" }),
+    ).rejects.toThrow("stopped this request");
+    expect(await f.stop()).toBeUndefined();
+    expect(f.requests).toHaveLength(0);
+    expect(f.notices()).toBe(1);
+    // Genuine input may deliberately reuse the old text and still starts a fresh request.
+    await f.input(queued!.additionalContext!);
+    await f.before(queued!.additionalContext!);
+    expect(
+      await f.checkpoint.execute("new-user-review", {
+        phase: "completion",
+        summary: "New request evidence",
+      }),
+    ).toMatchObject({ isError: false });
+    expect(f.requests).toHaveLength(1);
+    expect(await f.stop()).toBeUndefined();
+  } finally {
+    await f.close();
   }
 });
