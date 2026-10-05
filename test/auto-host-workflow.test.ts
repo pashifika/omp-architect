@@ -153,6 +153,70 @@ test("all_done and source done bits cannot invent independent verification", () 
   expect(projected.stages.find((stage) => stage.id === "ship")?.status).toBe("pending");
 });
 
+test("explicit independent-check frontiers preserve pending tasks and return to apply", () => {
+  const pending = snapshot();
+  const original = JSON.stringify(pending);
+  const host = new HostAutoWorkflow(change);
+  host.observe(pending, absent);
+  expect(host.beginVerification()).toMatchObject({ phase: "verify", readyForReview: false });
+  const frontier = host.statusView();
+  expect(host.beginVerification()).toEqual(frontier);
+  expect(host.observe(pending, absent)).toEqual(frontier);
+  const projection = host.effectiveWorkflow();
+  expect(projection).toMatchObject({ ready: ["verify"], next: "verify" });
+  if (projection.kind !== "present") throw new Error("Expected built-in projection");
+  expect(projection.stages.find((stage) => stage.id === "apply")?.status).toBe("pending");
+  expect(assessWorkflowScope(projection).ready).toBe(false);
+  expect(host.recordReview(approve, { approved: true }).phase).toBe("verify");
+  const proof = verifier(host);
+  expect(host.recordVerification(proof)).toBe(true);
+  expect(host.statusView()).toMatchObject({
+    phase: "apply",
+    verifiedStages: ["verify"],
+    readyForReview: false,
+  });
+  expect(host.verificationEvidence()[0]?.evidence).toBe(proof.evidence);
+  expect(host.observe(pending, absent).phase).toBe("apply");
+  expect(JSON.stringify(pending)).toBe(original);
+  expect(host.recordReview(approve, { approved: true }).phase).toBe("apply");
+
+  // Updating the task/code facts still requires the existing fresh-proof check.
+  expect(host.observe(snapshot(true), absent)).toMatchObject({
+    phase: "verify",
+    verifiedStages: [],
+  });
+  expect(host.recordVerification(proof)).toBe(false);
+  expect(host.recordVerification(verifier(host, "final-current-state"))).toBe(true);
+  expect(host.recordReview(approve, { approved: true }).phase).toBe("settled");
+});
+
+test("pending-task verification follows dependencies and changed facts revoke its frontier", () => {
+  const external = source();
+  external.stages.push({
+    id: "security",
+    kind: "standard",
+    skill: "rasen-cso",
+    requires: ["verify"],
+    status: "pending",
+  });
+  const host = new HostAutoWorkflow(change);
+  host.observe(snapshot(), external);
+  host.beginVerification();
+  expect(host.recordVerification(verifier(host, "too-early", { stages: ["security"] }))).toBe(
+    false,
+  );
+  expect(host.recordVerification(verifier(host, "first-check"))).toBe(true);
+  expect(host.statusView()).toMatchObject({ phase: "verify", stage: "security" });
+  const stale = verifier(host, "before-edit");
+  expect(host.observe(snapshot(false, "edited"), external)).toMatchObject({
+    phase: "apply",
+    verifiedStages: [],
+    readyForReview: false,
+  });
+  expect(host.recordVerification(stale)).toBe(false);
+  expect(host.beginVerification()).toMatchObject({ phase: "verify", stage: "verify" });
+});
+
 test("native verification receipts are successful, settled, independent and fact-bound", () => {
   for (const extra of [
     { role: "omp-worker" },

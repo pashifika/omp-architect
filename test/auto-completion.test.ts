@@ -58,7 +58,7 @@ async function fixture(verify = true) {
     },
     pi: { getAgentDir: () => path.join(cwd, "agent") },
     typebox: {
-      Type: { Object() {}, String() {}, Optional() {}, Literal() {} },
+      Type: { Object() {}, String() {}, Optional() {}, Literal() {}, Union() {} },
     },
   } as unknown as ExtensionAPI;
   const ctx = {

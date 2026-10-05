@@ -252,7 +252,10 @@ async function loaderFixture(
       ctx,
     );
   };
-  const step = async (summary = "Recorded pipeline stage frontier", transition?: "triage") => {
+  const step = async (
+    summary = "Recorded pipeline stage frontier",
+    transition?: "triage" | "verify",
+  ) => {
     const result = await extension.tools
       .get("auto_step")!
       .definition.execute(
@@ -1450,6 +1453,13 @@ test("Auto step Eval carriers require one reset-safe literal call and reject bat
   };
   const literal = `await tool.write(${JSON.stringify(input)})`;
   expect(autoStepCarrier({ language: "js", reset: true, code: literal })).toBe(true);
+  expect(
+    autoStepCarrier({
+      language: "js",
+      reset: true,
+      code: `await tool.write(${JSON.stringify({ ...input, content: JSON.stringify({ summary: "Current edits need tests", transition: "verify" }) })})`,
+    }),
+  ).toBe(true);
   expect(autoStepCarrier({ language: "js", reset: true, code: `console.log(${literal});` })).toBe(
     true,
   );
@@ -1473,6 +1483,106 @@ test("Auto step Eval carriers require one reset-safe literal call and reject bat
     },
   ])
     expect(autoStepCarrier(candidate)).toBe(false);
+});
+
+test("independent checks precede honest test-task completion and final current-state review", async () => {
+  const fixture = await loaderFixture(
+    {},
+    {
+      dependencies: {
+        workflow: async () => ({
+          kind: "absent",
+          change: "fixture-change",
+          reason: "No source workflow",
+          fingerprint: "absent",
+        }),
+      },
+    },
+  );
+  const native = Promise.withResolvers<string>();
+  try {
+    await fixture.start();
+    fixture.setProgress(1);
+    expect(await fixture.step()).toMatchObject({ allowedNextPhase: "apply" });
+    expect(fixture.bootstraps[0]).toContain("transition=verify");
+    const jobId = fixture.nativeManager.register(
+      "bash",
+      "settling implementation",
+      () => native.promise,
+      { ownerId: "main" },
+    );
+    expect(await fixture.step("Ready for independent checks", "verify")).toMatchObject({
+      isError: true,
+    });
+    expect((await fixture.status()).hostWorkflow.phase).toBe("apply");
+    native.resolve("Implementation settled");
+    await fixture.nativeManager.getJob(jobId)!.promise;
+    const admitted = await fixture.step(
+      "Current implementation needs focused independent tests",
+      "verify",
+    );
+    expect(admitted).toMatchObject({
+      isError: false,
+      hostWorkflow: { phase: "verify", readyForReview: false, verifiedStages: [] },
+      ready: ["verify"],
+    });
+    expect(await fixture.status()).toMatchObject({ progress: { complete: 1, remaining: 1 } });
+    expect((await fixture.step("Repeated check frontier", "verify")).hostWorkflow.revision).toBe(
+      admitted.hostWorkflow.revision,
+    );
+    const toolCallId = "pending-checkbox-check";
+    const input = {
+      agent: "omp-reviewer",
+      task: "Run the pending focused test",
+      solutionSpace: "Current implementation",
+    };
+    for (const handler of fixture.extension.handlers.get("tool_call") ?? [])
+      expect(
+        await handler({ type: "tool_call", toolName: "task", toolCallId, input }, fixture.ctx),
+      ).toBeUndefined();
+    fixture.registerNativeChild(toolCallId);
+    for (const handler of fixture.extension.handlers.get("tool_result") ?? [])
+      await handler(
+        {
+          type: "tool_result",
+          toolName: "task",
+          toolCallId,
+          input,
+          isError: false,
+          content: [{ type: "text", text: "Focused test passed" }],
+          details: {
+            results: [
+              {
+                id: toolCallId,
+                agent: "omp-reviewer",
+                exitCode: 0,
+                output:
+                  "Independent focused test passed; task remains pending until Main records the evidence",
+              },
+            ],
+          },
+        },
+        fixture.ctx,
+      );
+    expect(await fixture.step()).toMatchObject({
+      allowedNextPhase: "apply",
+      hostWorkflow: { verifiedStages: ["verify"], readyForReview: false },
+    });
+    expect((await fixture.checkpoint()).isError).toBe(true);
+    expect(await fixture.status()).toMatchObject({ progress: { complete: 1, remaining: 1 } });
+    fixture.complete();
+    await fixture.verify();
+    expect((await fixture.checkpoint()).isError).toBe(false);
+    expect((await fixture.step("Cannot bypass approved review", "verify")).isError).toBe(true);
+    await fixture.stop();
+    expect(await fixture.settled()).toMatchObject({
+      status: "completed",
+      completionVerified: true,
+    });
+  } finally {
+    native.resolve("Cleanup");
+    await fixture.close();
+  }
 });
 
 for (const phase of ["unadmitted", "apply", "verify", "review", "triage", "fix"] as const) {

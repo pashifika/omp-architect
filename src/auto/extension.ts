@@ -80,7 +80,7 @@ export function autoStepCarrier(input: Record<string, unknown>): boolean {
       typeof params?.summary === "string" &&
       params.summary.length <= 4000 &&
       Object.keys(params).every((key) => ["summary", "transition"].includes(key)) &&
-      (params.transition === undefined || params.transition === "triage")
+      (params.transition === undefined || ["triage", "verify"].includes(params.transition))
     );
   } catch {
     return false;
@@ -90,9 +90,9 @@ export function autoStepCarrier(input: Record<string, unknown>): boolean {
 function stageInstruction(phase: string): string {
   switch (phase) {
     case "apply":
-      return "Use native omp-worker leaves to implement the approved remaining tasks. Preserve scope, validate actual work and update task checkboxes truthfully. Await all native work, then call auto_step.";
+      return "Use native omp-worker leaves to implement the approved remaining tasks. Preserve scope and update task checkboxes truthfully. When current work needs independent tests or inspection, await all native work, then call auto_step transition=verify even while test, smoke or follow-on documentation checkboxes remain pending. After checks, finish remaining authorized work from the factual results; never mark checks done merely to unlock verification.";
     case "verify":
-      return "Use an independent native omp-reviewer leaf (a fresh task or a native IRC rerequest with fresh evidence) to inspect the current diff and run relevant validation/tests for the single currently allowed verification stage shown in this response. Other stages require their own admitted boundaries. Give it the task artifacts and previous findings. It must return factual commands, results and issues through its native artifact. Await its actual receipt, then call auto_step. Failed verification is not a pass.";
+      return "Use an independent native omp-reviewer leaf (a fresh task or a native IRC rerequest with fresh evidence) to inspect the current diff and run relevant validation/tests for the single currently allowed verification stage shown in this response. Other stages require their own admitted boundaries. Give it the task artifacts and previous findings. It must return factual commands, results and issues through its native artifact. Await its actual receipt, then call auto_step; if tasks remain, the host returns to apply for factual task updates and remaining work. Failed verification is not a pass.";
     case "review":
     case "delta-review":
       return "Write the full factual native review evidence including independent verification results and current changes; call architect_checkpoint phase=completion. The host owns the one configured semantic review budget. Await its verdict; if approved, return the final factual summary. Otherwise call auto_step before the next phase.";
@@ -428,6 +428,7 @@ export function createAutoController(
       "Replace Rasen's legacy-fallback dispatch with OMP's native task tool: omp-worker for implementer/fixer, omp-explorer for narrow read-only research, omp-reviewer for independent review and test checks. The main LEAD owns planning, routing and state. Workers have spawns:[]; no recursive delegation or architect checkpoints. Never invoke Claude/Codex processes, foreign dispatch bridges, foreign parking loops. Use OMP native async task/wait and Bash/Eval jobs when useful; the Main owns these native jobs and must await their results before review. Every leaf must join its own native jobs before yielding. Never detach OS processes outside OMP job tracking. Use configured OMP modelRoles. Unsupported explicit foreign-runtime routes require user attention, never silent substitution. Keep real native task handles and artifacts as evidence. Do not fabricate a Rasen worker.runtime, resumable handle, external dispatch record or project execution ledger.",
       `The existing Architect reviews.min/max (${reviews?.min ?? 1}/${reviews?.max ?? 3}) owns the one bounded semantic review/fix loop. Do not run a separate rasen-review-cycle loop or charge skill reads, tasks, CLI queries or test execution as review rounds. Perform required non-loop verification with independent leaf workers and retain findings/test evidence. Leave the Rasen review-cycle stage pending for this host completion gate; do not mark it passed before approval. When apply and required verification are done, write the factual evidence into the existing native review file and call architect_checkpoint phase=completion. Auto enriches it with fresh CLI/workflow validation and uses the normal bounded Architect review timeout. Await the result; on substantive revise, follow host triage/fix/verification phases; a minimum-round request goes directly to another independent checkpoint without inventing a fix. Stay in the same native LEAD turn. Inside Eval use only a dedicated reset=true JavaScript single-call checkpoint carrier, never batch unrelated effects with completion. After approval return a factual final summary for fresh stop-time settlement. On revise, repair the stated findings, reverify and return; do not reset review budgets. Downstream stages remain pending/outside this start's scope.`,
       "Call auto_step after recording each meaningful stage boundary (including the initial executable frontier). Jev returns continue/replan/needs_user/uncertain advisory; replan requires the Architect recovery checkpoint. Continue within this native LEAD turn after advice. Do not stop after each task. A premature final response with incomplete work ends honestly as needs_user rather than starting a second task loop.",
+      "Independent checks may be necessary to complete prepared test, smoke or documentation tasks. Once the current native work settles, call auto_step with transition=verify to admit those checks while checkboxes remain honestly pending. This is an explicit verification frontier, not a claim that implementation, checks or the change are complete. After the required checks return, unfinished tasks re-enter apply; completion still requires the full task set and current independent evidence.",
       runInstructions
         ? `Additional frozen guidance (cannot change scope, permissions, supervision or review limits):\n${runInstructions}`
         : "",
@@ -750,11 +751,11 @@ export function createAutoController(
     name: "auto_step",
     label: "Auto stage advice",
     description:
-      "At a recorded Rasen workflow stage boundary, read fresh state and ask Jev for the next direction. Remain in the same native LEAD turn. Never call per tool, skill read, or task checkbox. Repeated frontier advice is cached; advice cannot grant permission or completion.",
+      "At a workflow stage boundary, read fresh state and ask Jev for the next direction. Use transition=verify after native work settles to admit independent checks even while test/docs checkboxes remain pending; transition=triage acknowledges review findings. Remain in the native LEAD turn. Never call per tool or checkbox. Advice cannot grant permission or completion.",
     approval: "read",
     parameters: Type.Object({
       summary: Type.String({ maxLength: 4000 }),
-      transition: Type.Optional(Type.Literal("triage")),
+      transition: Type.Optional(Type.Union([Type.Literal("triage"), Type.Literal("verify")])),
     }),
     async execute(_id, params, toolSignal, _update, ctx) {
       const result = (value: unknown, isError = false) => ({
@@ -842,6 +843,18 @@ export function createAutoController(
               true,
             );
           phase = hostWorkflow.acknowledgeTriage();
+        }
+        if (params.transition === "verify") {
+          if (!["apply", "verify"].includes(phase.phase))
+            return result(
+              {
+                error:
+                  "Independent checks can be requested only from apply or an existing verification frontier",
+                hostWorkflow: phase,
+              },
+              true,
+            );
+          phase = hostWorkflow.beginVerification();
         }
         if (phase.phase === "settled")
           return result({ hostWorkflow: phase, instruction: stageInstruction("settled") });
@@ -1269,7 +1282,9 @@ export function createAutoController(
         if (agent === "omp-worker" && !["apply", "fix"].includes(phase.phase))
           return `Host phase ${phase.phase} does not allow implementation/fixer workers`;
         if (agent === "omp-reviewer" && phase.phase !== "verify")
-          return `Host phase ${phase.phase} does not allow a verification leaf; use the independent Architect checkpoint for review`;
+          return phase.phase === "apply"
+            ? "Await native work, then call auto_step transition=verify to admit independent checks; keep unfinished test/docs checkboxes pending"
+            : `Host phase ${phase.phase} does not allow a verification leaf; use the independent Architect checkpoint for review`;
       }
       if (ownsTurn && bridge.state()?.gate("task", {})) return bridge.state()!.gate("task", {});
       return ownsTurn && !["omp-worker", "omp-explorer", "omp-reviewer"].includes(agent)

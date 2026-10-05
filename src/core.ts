@@ -178,7 +178,7 @@ function boundedEvidence(
   output: string,
   isError: boolean,
   limit: number,
-  denied = false,
+  kind?: "gate_denial" | "diagnostic",
   hostMetadata?: unknown,
 ): string {
   const record: {
@@ -196,7 +196,8 @@ function boundedEvidence(
     input: {},
     output: "",
     isError,
-    ...(denied ? { kind: "gate_denial", executed: false } : {}),
+    ...(kind ? { kind } : {}),
+    ...(kind === "gate_denial" ? { executed: false } : {}),
   };
   // Reserve the minimum explicit-loss output before assigning structured field budgets.
   const outputReserve = jsonSize(omitted, true) - jsonSize("", true);
@@ -295,7 +296,7 @@ export class Orchestrator {
     if (tool === "architect_checkpoint" || this.#seen.has(id)) return false;
     this.#seen.add(id);
     this.invalidate();
-    this.recordEvidence(id, tool, input, output, isError, false, hostMetadata);
+    this.recordEvidence(id, tool, input, output, isError, undefined, hostMetadata);
     if (!isError) {
       this.#failures.delete(tool);
       return false;
@@ -307,12 +308,27 @@ export class Orchestrator {
     if (count >= this.config.repeatedErrorThreshold) this.pendingRecovery = true;
     return this.pendingRecovery;
   }
+  /** Status reads are context, not execution success, failure streaks, or new approval. */
+  diagnose(
+    id: string,
+    tool: string,
+    input: Record<string, unknown>,
+    output: string,
+    isError: boolean,
+    hostMetadata?: unknown,
+  ): void {
+    if (this.#seen.has(id)) return;
+    this.#seen.add(id);
+    // Observing diagnostics alone must not revoke completion or mutate recovery.
+    // The Auto controller separately invalidates materially changed workflow facts.
+    this.recordEvidence(id, tool, input, output, isError, "diagnostic", hostMetadata);
+  }
   /** Admission denials are evidence, not executed tool errors or recovery streaks. */
   deny(id: string, tool: string, input: Record<string, unknown>, reason: string): void {
     if (this.#seen.has(id)) return;
     this.#seen.add(id);
     this.invalidate();
-    this.recordEvidence(id, tool, input, reason, true, true);
+    this.recordEvidence(id, tool, input, reason, true, "gate_denial");
   }
   private recordEvidence(
     id: string,
@@ -320,7 +336,7 @@ export class Orchestrator {
     input: Record<string, unknown>,
     output: string,
     isError: boolean,
-    denied = false,
+    kind?: "gate_denial" | "diagnostic",
     hostMetadata?: unknown,
   ): void {
     // One record cannot consume the ring or the space reserved for checkpoint context.
@@ -331,7 +347,7 @@ export class Orchestrator {
       output,
       isError,
       Math.floor(this.config.maxEvidenceChars / 3),
-      denied,
+      kind,
       hostMetadata,
     );
     this.evidence.push(entry);

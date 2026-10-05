@@ -8,6 +8,30 @@ context and public Rasen pipeline observations; it does not load the generated
 it uses session-local apply/verification/review phases without creating external
 pipeline state. See [setup and limits](rasen-auto.md) for the current contract.
 
+## Pending-task verification frontier (2026-10-05)
+
+The LEAD's explicit `auto_step transition=verify` now admits independent checks
+after native settlement while prepared test/docs tasks remain honestly pending.
+Successful factual receipts return incomplete work to `apply`; final review still
+requires complete tasks and current independent proof. Changed task/code/source
+facts invalidate old evidence as before. No task-text classification, external
+workflow writes, new review budget, or native lifecycle ownership was added.
+
+Recovery now receives native pre-execution spawn refusals as non-executed gate
+evidence, plus native and canonical XD status reads as diagnostics. These events
+do not fabricate task success or advance execution-failure streaks; duplicate
+status results retain only one host-call record.
+
+On locked **OMP 18.6.0**, Bun **1.3.14**, Node **24.19.0**, and the existing pinned
+Rasen development build, formatting, TypeScript, **431 unit/installer tests / 2,948
+assertions**, **199 smoke tests / 1,966 assertions**, **46-entry** packed loading,
+and workflow/ruleset checks passed. Independent review found no blocker and reran
+**16 focused tests / 155 assertions** successfully. The real native reviewer test
+proves admission and factual return with pending checkboxes; the complete
+apply/check/task-update/final-verification/review sequence is covered through the
+native extension loader. Model replies remain deterministic fixtures; the user's
+live provider run and macOS/Windows execution were not replayed locally.
+
 ## Native lifecycle revision (2026-10-05)
 
 OMP retains execution, task/Bash/Eval jobs, messages, IRC, wake/revival, rereview,

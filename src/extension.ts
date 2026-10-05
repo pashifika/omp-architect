@@ -299,15 +299,29 @@ export function extensionFactory(
     });
     pi.on("before_subagent_spawn", (event, ctx) => {
       if (ctx.agent.kind !== "main" || !state) return;
+      const deny = (reason: string) => {
+        // This host event has no parent tool-call ID. Keep its native identity
+        // as context; do not guess a task result or count another execution failure.
+        state!.deny(
+          `spawn:${crypto.randomUUID()}`,
+          "before_subagent_spawn",
+          {
+            agent: event.agent,
+            invocationKind: event.invocationKind,
+            ...(event.spawnKey !== undefined ? { spawnKey: event.spawnKey } : {}),
+          },
+          reason,
+        );
+        return { block: true as const, reason };
+      };
       const autoGate = auto.spawnGate(event.agent, event.invocationKind);
-      if (autoGate) return { block: true, reason: autoGate };
+      if (autoGate) return deny(autoGate);
       const role = routeAgent(event.agent, state.config);
       if (!role) return;
       if (!ctx.models.resolve(role))
-        return {
-          block: true,
-          reason: `Configure authenticated modelRoles.${role.slice(1)} before spawning ${event.agent}`,
-        };
+        return deny(
+          `Configure authenticated modelRoles.${role.slice(1)} before spawning ${event.agent}`,
+        );
       return { model: role, note: `OMP Architect: ${event.agent} uses ${role}` };
     });
     pi.on("tool_call", (event, ctx) => {
@@ -394,16 +408,23 @@ export function extensionFactory(
       }
       if (toolName === "eval" && auto.isRunning() && !event.isError && autoStepCarrier(event.input))
         return;
-      if (
-        toolName === "auto_status" ||
-        toolName === "architect_checkpoint" ||
-        (toolName === "auto_step" && !event.isError)
-      )
+      if (toolName === "architect_checkpoint" || (toolName === "auto_step" && !event.isError))
         return;
       const text = event.content
         .filter((c) => c.type === "text")
         .map((c) => c.text)
         .join("\n");
+      if (toolName === "auto_status") {
+        state.diagnose(
+          event.toolCallId,
+          toolName,
+          event.input,
+          text,
+          event.isError,
+          captureMetadata(event.details),
+        );
+        return;
+      }
       // Native task envelopes may omit isError even when a child failed. Keep
       // the ordinary repeated-failure recovery gate effective for Auto leaves.
       const results =

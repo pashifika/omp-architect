@@ -161,6 +161,17 @@ fixer receipt leads to fresh independent verification and `delta-review`. A clea
 minimum-round request goes directly to another independent delta checkpoint.
 Only the existing Architect review settings count and cap semantic rounds.
 
+The LEAD can explicitly request `auto_step` with `transition: "verify"` from
+`apply` once current native work has settled. Independent tests or smoke checks
+often must run before their prepared-task checkboxes can truthfully be completed.
+This opens a verification frontier without marking implementation or any task
+complete. The response exposes the current allowed independent check; its result
+uses the same native evidence contract below. Once checks settle, unfinished
+tasks return to `apply` for factual updates and remaining authorized work. Changed
+code/task/source facts still invalidate stale receipts. Final host review requires
+all prepared tasks complete and fresh independent evidence; this transition
+cannot authorize downstream work or bypass recovery, approvals or review.
+
 Each verification receipt is bound to its review request, workflow revision, required
 check, and exact code/task/source fingerprints, with independently observed native
 producer evidence. A child agent ID is a producer identity, not a review-request

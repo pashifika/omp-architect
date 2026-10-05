@@ -60,12 +60,14 @@ async function nativeFixture(
     mainMode?: "pause" | "wait" | "stream";
     parked?: boolean;
     verification?: boolean;
+    pendingVerification?: boolean;
     activeSteering?: boolean;
   } = {},
 ) {
   const detached = options.detached ?? false;
   const mainMode = options.mainMode ?? "pause";
   const verification = options.verification ?? false;
+  const pendingVerification = options.pendingVerification ?? false;
   const activeSteering = options.activeSteering ?? false;
   const agent = verification ? "omp-reviewer" : "omp-worker";
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-auto-native-"));
@@ -178,7 +180,12 @@ async function nativeFixture(
       });
       const calls =
         main && request === 1
-          ? [call("auto_step", { summary: "Admit the extension-owned implementation boundary" })]
+          ? [
+              call("auto_step", {
+                summary: "Admit the extension-owned implementation boundary",
+                ...(pendingVerification ? { transition: "verify" } : {}),
+              }),
+            ]
           : main && request === 2
             ? [
                 call("task", {
@@ -342,14 +349,14 @@ async function nativeFixture(
     contextFiles: [],
     fingerprint: "fixture-ready",
   };
-  if (verification) {
+  if (verification && !pendingVerification) {
     snapshot.state = "all_done";
     snapshot.progress = { total: 1, complete: 1, remaining: 0 };
     snapshot.tasks[0]!.done = true;
   }
   const verificationWorkflow = fallbackWorkflow(snapshot);
   verificationWorkflow.fingerprint = "two-sequential-checks";
-  if (!activeSteering)
+  if (!activeSteering && !pendingVerification)
     verificationWorkflow.stages.push({
       id: "security",
       kind: "standard",
@@ -360,7 +367,7 @@ async function nativeFixture(
       requires: ["verify"],
       status: "pending",
     });
-  if (!activeSteering) verificationWorkflow.remaining.push("security");
+  if (!activeSteering && !pendingVerification) verificationWorkflow.remaining.push("security");
   const sessionManager = SessionManager.inMemory(cwd);
   sessionManager.adoptArtifactManager(new ArtifactManager(path.join(cwd, ".test-artifacts")));
   const created = await createAgentSession({
@@ -520,6 +527,32 @@ async function nativeFixture(
     },
   };
 }
+
+test("actual native reviewer runs before pending verification checkboxes are marked complete", async () => {
+  const fixture = await nativeFixture("success", { verification: true, pendingVerification: true });
+  try {
+    await fixture.start();
+    expect(fixture.errors).toEqual([]);
+    expect(fixture.lifecycles.some((event) => event.status === "started")).toBe(true);
+    expect(fixture.taskResults[0]).toMatchObject({
+      isError: false,
+      details: {
+        results: [expect.objectContaining({ exitCode: 0, aborted: false, modelRole: "architect" })],
+      },
+    });
+    expect(await pausedStatus(fixture)).toMatchObject({
+      status: "paused",
+      completionVerified: false,
+      progress: { complete: 0, remaining: 1 },
+      hostWorkflow: { phase: "apply", verifiedStages: ["verify"], readyForReview: false },
+    });
+    expect(fixture.counts()).toMatchObject({ childRequests: 1, childAborted: false, reviews: 0 });
+    for (const [name, execute] of fixture.nativeExecutors)
+      expect(fixture.session.getToolByName(name)?.execute).toBe(execute);
+  } finally {
+    await fixture.close();
+  }
+}, 30000);
 
 for (const mode of ["success", "prompt", "deny", "child-abort", "recursion"] as const) {
   test(`Auto supervises actual native leaf ${mode} with an in-memory child journal`, async () => {

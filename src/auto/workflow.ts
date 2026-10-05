@@ -610,7 +610,7 @@ export interface HostWorkflowState {
 
 const phaseInstructions: Record<HostAutoPhase, string> = {
   apply:
-    "Apply the remaining prepared-change tasks with native omp-worker leaves, then request a fresh auto_step observation",
+    "Apply remaining prepared-change tasks with native omp-worker leaves; when current work is ready for independent checks, await native settlement and call auto_step transition=verify without prematurely completing checkboxes",
   verify:
     "Dispatch an independent native omp-reviewer for the current ready verification stage, await its factual result, then call auto_step",
   review:
@@ -701,6 +701,9 @@ export class HostAutoWorkflow {
   private workflowIdentity = "";
   private reason: string | null = null;
   private verification = new Map<string, HostVerificationEvidence>();
+  // A LEAD-declared check boundary admits verification, never completion. Tests
+  // and follow-on documentation may themselves be unfinished prepared tasks.
+  private verificationBoundary = false;
   private consumedEvidence = new Set<string>();
   private revision = 0;
   private findings: string[] = [];
@@ -807,8 +810,22 @@ export class HostAutoWorkflow {
             ? "delta-review"
             : "review"
           : "verify"
-        : "apply";
+        : this.verificationBoundary
+          ? "verify"
+          : "apply";
     this.reason = null;
+    return this.statusView();
+  }
+
+  /** Called only at a freshly observed, settled native auto_step boundary. */
+  beginVerification(): HostWorkflowState {
+    if (this.phase === "apply" && this.snapshot && this.source) {
+      // A later explicit check request is distinct even when no files changed.
+      // Repeated auto_step observations within this frontier remain idempotent.
+      this.invalidateVerification();
+      this.verificationBoundary = true;
+      this.phase = "verify";
+    }
     return this.statusView();
   }
 
@@ -818,7 +835,7 @@ export class HostAutoWorkflow {
       this.phase !== "verify" ||
       !this.snapshot ||
       !this.source ||
-      !tasksComplete(this.snapshot) ||
+      (!tasksComplete(this.snapshot) && !this.verificationBoundary) ||
       evidence.role !== "omp-reviewer" ||
       !this.validReceipt(evidence) ||
       evidence.snapshotFingerprint !== this.snapshot.fingerprint ||
@@ -839,7 +856,14 @@ export class HostAutoWorkflow {
     this.consumedEvidence.add(this.evidenceKey(evidence));
     const admitted = { ...structuredClone(evidence), stages: [...stages] };
     for (const stage of stages) this.verification.set(stage, admitted);
-    if (this.verified()) this.phase = this.needsDelta ? "delta-review" : "review";
+    if (this.requiredVerification().every((stage) => this.verification.has(stage))) {
+      this.verificationBoundary = false;
+      this.phase = tasksComplete(this.snapshot)
+        ? this.needsDelta
+          ? "delta-review"
+          : "review"
+        : "apply";
+    }
     return true;
   }
 
@@ -856,7 +880,8 @@ export class HostAutoWorkflow {
   invalidateVerification(): void {
     this.revision++;
     this.verification.clear();
-    if (["review", "delta-review", "settled"].includes(this.phase))
+    this.verificationBoundary = false;
+    if (["verify", "review", "delta-review", "settled"].includes(this.phase))
       this.phase = this.snapshot && tasksComplete(this.snapshot) ? "verify" : "apply";
   }
 
@@ -964,6 +989,9 @@ export class HostAutoWorkflow {
           stage.requires.every((id) => projected.completed.includes(id)),
       )
       .map((stage) => stage.id);
+    // Explicit verification can precede completion of test/docs checkboxes.
+    // Expose its executable frontier without marking apply or any task done.
+    if (this.phase === "verify") projected.ready = this.readyVerificationStages();
     projected.next = projected.ready[0] ?? null;
     // Scope readiness must remain false if the host failed closed, even when
     // external completion bits happen to look complete.
@@ -1076,7 +1104,12 @@ export class HostAutoWorkflow {
   }
 
   private readyVerificationStages(): string[] {
-    if (!this.definition || !this.snapshot || !tasksComplete(this.snapshot)) return [];
+    if (
+      !this.definition ||
+      !this.snapshot ||
+      (!tasksComplete(this.snapshot) && !this.verificationBoundary)
+    )
+      return [];
     const required = this.requiredVerification();
     const byId = new Map(this.definition.stages.map((stage) => [stage.id, stage]));
     const memo = new Map<string, boolean>();
