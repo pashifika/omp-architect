@@ -1,6 +1,6 @@
 # Rasen Auto setup and limits
 
-`/auto start <change>` runs the extension-owned Auto flow for a **prepared, existing local Rasen change**, scoped to remaining apply, verification, and review. The main OMP session is the LEAD and uses native one-shot leaf workers. Jev actively advises next-step selection at actual workflow stage boundaries; code supervises ownership, permissions, time limits, and the final completion gate. Existing Architect behavior remains the default when Auto is off.
+`/auto start <change>` runs the extension-owned Auto flow for a **prepared, existing local Rasen change**, scoped to remaining apply, verification, and review. The main OMP session is the LEAD and uses native leaf workers, including native messages and rereview requests. Jev actively advises next-step selection at actual workflow stage boundaries; Auto supervises semantic dispatch, permissions, time limits, and the final completion gate while OMP retains native execution and delivery. Existing Architect behavior remains the default when Auto is off.
 
 The supported Rasen source is **dev/0.1.8 at `f0ae20d19a30c265ad3f3ffaaa5bb3cd148d12dd`**. Build and locally install that source, then initialize OMP integration with `rasen init --tools omp`. The generated `rasen-apply-change` skill and bounded change artifacts provide apply context. Auto orchestration is implemented by this extension: it does not read or load `.omp/skills/rasen-auto/SKILL.md`, and it does not require a `full` profile. Existing generated Auto skills can remain in the project; they do not drive this command.
 
@@ -37,7 +37,7 @@ remains bounded to 64 KiB, and the complete native delivery payload is bounded t
 
 The extension admits idle and queued startup through the same ownership check;
 stop, new input, session changes, or changed delivery content cannot revive a run.
-Canceled internal payloads are removed from later user context. Completion review
+Revoked Auto control payloads are removed from later user context; native child messages and results are preserved unchanged. Completion review
 and fixes normally stay in the same LEAD turn. Bounded reminders to submit a
 missing completion checkpoint retain native hidden delivery and the same budgets;
 individual tasks do not create stop-hook turns.
@@ -53,7 +53,7 @@ source guidance is never reconstructed from display rows.
 2. Both the global and project `auto.json` files are **optional**. Set common defaults in the active OMP agent directory's `auto.json` (normally `~/.omp/agent/auto.json`), then override individual settings in `<project>/.omp/auto.json` if needed. With neither file, Auto uses its bounded builtins and `rasen` on PATH. See [configuration inheritance](#configuration-inheritance) below; restart OMP after editing. A missing file or `enabled: true` never starts a run automatically
 3. Keep your native OMP async settings: Auto supports native task/wait and Bash/Eval jobs without disabling async or changing global configuration. [examples/auto-config.yml](../examples/auto-config.yml) explains the settings policy. The regular `modelRoles` and Architect `reviews.min/max` settings in the [Architect guide](architect.md) remain authoritative
 4. Authenticate the `typesafe` provider through OMP's `/login`, or provide `TYPESAFE_API_KEY` in the OMP process environment through your normal secure setup. Auto resolves credentials through the current OMP session's `authStorage.keys.get("typesafe")` on each Jev invocation, using OMP's standard precedence; a key saved by `/login` takes precedence over the environment variable. You do not need to configure both. Credential lookup shares the decision's timeout and cancellation boundary. Never put keys in `auto.json`, this repository, task artifacts, or tool arguments. No external private connector key is imported. `jev-latest` is the fixed TypeSafe routing model; OMP generative models/efforts still use native roles
-5. Run `/auto start my-change` in interactive OMP and confirm the scoped run and evidence sharing. `/auto status` and `auto_status` independently re-read bounded, fresh Rasen CLI state and show progress, supervision, and review budgets, including after a run stops. `/auto stop` cancels; a fresh user start is required to reset budgets
+5. Run `/auto start my-change` in interactive OMP and confirm the scoped run and evidence sharing. `/auto status` and `auto_status` independently re-read bounded, fresh Rasen CLI state and show progress, supervision, and review budgets, including after a run stops. `/auto stop` revokes new Auto work and drains already-admitted native work; after verified drain, a fresh user start is required to reset budgets
 
 ## Configuration inheritance
 
@@ -123,7 +123,7 @@ The named change supplies `{var}` and the pack's `variable:` placeholder. Packs 
 
 Tab completes Auto subcommands, actual local Rasen change directories, `--brief`, existing pack names and unused blocks/aliases. Explicit Tab selects; Enter submits only what was typed, including when a suggestions popup is stale. Completion does no CLI calls or network access. After prose begins, Auto contributes no further suggestions.
 
-The rendered brief and extra instructions are shown at confirmation and frozen for that run. Later template edits cannot change a running request; use `/auto stop` and start again to pick them up. The complete guidance is retained in the LEAD turn, any bounded continuation, and Architect request evidence. Inputs exceeding the current Architect request-evidence budget are rejected before starting, rather than silently truncated. Shorten the guidance or deliberately increase `architect.json`'s `maxEvidenceChars` and restart. The reader additionally bounds source packs to 64 KiB/128 entries and rendered text to 12,000 characters, rejecting unsafe pack/file links, invalid UTF-8 and unknown blocks.
+The rendered brief and extra instructions are shown at confirmation and frozen for that run. Later template edits cannot change a running request; use `/auto stop`, wait for native drain, and start again to pick them up. The complete guidance is retained in the LEAD turn, any bounded continuation, and Architect request evidence. Inputs exceeding the current Architect request-evidence budget are rejected before starting, rather than silently truncated. Shorten the guidance or deliberately increase `architect.json`'s `maxEvidenceChars` and restart. The reader additionally bounds source packs to 64 KiB/128 entries and rendered text to 12,000 characters, rejecting unsafe pack/file links, invalid UTF-8 and unknown blocks.
 
 Guidance cannot override budgets, normal tool approvals, native leaf constraints, or grant permission to publish, merge, deploy, or expand scope. Existing brief blocks requesting delegation are adapted to native OMP leaf roles. Permission to run Auto is scoped to applying, verifying, and reviewing the named prepared change.
 
@@ -149,9 +149,9 @@ The extension owns Auto phase state and admission gates. The main session reason
 - `omp-explorer` / `@research`: narrow read-only repository research
 - `omp-reviewer` / `@architect`: independent scoped diff review and verification, without implementation edits
 
-Each worker is a one-shot leaf with `spawns: []`; it may not redelegate or call Architect checkpoints. The no-tool Architect checkpoint reviewer remains the independent completion gate. Native worker findings and test results are evidence for that gate, not a second semantic completion-review loop.
+Each worker is a leaf with `spawns: []`; it may not redelegate or call Architect checkpoints. Native messages, IRC, and `agent://` wake/rerequest routes remain available, including a fresh review request to the same child. The no-tool Architect checkpoint reviewer remains the independent completion gate. Native worker findings and test results are evidence for that gate, not a second semantic completion-review loop.
 
-Foreign Claude/Codex processes, foreign dispatch bridges, recursive delegation, and detached OS processes outside native OMP job tracking are not supported during Auto. Native async task/wait and Bash/Eval jobs remain available; each leaf must join its own jobs before yielding. Unsupported explicit foreign-runtime routing requires user attention. Record only actual native task handles and artifacts; do not invent Claude/Codex runtime identifiers or resumable worker handles. Ordinary non-Auto routing is unchanged.
+Foreign Claude/Codex processes, foreign dispatch bridges, recursive delegation, and detached OS processes outside native OMP job tracking are not supported during Auto. Native async task/wait and Bash/Eval jobs remain available; each leaf must join its own jobs before yielding. Unsupported explicit foreign-runtime routing requires user attention. Record only actual native handles, messages, receipts, and artifacts; do not invent Claude/Codex runtime identifiers or producer evidence. Ordinary non-Auto routing is unchanged.
 
 At the initial executable frontier and after recording each meaningful workflow stage boundary, the LEAD calls the synchronous `auto_step` tool. It refreshes bounded Rasen state before requesting Jev's existing `continue`, `replan`, `needs_user`, or `uncertain` decision, with the bounded Architect fallback described below. A semantic boundary includes the extension-owned phase, any recorded pipeline, stage frontier/status, findings, and review rounds. Identical semantic boundaries reuse the cached decision; task-checkbox ticks, assistant summaries, and timestamps do not create new decisions. Jev remains active in next-step selection; it is neither a workflow driver nor a callback on every tool, skill read, or task-checkbox update. The LEAD continues the extension-owned flow within the same native turn after receiving advice.
 
@@ -161,19 +161,29 @@ fixer receipt leads to fresh independent verification and `delta-review`. A clea
 minimum-round request goes directly to another independent delta checkpoint.
 Only the existing Architect review settings count and cap semantic rounds.
 
-Each verification receipt is bound to its admitted stage and exact code/task/source
-fingerprints. Parallel receipts for one check cannot satisfy a later dependent check.
+Each verification receipt is bound to its review request, workflow revision, required
+check, and exact code/task/source fingerprints, with independently observed native
+producer evidence. A child agent ID is a producer identity, not a review-request
+identity: the same native child can answer a later rereview request, but its old
+receipt cannot satisfy the new request or revision. Model-echoed identifiers do
+not establish provenance. Parallel receipts for one check cannot satisfy a later
+dependent check.
 A recorded DAG must have one apply stage, followed by supported verification stages;
 unsupported multi-apply or pre-apply verification topologies stop for attention.
 Main mutation tools require an admitted apply/fix phase. Other phases allow read-only
-Main work, native leaf tasks and the narrow review-file/checkpoint handoff. Auto blocks
-peer messages and `agent://` wakes: completed leaves are not resumed outside its ledger.
+Main work, native leaf tasks/messages and the narrow review-file/checkpoint handoff.
+OMP owns child execution, message delivery, IRC relay, wake/revival, rereview, and
+cancellation. Auto observes public evidence without patching tool execution or
+wake observers and without maintaining a replacement native execution ledger.
 
-A detached verification/fix task must supply its actual complete, retained native
-artifact. Rendered task previews are never accepted as complete evidence. Synchronous
-untruncated outputs may supply the full native receipt; truncated results likewise
-require their complete artifact. Successful task execution is not itself a test pass:
-all captured verification findings reach the independent Architect review material.
+Verification/fix evidence comes from complete original native task results or
+complete extracted native yield receipts, never rendered previews or a child's
+mutable `outputPath`. For IRC rerequests, the original transcript yield must bind
+to the admitted incoming request and a matching successful native finalization
+outcome. A metadata-only `useLastTurn` receipt without its complete response body
+remains unverified. Successful task execution is not itself a test pass: all
+captured verification findings reach the independent Architect review material.
+The complete native-file Architect handoff below is unchanged.
 
 ## Native completion handoff
 
@@ -228,59 +238,68 @@ completion reminder, not a task-by-task implementation loop.
 - `auto_status` and failed `auto_step` results expose `decisionDiagnostics`: the configured confidence threshold and Jev timeout, plus primary (`jev`) and fallback (`architect`) choice/confidence or safe error code, elapsed time, and each attempt’s actual timeout. Successful fallback provenance is retained too. `JEV_MISSING_API_KEY` means to check OMP's `typesafe` login/environment setup; `DECISION_TIMEOUT`/`JEV_TIMEOUT` identifies the bounded call that expired; `JEV_INVALID_RESPONSE`/`FALLBACK_INVALID_RESPONSE` identifies incompatible output. `PROVIDER_ERROR` deliberately withholds arbitrary exception text. Low confidence and a genuine `uncertain` response remain distinct from transport/configuration failure. Inspect the reported cause before an explicit restart; Auto never retries providers in a loop or lowers the confidence threshold
 - Jev receives the current host phase, supported native next step and built-in/recorded workflow source. A built-in prepared-change flow explicitly says that no external Rasen run-state is required. This is routing evidence, never a substitute for approval. Small evidence budgets retain prioritized host facts as complete JSON and mark omitted fields, rather than clipping serialized facts mid-field
 - Low confidence, malformed output, timeout, or provider error permits at most one isolated no-tool architect-role triage fallback for that decision, within `maxFallbacks` for the run. `fallback: "stop"` disables it. Continued uncertainty stops explicitly. No provider retry loop exists
-- `replan` requires the existing Architect recovery checkpoint. Plan, recovery and explicit blocked checkpoints use the [native-file handoff](architect.md#native-file-handoff): write `local://architect-review/NAME.md`, then submit `{ phase, evidenceRef, steps? }`; inline `summary` is unsupported. A denied OMP tool approval stops Auto as `needs_user`; no confidence can override it
+- `replan` requires the existing Architect recovery checkpoint. Plan, recovery and explicit blocked checkpoints use the [native-file handoff](architect.md#native-file-handoff): write `local://architect-review/NAME.md`, then submit `{ phase, evidenceRef, steps? }`; inline `summary` is unsupported. A denied OMP tool approval revokes Auto with outcome `needs_user`; no confidence can override it
 - The existing Architect `reviews.min/max` settings (defaults **1/3**) are the sole semantic completion review/fix loop, using the native handoff above. Required independent verification still runs, but skill reads, CLI queries, task progress, and test commands are not review rounds. Any recorded Rasen review-cycle stage remains pending for the host gate; downstream stages remain outside this start's scope. Unresolved plan/recovery checkpoints, review findings, or exhausted review budgets cannot become success
 - Task identity/order/description, schema, and local project root are frozen for a run. Scope changes require the user to review and explicitly restart. Deleted/replaced tasks and repeated checkbox toggling do not manufacture progress
 - Default supervision is **4 hours overall** (`maxDurationMs: 14400000`, configurable up to 12 hours) and **10 minutes without native model/tool output** (`noOutputTimeoutMs: 600000`, configurable up to 30 minutes). The inactivity timer measures output activity, not checkbox progress. Both time limits remain finite
 - `maxSteps`, `maxToolCalls`, and `maxStalls` default to `null`, so there is no default whole-change 8-turn, 80-tool-call, or checkbox-stall cap. Explicit legacy integer limits remain accepted and enforced: `maxSteps` 1–10000 for native execution turns, `maxToolCalls` 1–100000 for main-session tool attempts (including failed attempts), and `maxStalls` 1–10000 for observed turns without newly completed tasks before continuation. Use `null` to disable an optional count cap. Counts and elapsed time never reset on hidden continuations
 - Semantic primary decisions occur at new stage boundaries; there is no default 8-decision ceiling. At most one fallback is permitted for a decision, with 2 fallback attempts for the run by default (`maxFallbacks`). Plan/recovery/completion reviews retain the separate `3 × reviews.max` total maximum. The `auto_step` stage-advice deadline is `2 × cliTimeoutMs + decisionTimeoutMs + reviewTimeoutMs + 1000` (139 seconds by default), allowing bounded fresh observation, primary advice, and fallback. Jev keeps its separate `decisionTimeoutMs` budget (8 seconds by default); the native Architect fallback uses its configured `reviewTimeoutMs` (120 seconds by default). Each `decisionDiagnostics.attempts` entry reports its actual `timeoutMs`. Completion review uses the configured Architect timeout; only stop-time fresh-fact settlement uses the 24-second deadline
-- Terminal outcomes are distinct: `completed`, `needs_user`, `uncertain`, `stalled`, `budget_exhausted`, `cancelled`, and `blocked`. Only `completed` records fresh CLI validation and settlement against matching approved task/workflow fingerprints. Status refreshes do not resume execution, reset budgets, change a terminal outcome, or award approval. If fresh evidence differs or cannot be read, `completionVerified` is false and observation errors remain visible. A stopped unverified run remains unverified even if checkboxes later change. Restart/resume/branch does not resume Auto; a new real user request cancels its ownership
+- Lifecycle status is `running`, `draining`, then `paused` or `completed`. The separate `outcome` retains the terminal reason category: `completed`, `needs_user`, `uncertain`, `stalled`, `budget_exhausted`, `cancelled`, and `blocked`. `completionVerified` requires the detached native settlement barrier plus fresh matching approved task, code, workflow, and strict-validation evidence. A completion outcome while draining is not verified completion. Status refreshes do not resume execution, reset budgets, or award approval. If fresh evidence differs or cannot be read, `completionVerified` is false and observation errors remain visible. A stopped unverified run remains unverified even if checkboxes later change. Restart/resume/branch does not resume Auto; new user input revokes further Auto work and preserves admitted native work
 
-`auto_status` includes Architect's `lastReview`, with invocation ID, artifact reference/SHA-256, status, charged attempt and verdict. Use it to distinguish a finished provider response from rejected input, stale evidence or caller cancellation; `charged` is review-budget accounting, not a billing receipt. Terminal abort behavior remains in place, and the durable review outcome remains available for diagnosis. Normal non-Auto completion invoked inside Eval follows the separate queued, 24-second boundary contract in the [Architect guide](architect.md#completion-boundaries-and-status).
+`auto_status` includes Architect's `lastReview`, with invocation ID, artifact reference/SHA-256, status, charged attempt and verdict. Use it to distinguish a finished provider response from rejected input, stale evidence or caller cancellation; `charged` is review-budget accounting, not a billing receipt. Revoking Auto also revokes its in-flight decision/review publication; native execution and durable review diagnostics remain available. Normal non-Auto completion invoked inside Eval follows the separate queued, 24-second boundary contract in the [Architect guide](architect.md#completion-boundaries-and-status).
 
 The confidence threshold is an uncalibrated routing heuristic, not a correctness probability. A future local backend such as Laya can implement the `DecisionProvider` interface, but no Laya model is installed, trained, benchmarked, or supported by this PR. Its confidence would require separate evaluation.
 
 Auto sends bounded stage/task counts, stage-frontier and finding evidence, a progress summary, and recent tool evidence to the fixed TypeSafe endpoint. No generated skill, full source artifact, or separate brief field is automatically included in that request, but summaries/tool evidence can still contain source, instructions, or private data: confirm only for data you may send. The separate no-tool architect completion session receives the full admitted native artifact, exact canonical plan, and bounded host evidence through your configured architect provider; frozen instructions and the rendered brief remain in its request evidence. This full-file handoff does not expand semantic triage: Jev and its fallback retain their bounded progress evidence. HTTP redirects are refused, response/request sizes are bounded, and provider errors do not echo credentials or response bodies.
 
-These are orchestration controls, not an OS sandbox: arbitrary shell code can create processes outside native job tracking, and streamed assistant claims cannot be retracted. Completion is refused while Auto-owned native work remains unsettled; await results and collect fresh evidence before review. Unrelated Main jobs do not block the Auto completion checkpoint, though native OMP terminal `session_stop` scheduling still waits for all Main-owned jobs. Use normal OMP approval settings and review the final evidence.
+These are orchestration controls, not an OS sandbox: arbitrary shell code can create processes outside native job tracking, and streamed assistant claims cannot be retracted. Completion is refused while native settlement is pending or unverified; await results and collect fresh evidence before review. The public Main-owner quiescence boundary is conservative: unrelated jobs under the same Main may delay Auto without becoming Auto evidence or being cancelled. Use normal OMP approval settings and review the final evidence.
 
 See [verification and known coverage limits](rasen-auto-verification.md) for recorded evidence and reproduction steps. Historical verification is not proof of live end-to-end coverage for the current extension-owned flow. Return to the [README](../README.md).
 
 ## Native async ownership and stopping
 
-Auto uses OMP's exported agent registry, native job manager, task receipts and child
-lifecycle events to associate jobs with its own run. It cancels only those exact
-jobs and leaf sessions on `/auto stop`, new user input, or session changes. A
-cancelled job status does not prove termination: the job promise must finish
-unwinding before a new run can begin or completion can be accepted. Late receipts
-remain associated with the stopped run, and stale native result delivery is
-suppressed. If a host delivery had already batched old and unrelated results,
-the unrelated job IDs remain available through a native wait/proc recovery notice
-instead of replaying the mixed stale body. Existing unrelated jobs in the same
-Main session are left alone.
+OMP remains responsible for native task/Bash/Eval execution, job ownership,
+messages, IRC, wake/revival, rereview, result delivery, and cancellation. Auto uses
+public lifecycle and settlement APIs as observations. It does not replace tool
+`execute` methods, patch wake observers, reconstruct async scopes, filter native
+results, or replace mixed-result messages with recovery notices. Native child
+receipts and messages remain available after Auto admission is revoked.
 
-Use `/auto stop` for explicit cancellation, including when Main is idle waiting
-for detached workers. Main's live-stream ESC interrupt reaches Auto through the
-native interrupted-turn path. An idle ESC may instead backtrack, and ESC while a
-child is focused may switch focus to Main; neither is a promise that all detached
-jobs were cancelled. Inspect `auto_status.nativeWork` and native job status before
-restarting. Native wait/resume scheduling does not consume an extra Auto hidden
-continuation budget.
+The lifecycle is `running → draining → paused/completed`:
 
-Bash/Eval ownership relies on native result metadata exposing the actual job ID;
-Auto does not infer ownership from a session-wide job-list difference or cancel
-all jobs belonging to Main. Native Main jobs missing those receipts cannot safely be
-attributed to an Auto run. For an interrupted in-flight Bash/Eval call without a
-receipt, `nativeWork.settlementUnverified` names the unresolved call. This means
-termination is unknown, not that the process is proven to be running. Auto blocks
-another start in that session; inspect native jobs and use a new session. A later
-exact receipt can resolve the uncertainty. Native owner-scoped joins cover the
-one-shot leaves' hidden jobs without joining unrelated Main work. A tool error
-immediately followed by interruption before the next assistant message can be
-ambiguous because the host omits a per-call abort/job handle; normal errors that
-continue to the model do not retain this fence. Processes launched outside the
-native manager are also outside this cancellation guarantee. These limits do not justify changing global
-async settings; keep normal tool approvals and verify actual termination.
+- `/auto stop`, new user input, and other stop conditions revoke new Auto dispatch,
+  Jev decisions, and review publication. They do not abort already-admitted native
+  children or cancel native jobs
+- During `draining`, admitted work finishes through OMP's normal routes. Auto waits
+  for admitted submissions, IRC replies, jobs, result delivery, and idle settlement
+  outside awaited Main tool/event callbacks. A native scheduling pause is not a
+  completion certificate or a reason to cancel children
+- `paused` means drain was verified without valid completion approval. Resuming
+  Auto requires a fresh explicit start; stopping never resets budgets by itself
+- `completed` requires verified drain and fresh task, code, workflow, validation,
+  and Architect approval evidence. A previous approval alone cannot certify a
+  workspace changed by later native work
+
+The public settlement boundary includes Main and its native descendants. It can
+wait for unrelated jobs belonging to the same Main owner. Those jobs are neither
+cancelled nor appropriated as Auto evidence. Auto leaves native async settings
+and global configuration unchanged. Inspect `auto_status.nativeWork` and native
+job status before restarting.
+
+Force-cancelling work is a separate explicit native OMP action. `/auto stop` is
+not that action. Main's live ESC interruption, idle ESC/backtrack, and focused-child
+ESC/focus switching retain their native behavior; none proves that every native
+job has terminated. A cancelled status alone is not proof that its promise or
+process has finished unwinding.
+
+Some interrupted native dispatches, including an in-flight `ensureLive` revival,
+can continue without a public handle that proves their settlement. In that case
+`nativeWork.settlementUnverified` records the unresolved call, Auto remains held
+in `draining`, and a same-session restart or completion is refused. This reports
+uncertainty, not proven continued execution or successful cancellation. Inspect
+native work; use a new session when public settlement cannot be established.
+Processes launched outside native job tracking are outside this observation
+boundary too. Do not disable async globally to work around an uncertain receipt.
 
 ### Diagnosing a refused start
 

@@ -9,6 +9,8 @@ import type { RasenSnapshot } from "./rasen.ts";
 
 export type AutoStatus =
   | "running"
+  | "draining"
+  | "paused"
   | "completed"
   | "needs_user"
   | "uncertain"
@@ -21,6 +23,7 @@ export type AutoStatus =
 export class AutoRun {
   status: AutoStatus = "running";
   reason = "";
+  outcome: Exclude<AutoStatus, "running" | "draining" | "paused"> | undefined;
   steps = 1;
   toolCalls = 0;
   decisions = 0;
@@ -63,6 +66,18 @@ export class AutoRun {
     if (status === "completed") this.#completionFingerprint = this.snapshot.fingerprint;
     this.status = status;
     this.reason = reason;
+  }
+
+  /** Revoke semantic scheduling; native execution remains owned by OMP. */
+  beginDrain(): void {
+    if (this.status === "running" || this.status === "draining" || this.status === "paused") return;
+    this.outcome = this.status;
+    this.status = "draining";
+  }
+
+  finishDrain(completed = false): void {
+    if (this.status !== "draining") return;
+    this.status = completed && this.outcome === "completed" ? "completed" : "paused";
   }
 
   checkTime(): boolean {
@@ -277,6 +292,7 @@ export class AutoRun {
       change: this.snapshot.change,
       status: this.status,
       reason: this.reason || null,
+      outcome: this.outcome ?? null,
       progress: this.snapshot.progress,
       steps:
         this.config.maxSteps === null ? `${this.steps}` : `${this.steps}/${this.config.maxSteps}`,

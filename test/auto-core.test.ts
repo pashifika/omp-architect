@@ -414,3 +414,17 @@ for (const outcome of ["success", "timeout", "cancel"] as const) {
     }
   });
 }
+
+test("semantic stop drains without resuming budgets and completes only after settlement", () => {
+  const run = new AutoRun(parseAutoConfig({}), snapshot());
+  run.stop("needs_user", "New user input");
+  run.beginDrain();
+  expect(run.status).toBe("draining");
+  expect(run.toolCall("late")).toBe(false);
+  expect(run.continue()).toBe(false);
+  run.finishDrain();
+  expect(run.status).toBe("paused");
+  expect(run.statusView().outcome).toBe("needs_user");
+  run.stop("completed", "Late approval cannot resume a held run");
+  expect(run.status).toBe("paused");
+});

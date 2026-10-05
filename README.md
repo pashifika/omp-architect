@@ -69,11 +69,14 @@ the native completion checkpoint synchronously in the LEAD turn, with fresh Rase
 evidence and the full configured review timeout. Its Eval route requires a
 dedicated JavaScript `reset: true` single-call checkpoint carrier;
 general or batched carriers are rejected without spending a review. Auto preserves
-native async settings and tracks its own Main-owned jobs. Its stop hook
+native async settings, execution, messages, IRC, and result delivery. Its stop hook
 only validates fresh facts against the approval; it does not run the reviewer.
-Await Auto-owned native jobs and submit fresh evidence before review. Use `/auto stop`
-to cancel Auto-owned work, including detached workers; idle ESC is not a universal
-job-cancellation command. The
+Await native work and submit fresh evidence before review. `/auto stop` revokes new
+Auto work and drains already-admitted children, preserving their normal results;
+it does not force-cancel them. Native cancellation is a separate explicit action.
+Auto moves from `running` through `draining` to `paused` or freshly verified
+`completed`; conservative quiescence checks may wait for unrelated work under
+the same Main owner. See [stopping and settlement](docs/rasen-auto.md#native-async-ownership-and-stopping). The
 extension does not silently switch your active main model. Reviews send the full
 admitted file and bounded host evidence to your configured provider; do not include secrets. These checks
 do not replace tool approvals or prove that assistant-authored claims occurred.

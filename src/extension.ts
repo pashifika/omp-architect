@@ -1,3 +1,4 @@
+import { nativeAsyncHost } from "./auto/async.ts";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { loadConfig, type Config } from "./config.ts";
 import {
@@ -117,7 +118,7 @@ export function extensionFactory(
         { triggerTurn: false, deliverAs: "nextTurn" },
       );
       ctx.ui.notify(`OMP Architect blocked: ${reason}. Completion remains unverified.`, "warning");
-      ctx.abort();
+      if (!auto.handlesCompletion()) ctx.abort();
     };
     const initialize = async (ctx: ExtensionContext) => {
       generation++;
@@ -247,7 +248,13 @@ export function extensionFactory(
         if (autoStart === "blocked") stopped = true;
         // A preparation/queued-delivery hook alone is not a new user request.
         // A confirmed Auto start has its own exact bootstrap ownership check.
-        if (stopped && autoStart !== "blocked" && !newUserRequest && !auto.request()) {
+        if (
+          stopped &&
+          autoStart !== "blocked" &&
+          !newUserRequest &&
+          !auto.request() &&
+          !auto.handlesCompletion()
+        ) {
           acceptedPrompt = "";
           expectedContinuation = "";
           ctx.abort();
@@ -313,6 +320,12 @@ export function extensionFactory(
         state?.deny(event.toolCallId, toolName, { ...event.input }, reason);
         return { block: true as const, reason };
       };
+      if (
+        stopped &&
+        auto.handlesCompletion() &&
+        ["wait", "read", "grep", "glob", "find", "ls"].includes(toolName)
+      )
+        return;
       if (stopped)
         return deny(
           "OMP Architect stopped this request; start a new user request after resolving the blocker",
@@ -356,11 +369,17 @@ export function extensionFactory(
       if (reason) return deny(reason);
       if (toolName === "eval") activeEvals.set(event.toolCallId, input);
     });
+    const nativeSettlement = (details: unknown, ctx: ExtensionContext) => {
+      const id = (details as { async?: { jobId?: string } } | undefined)?.async?.jobId;
+      return id
+        ? nativeAsyncHost(pi, ctx)?.session.asyncJobManager?.getJob(id)?.promise
+        : undefined;
+    };
     pi.on("tool_result", (event, ctx) => {
       if (ctx.agent.kind !== "main" || !state) return;
       const toolName = effectiveToolName(event.toolName, event.input);
       if (toolName === "eval") {
-        const pending = auto.asyncCall(event.toolCallId);
+        const pending = nativeSettlement(event.details, ctx);
         if (pending) {
           const input = activeEvals.get(event.toolCallId);
           void pending.then(() => {
@@ -422,7 +441,7 @@ export function extensionFactory(
     pi.on("tool_execution_end", (event, ctx) => {
       if (ctx.agent.kind !== "main" || event.toolName !== "eval") return;
       const input = activeEvals.get(event.toolCallId);
-      if (auto.asyncCall(event.toolCallId)) return; // Initial native background receipt, not settlement.
+      if (nativeSettlement((event.result as { details?: unknown })?.details, ctx)) return; // Initial native background receipt, not settlement.
       if (!input) return; // The normal tool_result already recorded this execution.
       activeEvals.delete(event.toolCallId);
       state?.observe(
@@ -619,7 +638,7 @@ export function extensionFactory(
             ctx,
             signal,
             invocationId,
-            new Set(autoCompletionCarriers),
+            new Set([id, ...autoCompletionCarriers]),
           );
           if (
             state &&

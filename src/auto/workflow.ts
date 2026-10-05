@@ -564,9 +564,18 @@ export type HostAutoPhase =
   | "settled"
   | "blocked";
 
-/** Only the native task-result adapter may construct this evidence. */
+/** Only the native result adapter may bind semantic requests to this provenance. */
 export interface HostTaskEvidence {
-  taskId: string;
+  reviewRequestId: string;
+  revision: number;
+  requiredCheck: string;
+  /** Native identity is provenance, never the identity of a semantic review. */
+  producer: {
+    agentId: string;
+    sessionId?: string;
+    receiptId: string;
+    artifactSha256?: string;
+  };
   snapshotFingerprint: string;
   workflowFingerprint: string;
   settled: boolean;
@@ -592,6 +601,7 @@ export interface HostWorkflowState {
   fingerprint: string;
   snapshotFingerprint: string;
   workflowFingerprint: string;
+  revision: number;
   cycle: number;
   requiredVerification: string[];
   verifiedStages: string[];
@@ -691,7 +701,8 @@ export class HostAutoWorkflow {
   private workflowIdentity = "";
   private reason: string | null = null;
   private verification = new Map<string, HostVerificationEvidence>();
-  private consumedTasks = new Set<string>();
+  private consumedEvidence = new Set<string>();
+  private revision = 0;
   private findings: string[] = [];
   private cycle = 0;
   private needsDelta = false;
@@ -776,13 +787,19 @@ export class HostAutoWorkflow {
       return this.block(
         `Source workflow has unfinished out-of-scope prerequisites: ${[...new Set(unavailable)].join(", ")}`,
       );
-    if (changed) this.invalidateVerification();
+    if (changed && this.phase !== "fix") this.invalidateVerification();
     // The native adapter consumes a successful prior fix receipt before this
     // settled boundary. A failed fixer may still edit code: the next admitted
     // retry must bind these fresh facts, rather than an obsolete fix baseline.
     // Diagnostics may observe mid-flight and must preserve the dispatch baseline.
-    if (this.phase === "fix" && options.settledBoundary === true)
+    if (this.phase === "fix" && options.settledBoundary === true) {
+      if (
+        this.fixOrigin?.snapshot !== snapshot.fingerprint ||
+        this.fixOrigin?.workflow !== source.fingerprint
+      )
+        this.invalidateVerification();
       this.fixOrigin = { snapshot: snapshot.fingerprint, workflow: source.fingerprint };
+    }
     if (this.phase !== "triage" && this.phase !== "fix" && this.phase !== "settled")
       this.phase = tasksComplete(snapshot)
         ? this.verified()
@@ -809,16 +826,17 @@ export class HostAutoWorkflow {
     )
       return false;
     const ready = this.readyVerificationStages();
-    // A generic receipt covers exactly the current allowed check. Explicit
+    // A generic receipt covers exactly its requested check. Explicit
     // parallel coverage is allowed only for already-ready independent stages.
-    const stages = evidence.stages ?? ready.slice(0, 1);
+    const stages = evidence.stages ?? [evidence.requiredCheck];
     if (
       !stages.length ||
+      !stages.includes(evidence.requiredCheck) ||
       new Set(stages).size !== stages.length ||
       stages.some((stage) => !ready.includes(stage))
     )
       return false;
-    this.consumedTasks.add(evidence.taskId);
+    this.consumedEvidence.add(this.evidenceKey(evidence));
     const admitted = { ...structuredClone(evidence), stages: [...stages] };
     for (const stage of stages) this.verification.set(stage, admitted);
     if (this.verified()) this.phase = this.needsDelta ? "delta-review" : "review";
@@ -828,12 +846,15 @@ export class HostAutoWorkflow {
   /** Native receipt provenance is factual; its prose findings still need Architect review. */
   verificationEvidence(): HostVerificationEvidence[] {
     return [
-      ...new Map([...this.verification.values()].map((item) => [item.taskId, item])).values(),
+      ...new Map(
+        [...this.verification.values()].map((item) => [this.evidenceKey(item), item]),
+      ).values(),
     ].map((item) => structuredClone(item));
   }
 
   /** Invalidate also on code edits not represented by the public task ledger. */
   invalidateVerification(): void {
+    this.revision++;
     this.verification.clear();
     if (["review", "delta-review", "settled"].includes(this.phase))
       this.phase = this.snapshot && tasksComplete(this.snapshot) ? "verify" : "apply";
@@ -866,7 +887,7 @@ export class HostAutoWorkflow {
       return this.statusView();
     }
     this.findings = verdict.issues.length ? [...verdict.issues] : [verdict.summary];
-    this.verification.clear();
+    this.invalidateVerification();
     this.phase = "triage";
     return this.statusView();
   }
@@ -888,15 +909,16 @@ export class HostAutoWorkflow {
     if (
       this.phase !== "fix" ||
       evidence.role !== "omp-worker" ||
+      evidence.requiredCheck !== "fix" ||
       !this.validReceipt(evidence) ||
       !this.fixOrigin ||
       evidence.snapshotFingerprint !== this.fixOrigin.snapshot ||
       evidence.workflowFingerprint !== this.fixOrigin.workflow
     )
       return false;
-    this.consumedTasks.add(evidence.taskId);
+    this.consumedEvidence.add(this.evidenceKey(evidence));
     this.fixOrigin = undefined;
-    this.verification.clear();
+    this.invalidateVerification();
     this.phase = this.snapshot && tasksComplete(this.snapshot) ? "verify" : "apply";
     return true;
   }
@@ -1006,6 +1028,7 @@ export class HostAutoWorkflow {
       instruction: phaseInstructions[phase],
       snapshotFingerprint: this.snapshot?.fingerprint ?? "",
       workflowFingerprint: this.source?.fingerprint ?? "",
+      revision: this.revision,
       cycle: this.cycle,
       requiredVerification: required,
       verifiedStages: verified,
@@ -1103,10 +1126,23 @@ export class HostAutoWorkflow {
     );
   }
 
+  private evidenceKey(evidence: HostTaskEvidence): string {
+    return JSON.stringify([evidence.reviewRequestId, evidence.revision, evidence.requiredCheck]);
+  }
+
   private validReceipt(evidence: HostTaskEvidence): boolean {
+    const producer = evidence.producer;
     return (
-      string(evidence.taskId) &&
-      !this.consumedTasks.has(evidence.taskId) &&
+      string(evidence.reviewRequestId) &&
+      Number.isSafeInteger(evidence.revision) &&
+      evidence.revision === this.revision &&
+      string(evidence.requiredCheck) &&
+      !!producer &&
+      string(producer.agentId) &&
+      string(producer.receiptId) &&
+      (producer.sessionId === undefined || string(producer.sessionId)) &&
+      (producer.artifactSha256 === undefined || /^[a-f0-9]{64}$/.test(producer.artifactSha256)) &&
+      !this.consumedEvidence.has(this.evidenceKey(evidence)) &&
       evidence.settled === true &&
       evidence.success === true &&
       string(evidence.evidence) &&

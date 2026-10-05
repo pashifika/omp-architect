@@ -42,17 +42,34 @@ function snapshot(done = false, revision = ""): RasenSnapshot {
 }
 function verifier(
   host: HostAutoWorkflow,
-  taskId = "native-check-1",
+  reviewRequestId = "review-request-1",
   extra: Partial<HostVerificationEvidence> = {},
 ): HostVerificationEvidence {
+  const state = host.statusView();
   return {
-    taskId,
+    reviewRequestId,
+    revision: state.revision,
+    requiredCheck: extra.stages?.[0] ?? state.stage ?? "verify",
+    producer: { agentId: "native-reviewer-child", receiptId: `receipt:${reviewRequestId}` },
     role: "omp-reviewer",
     settled: true,
     success: true,
     evidence: "Independent native task completed the tests and inspected the implementation",
-    snapshotFingerprint: host.statusView().snapshotFingerprint,
-    workflowFingerprint: host.statusView().workflowFingerprint,
+    snapshotFingerprint: state.snapshotFingerprint,
+    workflowFingerprint: state.workflowFingerprint,
+    ...extra,
+  };
+}
+function fixer(
+  host: HostAutoWorkflow,
+  reviewRequestId = "fix-request-1",
+  extra: Partial<HostFixEvidence> = {},
+): HostFixEvidence {
+  return {
+    ...verifier(host, reviewRequestId),
+    requiredCheck: "fix",
+    producer: { agentId: "native-fixer-child", receiptId: `receipt:${reviewRequestId}` },
+    role: "omp-worker",
     ...extra,
   };
 }
@@ -142,6 +159,15 @@ test("native verification receipts are successful, settled, independent and fact
     { success: false },
     { settled: false },
     { evidence: " " },
+    { reviewRequestId: "" },
+    { revision: -1 },
+    { revision: 1.5 },
+    { revision: Number.MAX_SAFE_INTEGER + 1 },
+    { requiredCheck: "" },
+    { producer: { agentId: "", receiptId: "receipt" } },
+    { producer: { agentId: "child", receiptId: "" } },
+    { producer: { agentId: "child", receiptId: "receipt", sessionId: "" } },
+    { producer: { agentId: "child", receiptId: "receipt", artifactSha256: "not-a-sha256" } },
     { snapshotFingerprint: "old-workspace" },
     { workflowFingerprint: "old-source" },
     { stages: ["ship"] },
@@ -155,10 +181,113 @@ test("native verification receipts are successful, settled, independent and fact
     ).toBe(false);
     expect(host.statusView().phase).toBe("verify");
   }
-  const host = ready();
+  const host = new HostAutoWorkflow(change);
+  host.observe(snapshot(true), absent);
+  const oldEvidence = verifier(host);
+  expect(host.recordVerification(oldEvidence)).toBe(true);
   host.invalidateVerification();
-  expect(host.recordVerification(verifier(host))).toBe(false);
+  expect(host.recordVerification(oldEvidence)).toBe(false);
   expect(host.recordVerification(verifier(host, "new-independent-check"))).toBe(true);
+});
+
+test("the same native reviewer can answer distinct requests for sequential required checks", () => {
+  const external = source();
+  external.stages.push({
+    id: "security",
+    kind: "standard",
+    skill: "rasen-cso",
+    requires: ["verify"],
+    status: "pending",
+  });
+  const host = new HostAutoWorkflow(change);
+  host.observe(snapshot(true), external);
+  const first = verifier(host, "verify-request");
+  expect(host.recordVerification(first)).toBe(true);
+  const second = verifier(host, "security-request");
+  expect(second.producer.agentId).toBe(first.producer.agentId);
+  expect(second.producer.receiptId).not.toBe(first.producer.receiptId);
+  expect(second.revision).toBe(first.revision);
+  expect(host.recordVerification(second)).toBe(true);
+  expect(host.statusView().phase).toBe("review");
+  expect(host.verificationEvidence()).toEqual([
+    { ...first, stages: ["verify"] },
+    { ...second, stages: ["security"] },
+  ]);
+});
+
+test("semantic evidence identity includes the required check rather than native producer identity", () => {
+  const external = source();
+  external.stages.push({
+    id: "security",
+    kind: "standard",
+    skill: "rasen-cso",
+    requires: ["apply"],
+    status: "pending",
+  });
+  const host = new HostAutoWorkflow(change);
+  host.observe(snapshot(true), external);
+  const first = verifier(host, "request-for-independent-checks");
+  expect(host.recordVerification(first)).toBe(true);
+  expect(host.recordVerification(first)).toBe(false);
+  expect(
+    host.recordVerification({
+      ...first,
+      producer: { agentId: "another-child", receiptId: "another-native-receipt" },
+    }),
+  ).toBe(false);
+  const second = verifier(host, first.reviewRequestId, {
+    producer: { ...first.producer, receiptId: "security-native-receipt" },
+  });
+  expect(second.requiredCheck).toBe("security");
+  expect(host.recordVerification(second)).toBe(true);
+  expect(host.verificationEvidence()).toHaveLength(2);
+});
+
+test("new revisions admit fresh responses from the same child and reject stale or future proof", () => {
+  const host = new HostAutoWorkflow(change);
+  host.observe(snapshot(true), absent);
+  const first = verifier(host, "original-review-request");
+  expect(host.recordVerification(first)).toBe(true);
+  host.invalidateVerification();
+  const revision = host.statusView().revision;
+  expect(revision).toBeGreaterThan(first.revision);
+  expect(host.statusView().snapshotFingerprint).toBe(first.snapshotFingerprint);
+  expect(host.recordVerification(first)).toBe(false);
+  const fresh = verifier(host, "later-review-request", {
+    producer: {
+      agentId: first.producer.agentId,
+      sessionId: "native-child-session",
+      receiptId: "fresh-native-output-message",
+      artifactSha256: "a".repeat(64),
+    },
+  });
+  expect(host.recordVerification({ ...fresh, revision: revision + 1 })).toBe(false);
+  expect(host.recordVerification(fresh)).toBe(true);
+  expect(host.verificationEvidence()[0].producer).toEqual(fresh.producer);
+  host.invalidateVerification();
+  // Revising the same semantic request also requires a fresh revision-bound receipt.
+  expect(
+    host.recordVerification({
+      ...fresh,
+      revision: host.statusView().revision,
+      producer: { ...fresh.producer, receiptId: "revised-native-output-message" },
+    }),
+  ).toBe(true);
+});
+
+test("explicit coverage must contain its requested check and cannot replace independent review", () => {
+  const host = new HostAutoWorkflow(change);
+  host.observe(snapshot(true), absent);
+  expect(
+    host.recordVerification(
+      verifier(host, "mismatched-request", { requiredCheck: "security", stages: ["verify"] }),
+    ),
+  ).toBe(false);
+  expect(host.recordVerification(verifier(host, "fixer-proof", { requiredCheck: "fix" }))).toBe(
+    false,
+  );
+  expect(host.recordVerification(verifier(host))).toBe(true);
+  expect(host.statusView()).toMatchObject({ phase: "review", readyForReview: true });
 });
 
 test("fresh workspace or source facts invalidate verification and settled approval", () => {
@@ -180,7 +309,7 @@ test("a real revise takes triage, successful native fix, reverify and delta-revi
   expect(host.statusView().findings).toEqual(revise.issues);
   expect(host.recordVerification(verifier(host, "early-reverify"))).toBe(false);
   expect(host.observe(snapshot(true), absent).phase).toBe("triage");
-  const fix: HostFixEvidence = { ...verifier(host, "native-fix"), role: "omp-worker" };
+  const fix = fixer(host, "native-fix");
   expect(host.recordFix(fix)).toBe(false);
   expect(host.acknowledgeTriage().phase).toBe("fix");
   expect(host.recordFix({ ...fix, success: false })).toBe(false);
@@ -586,16 +715,12 @@ test("a failed fixer that edits code can retry against the next fresh fix bounda
   const host = ready();
   host.recordReview(revise, { approved: false });
   host.acknowledgeTriage();
-  const first: HostFixEvidence = {
-    ...verifier(host, "failed-fixer"),
-    role: "omp-worker",
-    success: false,
-  };
+  const first = fixer(host, "failed-fixer", { success: false });
   expect(host.recordFix(first)).toBe(false);
   expect(
     host.observe(snapshot(true, "partial-failed-fix"), absent, { settledBoundary: true }).phase,
   ).toBe("fix");
-  const retry: HostFixEvidence = { ...verifier(host, "successful-retry"), role: "omp-worker" };
+  const retry = fixer(host, "successful-retry");
   expect(retry.snapshotFingerprint).not.toBe(first.snapshotFingerprint);
   expect(host.recordFix(retry)).toBe(true);
   expect(host.observe(snapshot(true, "completed-fix"), absent).phase).toBe("verify");
@@ -607,8 +732,45 @@ test("diagnostic observations during a native fix do not replace its admitted di
   const host = ready();
   host.recordReview(revise, { approved: false });
   host.acknowledgeTriage();
-  const dispatched: HostFixEvidence = { ...verifier(host, "active-fixer"), role: "omp-worker" };
+  const dispatched = fixer(host, "active-fixer");
   expect(host.observe(snapshot(true, "midflight-edits"), absent).phase).toBe("fix");
+  expect(host.statusView().revision).toBe(dispatched.revision);
   expect(host.recordFix(dispatched)).toBe(true);
   expect(host.statusView().phase).toBe("verify");
+  expect(host.statusView().revision).toBeGreaterThan(dispatched.revision);
+});
+
+test("settled fix retries refresh the revision even after diagnostics already observed the edits", () => {
+  const host = ready();
+  host.recordReview(revise, { approved: false });
+  host.acknowledgeTriage();
+  const old = fixer(host, "old-fix-request");
+  host.observe(snapshot(true, "partial-fix"), absent);
+  expect(host.statusView().revision).toBe(old.revision);
+  host.observe(snapshot(true, "partial-fix"), absent, { settledBoundary: true });
+  expect(host.statusView().revision).toBeGreaterThan(old.revision);
+  expect(host.recordFix(old)).toBe(false);
+  const fresh = fixer(host, "retry-fix-request");
+  expect(fresh.producer.agentId).toBe(old.producer.agentId);
+  expect(host.recordFix({ ...fresh, requiredCheck: "verify" })).toBe(false);
+  expect(host.recordFix(fresh)).toBe(true);
+  expect(host.recordFix(fresh)).toBe(false);
+});
+
+test("the same fixer can serve a later review cycle without inheriting stale fix evidence", () => {
+  const host = ready();
+  host.recordReview(revise, { approved: false });
+  host.acknowledgeTriage();
+  const first = fixer(host, "first-fix-request");
+  expect(host.recordFix(first)).toBe(true);
+  expect(host.recordVerification(verifier(host, "first-recheck-request"))).toBe(true);
+  host.recordReview(revise, { approved: false });
+  host.acknowledgeTriage();
+  const second = fixer(host, "second-fix-request");
+  expect(second.producer.agentId).toBe(first.producer.agentId);
+  expect(second.revision).toBeGreaterThan(first.revision);
+  expect(host.recordFix(first)).toBe(false);
+  expect(host.recordFix(second)).toBe(true);
+  expect(host.recordVerification(verifier(host, "second-recheck-request"))).toBe(true);
+  expect(host.recordReview(approve, { approved: true }).phase).toBe("settled");
 });

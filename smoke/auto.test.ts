@@ -165,7 +165,19 @@ async function loaderFixture(
   const nativeSession = {
     asyncJobManager: nativeManager,
     getAgentId: () => "main",
+    sessionId: "fixture-native-main",
+    hasPendingAsyncWork: () => nativeManager.getAllJobs().some((job) => job.status === "running"),
+    waitForAdmittedSubmissions: async () => {},
+    waitForIrcReplies: async () => {},
+    settleAsyncWork: async () => {},
+    waitForIdle: async () => {},
   } as AgentSession;
+  nativeRegistry.register({
+    id: "main",
+    displayName: "Main",
+    kind: "main",
+    session: nativeSession,
+  });
   const factory = extensionFactory(() => overrides.reviewer ?? (async () => approved), {
     snapshot: async () => {
       reads++;
@@ -254,6 +266,27 @@ async function loaderFixture(
     if (content.type !== "text") throw new Error("Missing stage advice");
     return { ...JSON.parse(content.text), isError: !!result.isError };
   };
+  const registerNativeChild = (id: string, agent = "omp-reviewer") =>
+    nativeRegistry.register({
+      id,
+      displayName: id,
+      kind: "sub",
+      parentId: "main",
+      status: "idle",
+      session: null,
+      history: { agent },
+      lifecycle: { acceptedAt: Date.now(), terminalAt: Date.now() },
+    });
+  const settled = async () => {
+    const deadline = Date.now() + 3000;
+    for (;;) {
+      const value = await status();
+      if (value.status !== "draining") return value;
+      if (Date.now() >= deadline)
+        throw new Error(`Native fixture did not settle: ${JSON.stringify(value)}`);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  };
   const verify = async () => {
     // This loader fixture deliberately delivers lifecycle events. The real
     // AgentSession cases below exercise actual native reviewer workers instead.
@@ -271,6 +304,7 @@ async function loaderFixture(
       expect(
         await handler({ type: "tool_call", toolName: "task", toolCallId, input }, ctx),
       ).toBeUndefined();
+    registerNativeChild(toolCallId);
     const details = {
       results: [
         {
@@ -307,6 +341,10 @@ async function loaderFixture(
     ctx,
     runtime,
     nativeManager,
+    nativeRegistry,
+    nativeSession,
+    registerNativeChild,
+    settled,
     async evidence(content: string): Promise<string> {
       const id = await sessionManager.saveArtifact(content, "architect-review");
       if (!id) throw new Error("Fixture review artifact was not saved");
@@ -411,7 +449,7 @@ for (const queued of [false, true]) {
       await fixture.extension.commands.get("auto")!.handler("start fixture-change", fixture.ctx);
       expect(notifications.join(" ")).toContain("[native delivery]");
       expect(notifications.join(" ")).not.toContain("PRIVATE DELIVERY ERROR");
-      expect((await fixture.status()).status).toBe("cancelled");
+      expect(await fixture.status()).toMatchObject({ status: "draining", outcome: "needs_user" });
       if (queued) {
         const result = await fixture.extension.handlers.get("context")![0](
           { type: "context", messages: fixture.deliveries },
@@ -422,6 +460,7 @@ for (const queued of [false, true]) {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
       fixture.runtime.sendMessage = send;
+      expect(await fixture.settled()).toMatchObject({ status: "paused", outcome: "needs_user" });
       fixture.bootstraps.length = 0;
       await fixture.start();
       expect((await fixture.status()).status).toBe("running");
@@ -659,6 +698,11 @@ test("brief is frozen after consent; new runs replace instructions and stopped r
     expect(fixture.bootstraps).toHaveLength(1);
     expect((await fixture.status()).steps).toBe("2");
     await fixture.extension.commands.get("auto")!.handler("stop", fixture.ctx);
+    expect(await fixture.settled()).toMatchObject({
+      status: "paused",
+      outcome: "needs_user",
+      steps: "2",
+    });
     await fixture.extension.commands
       .get("auto")!
       .handler("start fixture-change New guidance", fixture.ctx);
@@ -715,7 +759,7 @@ for (const delivery of ["bootstrap", "continuation"] as const) {
             fixture.ctx,
           ),
         ).toMatchObject({ block: true });
-        expect(fixture.counts().aborts).toBeGreaterThan(0);
+        expect(fixture.counts().aborts).toBe(0);
         expect(fixture.bootstraps).toHaveLength(1);
         await fixture.extension.handlers.get("input")![0](
           { type: "input", text: "Fresh unrelated request", source: "interactive" },
@@ -905,7 +949,8 @@ test("real loader default Jev fails closed without TypeSafe credentials or netwo
     expect((await fixture.step()).isError).toBe(true);
     const status = await fixture.status();
     expect(status).toMatchObject({
-      status: "uncertain",
+      status: "draining",
+      outcome: "uncertain",
       decisions: 1,
       completionVerified: false,
     });
@@ -936,7 +981,8 @@ test("real loader default Jev fails closed when OMP key resolution rejects witho
     expect((await fixture.step()).isError).toBe(true);
     const status = await fixture.status();
     expect(status).toMatchObject({
-      status: "uncertain",
+      status: "draining",
+      outcome: "uncertain",
       decisions: 1,
       completionVerified: false,
     });
@@ -962,7 +1008,8 @@ test("real loader stops Auto at its turn cap without another decision or retry",
     await fixture.verify();
     expect(await fixture.stop()).toBeUndefined();
     expect(await fixture.status()).toMatchObject({
-      status: "budget_exhausted",
+      status: "draining",
+      outcome: "budget_exhausted",
       steps: "1/1",
       completionVerified: false,
     });
@@ -989,18 +1036,19 @@ test("real loader stops Auto on tool denial without decision, continuation, or w
       fixture.ctx,
     );
     expect(await fixture.status()).toMatchObject({
-      status: "needs_user",
+      status: "draining",
+      outcome: "needs_user",
       completionVerified: false,
     });
     expect(await fixture.stop()).toBeUndefined();
-    expect(fixture.counts()).toMatchObject({ decisions: 0, aborts: 1 });
+    expect(fixture.counts()).toMatchObject({ decisions: 0, aborts: 0 });
     expect(fixture.bootstraps).toHaveLength(1);
   } finally {
     await fixture.close();
   }
 });
 
-test("real loader gives an unrelated user request ownership and cancels the existing Auto run", async () => {
+test("real loader gives an unrelated user request ownership while holding the existing Auto run", async () => {
   const fixture = await loaderFixture();
   try {
     await fixture.start();
@@ -1017,8 +1065,9 @@ test("real loader gives an unrelated user request ownership and cancels the exis
       fixture.ctx,
     );
     expect(await fixture.status()).toMatchObject({
-      status: "cancelled",
-      reason: "Superseded by new user input",
+      status: "draining",
+      outcome: "needs_user",
+      reason: "Superseded by a new user request",
     });
     await fixture.stop();
     expect(fixture.counts()).toMatchObject({ decisions: 0, aborts: 0 });
@@ -1026,6 +1075,207 @@ test("real loader gives an unrelated user request ownership and cancels the exis
     await fixture.close();
   }
 });
+
+test("new user input releases Main while hidden native starts cannot reset or resume held Auto", async () => {
+  const f = await loaderFixture();
+  try {
+    await f.start();
+    await f.step();
+    await f.extension.commands.get("auto")!.handler("stop", f.ctx);
+    const held = await f.settled();
+    expect(held).toMatchObject({ status: "paused", outcome: "needs_user" });
+    await f.extension.handlers.get("input")![0](
+      { type: "input", text: "Inspect another scoped change", source: "interactive" },
+      f.ctx,
+    );
+    await f.extension.handlers.get("before_agent_start")![0](
+      { type: "before_agent_start", prompt: "Inspect another scoped change", systemPrompt: [] },
+      f.ctx,
+    );
+    expect(
+      await f.extension.handlers.get("tool_call")![0](
+        {
+          type: "tool_call",
+          toolName: "write",
+          toolCallId: "new-user-write",
+          input: { path: "new-request.txt", content: "Authorized Main work" },
+        },
+        f.ctx,
+      ),
+    ).toBeUndefined();
+    const plan = await f.extension.tools.get("architect_checkpoint")!.definition.execute(
+      "new-user-plan",
+      {
+        phase: "plan",
+        evidenceRef: await f.evidence("Inspect another scoped change"),
+        steps: ["Inspect", "Implement", "Verify"],
+      },
+      undefined,
+      undefined,
+      f.ctx,
+    );
+    expect(plan.isError).toBe(false);
+    expect(await f.status()).toMatchObject({
+      status: "paused",
+      outcome: "needs_user",
+      architect: { attempts: { plan: 1 } },
+    });
+    await f.extension.handlers.get("turn_start")![0](
+      { type: "turn_start", turnIndex: 1, timestamp: Date.now() },
+      f.ctx,
+    );
+    await f.extension.handlers.get("before_agent_start")![0](
+      { type: "before_agent_start", prompt: "Native IRC result follow-up", systemPrompt: [] },
+      f.ctx,
+    );
+    expect(await f.status()).toMatchObject({
+      status: "paused",
+      outcome: "needs_user",
+      steps: held.steps,
+      decisions: held.decisions,
+      architect: { attempts: { plan: 1 } },
+    });
+    expect((await f.step()).isError).toBe(true);
+    expect(f.bootstraps).toHaveLength(1);
+    expect(f.counts().aborts).toBe(0);
+  } finally {
+    await f.close();
+  }
+});
+
+test("Auto stop drains native work without cancelling or consuming its result", async () => {
+  const f = await loaderFixture();
+  const body = Promise.withResolvers<string>();
+  const mainIdle = Promise.withResolvers<void>();
+  const idleWaitStarted = Promise.withResolvers<void>();
+  let nativeSignal: AbortSignal | undefined;
+  const cancel = spyOn(f.nativeManager, "cancel");
+  const cancelAll = spyOn(f.nativeManager, "cancelAll");
+  const acknowledge = spyOn(f.nativeManager, "acknowledgeDeliveries");
+  const consume = spyOn(f.nativeManager, "consumeJobResults");
+  f.nativeSession.waitForIdle = async () => {
+    idleWaitStarted.resolve();
+    await mainIdle.promise;
+  };
+  try {
+    await f.start();
+    const id = f.nativeManager.register(
+      "bash",
+      "native operation",
+      async ({ signal }) => {
+        nativeSignal = signal;
+        return body.promise;
+      },
+      { ownerId: "main" },
+    );
+    await f.extension.commands.get("auto")!.handler("stop", f.ctx);
+    expect(await f.status()).toMatchObject({
+      status: "draining",
+      outcome: "needs_user",
+      completionVerified: false,
+      nativeWork: { pending: true },
+    });
+    expect(nativeSignal?.aborted).toBe(false);
+    expect(f.nativeManager.getJob(id)?.status).toBe("running");
+    await f.extension.commands.get("auto")!.handler("start fixture-change", f.ctx);
+    expect(f.bootstraps).toHaveLength(1);
+    const gate = f.extension.handlers.get("tool_call")![0];
+    expect(
+      await gate(
+        {
+          type: "tool_call",
+          toolName: "write",
+          toolCallId: "late-auto-write",
+          input: { path: "fixture.ts", content: "late" },
+        },
+        f.ctx,
+      ),
+    ).toMatchObject({ block: true });
+    expect(
+      await gate(
+        { type: "tool_call", toolName: "wait", toolCallId: "native-wait", input: {} },
+        f.ctx,
+      ),
+    ).toBeUndefined();
+    body.resolve("Native result is still deliverable");
+    await f.nativeManager.getJob(id)!.promise;
+    await idleWaitStarted.promise;
+    expect(await f.status()).toMatchObject({ status: "draining", outcome: "needs_user" });
+    mainIdle.resolve();
+    expect(await f.settled()).toMatchObject({
+      status: "paused",
+      outcome: "needs_user",
+      completionVerified: false,
+    });
+    expect(f.nativeManager.getJob(id)).toMatchObject({
+      status: "completed",
+      resultText: "Native result is still deliverable",
+    });
+    expect(f.nativeManager.isJobResultConsumed(id)).toBe(false);
+    expect(cancel).not.toHaveBeenCalled();
+    expect(cancelAll).not.toHaveBeenCalled();
+    expect(acknowledge).not.toHaveBeenCalled();
+    expect(consume).not.toHaveBeenCalled();
+    expect(f.counts().aborts).toBe(0);
+    expect(f.bootstraps).toHaveLength(1);
+  } finally {
+    body.resolve("cleanup");
+    mainIdle.resolve();
+    cancel.mockRestore();
+    cancelAll.mockRestore();
+    acknowledge.mockRestore();
+    consume.mockRestore();
+    await f.close();
+  }
+});
+
+for (const fresh of [true, false]) {
+  test(`Auto completion waits detached Main settlement and ${fresh ? "certifies fresh" : "rejects changed"} facts`, async () => {
+    const mainIdle = Promise.withResolvers<void>();
+    const idleWaitStarted = Promise.withResolvers<void>();
+    let changed = false;
+    const f = await loaderFixture(
+      {},
+      {
+        dependencies: {
+          snapshot: async () => ({
+            ...snapshot(2),
+            fingerprint: changed ? "changed-after-review" : "fixture-2",
+          }),
+        },
+      },
+    );
+    f.nativeSession.waitForIdle = async () => {
+      idleWaitStarted.resolve();
+      await mainIdle.promise;
+    };
+    try {
+      await f.start();
+      await f.verify();
+      expect((await f.checkpoint()).isError).toBe(false);
+      // onStop must return before Main's idle wait can resolve.
+      expect(await f.stop()).toBeUndefined();
+      await idleWaitStarted.promise;
+      expect(await f.status()).toMatchObject({
+        status: "draining",
+        outcome: "completed",
+        completionVerified: false,
+      });
+      changed = !fresh;
+      mainIdle.resolve();
+      expect(await f.settled()).toMatchObject({
+        status: fresh ? "completed" : "paused",
+        outcome: "completed",
+        completionVerified: fresh,
+      });
+      expect(f.counts().aborts).toBe(0);
+      expect(f.bootstraps).toHaveLength(1);
+    } finally {
+      mainIdle.resolve();
+      await f.close();
+    }
+  });
+}
 
 test("real loader denies subagents Auto ownership, status, and lifecycle continuation", async () => {
   const fixture = await loaderFixture();
@@ -1177,9 +1427,16 @@ for (const valid of [true, false]) {
       expect(validations).toBe(2);
       expect(reviews).toBe(valid ? 1 : 0);
       expect(await fixture.status()).toMatchObject({
-        status: valid ? "completed" : "blocked",
+        status: "draining",
+        outcome: valid ? "completed" : "blocked",
+        completionVerified: false,
+      });
+      expect(await fixture.settled()).toMatchObject({
+        status: valid ? "completed" : "paused",
+        outcome: valid ? "completed" : "blocked",
         completionVerified: valid,
       });
+      expect(validations).toBe(valid ? 3 : 2);
     } finally {
       await fixture.close();
     }
@@ -1259,16 +1516,28 @@ for (const phase of ["unadmitted", "apply", "verify", "review", "triage", "fix"]
         else expect(admission).toMatchObject({ block: true });
       }
       for (const [toolName, input] of [
-        ["write", { path: "agent://finished-leaf", content: "Resume untracked work" }],
-        ["send", { agent: "finished-leaf", message: "Resume untracked work" }],
-        ["irc", { target: "finished-leaf", message: "Resume untracked work" }],
+        [
+          "write",
+          {
+            path: "agent://finished-leaf",
+            content: "Read the current fixture and report findings",
+          },
+        ],
+        [
+          "send",
+          { agent: "finished-leaf", message: "Read the current fixture and report findings" },
+        ],
+        [
+          "irc",
+          { target: "finished-leaf", message: "Read the current fixture and report findings" },
+        ],
       ] as const)
         expect(
           await fixture.extension.handlers.get("tool_call")![0](
             { type: "tool_call", toolName, input, toolCallId: `${phase}-revive-${toolName}` },
             fixture.ctx,
           ),
-        ).toMatchObject({ block: true });
+        ).toBeUndefined();
       expect(await fixture.status()).toMatchObject({
         status: "running",
         completionVerified: false,
@@ -1309,6 +1578,7 @@ test("parallel reviewer receipts stay bound to their admitted sequential verific
       ).toBeUndefined();
   };
   const receipt = async (toolCallId: string) => {
+    fixture.registerNativeChild(toolCallId);
     for (const handler of fixture.extension.handlers.get("tool_result") ?? [])
       await handler(
         {
@@ -1402,7 +1672,11 @@ test("uncharged oversized enriched completion evidence can be corrected within t
     });
     expect((await fixture.checkpoint()).isError).toBe(false);
     await fixture.stop();
-    expect(await fixture.status()).toMatchObject({ status: "completed", completionVerified: true });
+    expect(await fixture.status()).toMatchObject({ status: "draining", completionVerified: false });
+    expect(await fixture.settled()).toMatchObject({
+      status: "completed",
+      completionVerified: true,
+    });
     expect(reviews).toBe(1);
   } finally {
     await fixture.close();
@@ -1591,8 +1865,12 @@ test("real loader preserves identical preparation retries but rejects replay aft
       fixture.ctx,
     );
     await fixture.extension.handlers.get("before_agent_start")![0](event, fixture.ctx);
-    expect(await fixture.status()).toMatchObject({ status: "cancelled", steps: "1" });
-    expect(fixture.counts()).toMatchObject({ decisions: 0, aborts: 1 });
+    expect(await fixture.status()).toMatchObject({
+      status: "draining",
+      outcome: "needs_user",
+      steps: "1",
+    });
+    expect(fixture.counts()).toMatchObject({ decisions: 0, aborts: 0 });
   } finally {
     await fixture.close();
   }
@@ -1648,9 +1926,13 @@ for (const interrupt of ["status", "unexpected-hidden", "new-user"] as const) {
         expect(await fixture.status()).toMatchObject({ status: "running", steps: "3" });
         expect(fixture.counts().decisions).toBe(2);
       } else {
-        expect(await fixture.status()).toMatchObject({ status: "cancelled", steps: "2" });
+        expect(await fixture.status()).toMatchObject({
+          status: "draining",
+          outcome: "needs_user",
+          steps: "2",
+        });
         expect(fixture.counts().decisions).toBe(2);
-        expect(fixture.counts().aborts).toBe(interrupt === "unexpected-hidden" ? 1 : 0);
+        expect(fixture.counts().aborts).toBe(0);
       }
     } finally {
       await fixture.close();
@@ -1670,7 +1952,7 @@ for (const mode of [
   "brief",
   "cancel-delivery",
 ] as const) {
-  test(`real OMP session ${mode === "cancel-delivery" ? "rejects cancelled queued delivery before model inference" : mode === "max-cap" ? "enforces an explicit one-turn cap without terminal retry" : `completes ${mode} with two architect reviews`}`, async () => {
+  test(`real OMP session ${mode === "cancel-delivery" ? "holds cancelled queued delivery without aborting the native turn" : mode === "max-cap" ? "enforces an explicit one-turn cap without terminal retry" : `completes ${mode} with two architect reviews`}`, async () => {
     let executable: string | undefined;
     if (mode === "real-cli") {
       executable = process.env.RASEN_BIN;
@@ -1957,7 +2239,11 @@ for (const mode of [
               : requests;
           if (mode === "real-cli" && step !== "wait" && step !== undefined)
             executedRealCliSteps.push(step);
-          if (requests === 1)
+          if (mode === "cancel-delivery") {
+            // The host may still call the provider. Our cancelled instructions
+            // must be absent, and Auto must not create another scheduling turn.
+            expect(JSON.stringify(context.messages)).not.toContain("Auto run:");
+          } else if (requests === 1)
             call("auto_step", { summary: "Initial extension-owned prepared-change frontier" });
           else if (step === "wait") call("wait", {});
           else if (step === "reads") {
@@ -2294,13 +2580,35 @@ for (const mode of [
       );
       await Promise.all(sends);
       await session.waitForIdle();
+      const tool = session.extensionRunner!.getRegisteredTool("auto_status")!.definition;
+      const readStatus = () =>
+        tool.execute("status", {}, undefined, undefined, session!.extensionRunner!.createContext());
+      let result = await readStatus();
+      const drainDeadline = Date.now() + 20000;
+      for (;;) {
+        if (result.content[0].type !== "text") throw new Error("Missing status text");
+        const observed = JSON.parse(result.content[0].text);
+        if (observed.status === "completed" || observed.status === "paused") break;
+        expect(["running", "draining"]).toContain(observed.status);
+        expect(observed.completionVerified).toBe(false);
+        if (Date.now() >= drainDeadline)
+          throw new Error(`Native Auto did not drain: ${result.content[0].text}`);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        result = await readStatus();
+      }
+      if (result.content[0].type !== "text") throw new Error("Missing status text");
       expect(errors).toEqual([]);
       if (mode === "cancel-delivery") {
-        expect(requests).toBe(0);
+        expect(requests).toBe(1);
         expect(reads).toBeGreaterThanOrEqual(1);
         expect(decisions).toBe(0);
         expect(reviews).toBe(0);
         expect(session.isStreaming).toBe(false);
+        expect(JSON.parse(result.content[0].text)).toMatchObject({
+          status: "paused",
+          outcome: "needs_user",
+          completionVerified: false,
+        });
         return;
       }
       for (const prompt of prompts) {
@@ -2345,7 +2653,7 @@ for (const mode of [
       else expect(requests).toBe(mode === "max-cap" ? 6 : 11);
       if (mode !== "real-cli") expect(reads).toBeGreaterThanOrEqual(mode === "max-cap" ? 3 : 4);
       expect(decisions).toBe(mode === "max-cap" ? 3 : mode === "real-cli" ? 6 : 4);
-      expect(validations).toBe(mode === "max-cap" ? 1 : 3);
+      expect(validations).toBe(mode === "max-cap" ? 1 : 4);
       expect(reviews).toBe(mode === "max-cap" ? 0 : 2);
       expect(beforeStarts).toBe(0);
       expect(stops).toEqual([false]);
@@ -2363,18 +2671,10 @@ for (const mode of [
             ? "Add the missing fixture footer"
             : "Minimum independent review rounds not yet met",
         );
-      const tool = session.extensionRunner!.getRegisteredTool("auto_status")!.definition;
-      const result = await tool.execute(
-        "status",
-        {},
-        undefined,
-        undefined,
-        session.extensionRunner!.createContext(),
-      );
-      expect(result.content[0].type).toBe("text");
-      if (result.content[0].type !== "text") throw new Error("Missing status text");
+
       expect(JSON.parse(result.content[0].text)).toMatchObject({
-        status: mode === "max-cap" ? "budget_exhausted" : "completed",
+        status: mode === "max-cap" ? "paused" : "completed",
+        outcome: mode === "max-cap" ? "budget_exhausted" : "completed",
         steps: mode === "max-cap" ? "1/1" : "1",
         completionVerified: mode !== "max-cap",
         hostWorkflow: { phase: mode === "max-cap" ? "review" : "settled" },
@@ -2483,7 +2783,7 @@ for (const mode of [
       auth.close();
       await fs.rm(cwd, { recursive: true, force: true });
     }
-  }, 60000);
+  }, 90000);
 }
 
 test.each([
@@ -2522,12 +2822,13 @@ test.each([
     );
     expect(result.isError).toBe(true);
     expect(await f.status()).toMatchObject({
-      status: "blocked",
+      status: "draining",
+      outcome: "blocked",
       architect: { completionApproved: false },
     });
     expect(await f.stop()).toBeUndefined();
     expect(await f.stop()).toBeUndefined();
-    expect(f.counts()).toMatchObject({ decisions: 0, aborts: 1 });
+    expect(f.counts()).toMatchObject({ decisions: 0, aborts: 0 });
     expect(reviews).toBe(phase === "blocked" ? 0 : 1);
     const messages = f.messages.length;
     const gate = f.extension.handlers.get("tool_call")![0];
@@ -2550,7 +2851,7 @@ test.each([
       ),
     ).toMatchObject({ block: true });
     expect(f.messages).toHaveLength(messages);
-    expect(f.counts()).toMatchObject({ decisions: 0, aborts: 1 });
+    expect(f.counts()).toMatchObject({ decisions: 0, aborts: 0 });
   } finally {
     await f.close();
   }
@@ -2579,9 +2880,9 @@ test("Auto cancelled final recovery attempt stops without CLI or decision retry"
         undefined,
         f.ctx,
       );
-    expect(await f.status()).toMatchObject({ status: "blocked" });
+    expect(await f.status()).toMatchObject({ status: "draining", outcome: "blocked" });
     expect(await f.stop()).toBeUndefined();
-    expect(f.counts()).toMatchObject({ decisions: 0, aborts: 1 });
+    expect(f.counts()).toMatchObject({ decisions: 0, aborts: 0 });
   } finally {
     await f.close();
   }
@@ -2600,6 +2901,10 @@ test("explicitly confirmed Auto restart can begin after a terminal architect sto
         undefined,
         f.ctx,
       );
+    expect(await f.status()).toMatchObject({ status: "draining", outcome: "blocked" });
+    await f.extension.commands.get("auto")!.handler("start fixture-change", f.ctx);
+    expect(f.bootstraps).toHaveLength(1);
+    expect(await f.settled()).toMatchObject({ status: "paused", outcome: "blocked" });
     await f.extension.commands.get("auto")!.handler("start fixture-change", f.ctx);
     expect(f.bootstraps).toHaveLength(2);
     await f.extension.handlers.get("before_agent_start")![0](
@@ -2639,7 +2944,7 @@ test("active Auto status calls keep their tool budget, and terminal diagnostics 
         f.ctx,
       ),
     ).toMatchObject({ block: true });
-    expect(await f.status()).toMatchObject({ status: "budget_exhausted" });
+    expect(await f.status()).toMatchObject({ status: "draining", outcome: "budget_exhausted" });
     expect(
       await gate(
         { type: "tool_call", toolCallId: "terminal-status", toolName: "auto_status", input: {} },
@@ -2658,7 +2963,7 @@ test("active Auto status calls keep their tool budget, and terminal diagnostics 
       ),
     ).toBeUndefined();
     expect(await f.stop()).toBeUndefined();
-    expect(f.counts()).toMatchObject({ decisions: 0, aborts: 1 });
+    expect(f.counts()).toMatchObject({ decisions: 0, aborts: 0 });
   } finally {
     await f.close();
   }
@@ -2790,7 +3095,7 @@ for (const interrupt of [
           f.ctx,
         ),
       ).toEqual({ messages: [] });
-      expect(f.counts().aborts).toBe(aborts + 1);
+      expect(f.counts().aborts).toBe(aborts);
       const user = {
         role: "user",
         content: [{ type: "text", text: "New request" }],
@@ -2802,7 +3107,7 @@ for (const interrupt of [
           f.ctx,
         ),
       ).toEqual({ messages: [user] });
-      expect(f.counts().aborts).toBe(aborts + 1);
+      expect(f.counts().aborts).toBe(aborts);
     } finally {
       await f.close();
     }
@@ -2904,7 +3209,7 @@ for (const userKind of ["text", "skill"] as const) {
         ),
       ).toEqual({ messages: [user] });
       expect(f.counts().aborts).toBe(0);
-      expect(await f.status()).toMatchObject({ status: "cancelled" });
+      expect(await f.status()).toMatchObject({ status: "draining", outcome: "needs_user" });
       await f.extension.handlers.get("agent_end")![0](
         { type: "agent_end", messages: [], willContinue: false },
         f.ctx,
@@ -2919,7 +3224,7 @@ for (const userKind of ["text", "skill"] as const) {
           f.ctx,
         ),
       ).toEqual({ messages: [user, assistant] });
-      expect(f.counts().aborts).toBe(1);
+      expect(f.counts().aborts).toBe(0);
     } finally {
       await f.close();
     }
@@ -2953,7 +3258,11 @@ test("Jev selects recorded stage frontiers, caches task-only churn, and never su
       architect: { completionApproved: false },
     });
     expect(await f.stop()).toBeUndefined();
-    expect(await f.status()).toMatchObject({ status: "needs_user", completionVerified: false });
+    expect(await f.status()).toMatchObject({
+      status: "draining",
+      outcome: "needs_user",
+      completionVerified: false,
+    });
     expect(f.counts().decisions).toBe(2);
   } finally {
     await f.close();
@@ -2972,7 +3281,7 @@ for (const choice of ["replan", "needs_user"] as const) {
       expect(await f.status()).toMatchObject(
         choice === "replan"
           ? { status: "running", architect: { pendingRecovery: true, completionApproved: false } }
-          : { status: "needs_user", completionVerified: false },
+          : { status: "draining", outcome: "needs_user", completionVerified: false },
       );
       if (choice === "replan") expect(advice.instruction).toContain("recovery");
       else expect(advice.isError).toBe(true);
@@ -2999,7 +3308,8 @@ test("premature LEAD stop requires user input without an invented task loop or r
     await f.start();
     expect(await f.stop()).toBeUndefined();
     expect(await f.status()).toMatchObject({
-      status: "needs_user",
+      status: "draining",
+      outcome: "needs_user",
       steps: "1",
       decisions: 0,
       completionVerified: false,
@@ -3042,20 +3352,23 @@ test("terminal tool cap retains fresh CLI progress and diagnostic failures never
       ),
     ).toMatchObject({ block: true });
     expect(await f.status()).toMatchObject({
-      status: "budget_exhausted",
+      status: "draining",
+      outcome: "budget_exhausted",
       toolCalls: "1/1",
       progress: { total: 2, complete: 1, remaining: 1 },
       completionVerified: false,
     });
     completed = 2;
     expect(await f.status()).toMatchObject({
-      status: "budget_exhausted",
+      status: "draining",
+      outcome: "budget_exhausted",
       progress: { complete: 2, remaining: 0 },
       completionVerified: false,
     });
     unavailable = true;
     expect(await f.status()).toMatchObject({
-      status: "budget_exhausted",
+      status: "draining",
+      outcome: "budget_exhausted",
       progress: { complete: 2 },
       observation: { error: expect.stringContaining("last known") },
       completionVerified: false,
@@ -3177,7 +3490,8 @@ test("fresh status diagnostics do not reset the no-output watchdog", async () =>
       ),
     ).toMatchObject({ block: true });
     expect(await f.status()).toMatchObject({
-      status: "stalled",
+      status: "draining",
+      outcome: "stalled",
       reason: expect.stringContaining("output"),
       completionVerified: false,
       supervision: { lastActivityAt: before.supervision.lastActivityAt },
@@ -3279,7 +3593,11 @@ test("Jev advice rejects an in-flight stage-status change even when completed/re
       status: "running",
       architect: { pendingRecovery: false },
     });
-    expect(await f.step()).toMatchObject({ status: "needs_user", isError: true });
+    expect(await f.step()).toMatchObject({
+      status: "draining",
+      outcome: "needs_user",
+      isError: true,
+    });
     expect(decisions).toBe(1);
   } finally {
     release.resolve();
@@ -3289,7 +3607,7 @@ test("Jev advice rejects an in-flight stage-status change even when completed/re
 });
 
 for (const mixed of [false, true]) {
-  test(`stale Auto async delivery preserves a newer active user turn, mixed=${mixed}`, async () => {
+  test(`native async delivery remains intact for a newer user turn, mixed=${mixed}`, async () => {
     const f = await loaderFixture();
     try {
       await f.start();
@@ -3348,9 +3666,9 @@ for (const mixed of [false, true]) {
         f.ctx,
       );
       expect(f.counts().aborts).toBe(aborts);
-      expect(JSON.stringify(result)).not.toContain("STALE BODY");
-      if (mixed) expect(JSON.stringify(result)).toContain("unrelated-job");
-      else expect(result).toEqual({ messages });
+      expect(result).toEqual({ messages: [...messages, delivery] });
+      expect(f.nativeManager.getJob(id)?.status).toBe("completed");
+      expect((await f.status()).outcome).toBe("needs_user");
     } finally {
       await f.close();
     }

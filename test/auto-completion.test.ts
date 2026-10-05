@@ -2,10 +2,12 @@ import { expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type {
-  ExtensionAPI,
-  ExtensionCommandContext,
-  ExtensionContext,
+import {
+  AgentRegistry,
+  type AgentSession,
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+  type ExtensionContext,
 } from "@oh-my-pi/pi-coding-agent";
 import { createAutoController } from "../src/auto/extension.ts";
 import {
@@ -38,6 +40,9 @@ async function fixture(verify = true) {
   const tools = new Map<string, Parameters<ExtensionAPI["registerTool"]>[0]>();
   const handlers = new Map<string, Array<(event: never, ctx: ExtensionContext) => unknown>>();
   const notifications: string[] = [];
+  const statuses: Array<{ status: string; outcome: string | null }> = [];
+  const paused = Promise.withResolvers<{ status: string; outcome: string | null }>();
+  let aborts = 0;
   const pi = {
     registerCommand: (name: string, command: Parameters<ExtensionAPI["registerCommand"]>[1]) =>
       commands.set(name, command),
@@ -45,7 +50,12 @@ async function fixture(verify = true) {
     on: (name: string, handler: (event: never, ctx: ExtensionContext) => unknown) =>
       handlers.set(name, [...(handlers.get(name) ?? []), handler]),
     events: { on() {} },
-    sendMessage() {},
+    sendMessage(message: { customType: string; content: string }) {
+      if (message.customType !== "omp-auto") return;
+      const status = JSON.parse(message.content);
+      statuses.push(status);
+      if (status.status === "paused") paused.resolve(status);
+    },
     pi: { getAgentDir: () => path.join(cwd, "agent") },
     typebox: {
       Type: { Object() {}, String() {}, Optional() {}, Literal() {} },
@@ -56,7 +66,9 @@ async function fixture(verify = true) {
     agent: { kind: "main", id: "main" },
     hasUI: true,
     isIdle: () => true,
-    abort() {},
+    abort() {
+      aborts++;
+    },
     ui: { custom: async () => true, notify: (message: string) => notifications.push(message) },
     sessionManager: {
       getSessionId: () => "fixture-session",
@@ -69,14 +81,27 @@ async function fixture(verify = true) {
       },
     },
   } as unknown as ExtensionCommandContext;
-  const nativeHost = {
-    session: {
-      sessionId: "fixture-session",
-      getAgentId: () => "main",
-      asyncJobManager: { getAllJobs: () => [] },
-    },
-    registry: { get: () => undefined },
-  } as unknown as NativeAsyncHost;
+  const registry = new AgentRegistry();
+  const manager = { getAllJobs: () => [], waitForOwnerJobs: async () => {} };
+  const session = (id: string) =>
+    ({
+      sessionId: id === "main" ? "fixture-session" : `fixture-session-${id}`,
+      getAgentId: () => id,
+      asyncJobManager: manager,
+      isStreaming: false,
+      hasAdmittedSubmission: false,
+      hasPendingAsyncWork: () => false,
+      waitForAdmittedSubmissions: async () => {},
+      waitForIrcReplies: async () => {},
+      settleAsyncWork: async () => {},
+      waitForIdle: async () => {},
+      abort: async () => {
+        aborts++;
+      },
+    }) as unknown as AgentSession;
+  const main = session("main");
+  registry.register({ id: "main", displayName: "Main", kind: "main", session: main });
+  const nativeHost: NativeAsyncHost = { session: main, registry };
   const snapshot: RasenSnapshot = {
     change: "fixture-change",
     root: cwd,
@@ -154,6 +179,15 @@ async function fixture(verify = true) {
     if (verify) {
       expect((await step()).allowedNextPhase).toBe("verify");
       expect(controller.toolCall("verify-task", "task", {}, ctx)).toBeUndefined();
+      registry.register({
+        id: "verify-child",
+        parentId: "main",
+        displayName: "Fixture reviewer",
+        kind: "sub",
+        session: session("verify-child"),
+        status: "idle",
+        history: { agent: "omp-reviewer" },
+      });
       for (const handler of handlers.get("tool_result") ?? [])
         await handler(
           {
@@ -162,7 +196,7 @@ async function fixture(verify = true) {
             details: {
               results: [
                 {
-                  id: "verify-task",
+                  id: "verify-child",
                   agent: "omp-reviewer",
                   exitCode: 0,
                   output: "Independent fixture inspection passed with no blocking findings",
@@ -177,6 +211,10 @@ async function fixture(verify = true) {
     return {
       architect,
       controller,
+      ctx,
+      statuses,
+      paused: () => paused.promise,
+      aborts: () => aborts,
       step: (signal?: AbortSignal) =>
         tools
           .get("auto_step")!
@@ -229,6 +267,7 @@ for (const stage of ["change snapshot", "workflow", "validation", "review"] as c
       expect(f.architect.completionApproved).toBe(false);
       expect(f.architect.phaseReviews.completion).toBe(0);
       expect(f.reviews()).toBe(0);
+      expect(f.aborts()).toBe(0);
     } finally {
       await f.close();
     }
@@ -299,6 +338,9 @@ for (const stage of ["change snapshot", "workflow", "advice"] as const) {
       expect(f.architect.completionApproved).toBe(false);
       expect(f.architect.phaseReviews.completion).toBe(0);
       expect(f.reviews()).toBe(0);
+      expect(f.statuses.at(-1)).toMatchObject({ status: "draining", outcome: "blocked" });
+      expect(await f.paused()).toMatchObject({ status: "paused", outcome: "blocked" });
+      expect(f.aborts()).toBe(0);
     } finally {
       await f.close();
     }
@@ -317,8 +359,48 @@ for (const stage of ["change snapshot", "workflow", "advice"] as const) {
       expect(f.architect.completionApproved).toBe(false);
       expect(f.architect.phaseReviews.completion).toBe(0);
       expect(f.reviews()).toBe(0);
+      expect(f.statuses.at(-1)).toMatchObject({ status: "draining", outcome: "blocked" });
+      expect(await f.paused()).toMatchObject({ status: "paused", outcome: "blocked" });
+      expect(f.aborts()).toBe(0);
     } finally {
       await f.close();
     }
   });
 }
+
+test("paused Auto preserves native result and IRC context without physically aborting execution", async () => {
+  const f = await fixture(false);
+  try {
+    f.inject("advice", new AutoPreflightError("Stage advice unavailable"));
+    await f.step();
+    await f.paused();
+    const messages: Parameters<typeof f.controller.context>[0]["messages"] = [
+      {
+        role: "custom",
+        customType: "async-result",
+        content: "Native task result received after the Auto scheduling pause",
+        display: true,
+        timestamp: Date.now(),
+      },
+      {
+        role: "custom",
+        customType: "irc:incoming",
+        content: "Native incoming peer response",
+        display: true,
+        details: { from: "verify-child", id: "late-native-incoming", message: "Review result" },
+        timestamp: Date.now(),
+      },
+      {
+        role: "custom",
+        customType: "irc:relay",
+        content: "Native relayed result",
+        display: true,
+        timestamp: Date.now(),
+      },
+    ];
+    expect(f.controller.context({ type: "context", messages }, f.ctx)).toEqual(messages);
+    expect(f.aborts()).toBe(0);
+  } finally {
+    await f.close();
+  }
+});

@@ -8,7 +8,53 @@ context and public Rasen pipeline observations; it does not load the generated
 it uses session-local apply/verification/review phases without creating external
 pipeline state. See [setup and limits](rasen-auto.md) for the current contract.
 
-## Extension-owned flow verification (2026-10-05)
+## Native lifecycle revision (2026-10-05)
+
+OMP retains execution, task/Bash/Eval jobs, messages, IRC, wake/revival, rereview,
+result delivery, and cancellation. Auto adds semantic dispatch, Jev advice, and
+bounded Architect review without execute/wake-observer patches or a replacement
+async execution scope. `/auto stop` and new user input revoke new Auto work,
+preserve native results, and drain already-admitted work. The lifecycle is
+`running → draining → paused/completed`; native force-cancellation is separate.
+
+Public quiescence checks conservatively include Main-owned jobs and native
+descendants. Unrelated same-Main work can delay Auto but is not cancelled or
+appropriated as review evidence. Interrupted native `ensureLive` dispatch may
+remain publicly unobservable; Auto exposes settlement uncertainty and holds the
+run rather than reporting completion. Evidence binds a review request, revision,
+required check, and native producer receipt separately from the child agent ID,
+allowing a fresh rereview from the same child without reusing stale evidence.
+
+The frozen locked **OMP 18.6.0** run passed:
+
+- Formatting and TypeScript
+- **425 unit/installer tests / 2,897 assertions**
+- **195 full-suite smoke tests / 1,908 assertions**
+- **46-entry** packed extension loading and workflow/ruleset checks
+
+Isolated compatibility runs on **OMP 18.5.1**, **18.6.0**, and **18.6.1** each
+passed all six check groups: TypeScript, **105 focused tests / 899 assertions**,
+**23 native-worker tests / 333 assertions**, **7 real-session tests / 216 assertions**,
+**4 sparse/bundled-host cases / 87 assertions**, and **46-entry** packed loading.
+All 18 groups passed against unchanged, source-matching execution/test snapshots
+(executable manifest SHA-256:
+`d230f65484bcdfd20dd973175575ec9db4742af3815b91e736a1e0e88ac2b710`).
+These compatibility checks are focused suites, not full aggregate reruns; the
+full unit/installer and smoke totals above ran on the locked host.
+
+Model and decision responses remain local fixtures. Child journals use the SDK
+memory backend because native OS journal locks fail with `EPERM` in this executor;
+native Bash fixtures use test-only `launch.enabled: false`. Production settings
+are unchanged. This record does not claim live paid-provider execution, persistent
+native journal-lock coverage, cross-platform execution, or remote CI success. See
+[the operating contract](rasen-auto.md#native-async-ownership-and-stopping).
+
+All dated records below describe earlier source revisions. Their test counts,
+exact-owned cancellation, native-result filtering, one-shot worker restrictions,
+and generated-skill loading claims are historical evidence only. They do not
+specify the current lifecycle or establish current-version compatibility.
+
+## Historical extension-owned flow verification (2026-10-05)
 
 On locked OMP **18.6.0**, Bun **1.3.14**, actual Node **24.19.0**, and the pinned
 Rasen `0.1.8 (dev.local f0ae20d)` build:
@@ -293,7 +339,11 @@ case retry and a subsequent complete 119-test smoke rerun passed. The cause of
 that initial timing-sensitive result was not established. No live model provider
 or user profile was used, and these local results do not establish remote CI.
 
-## Native async ownership revision (2026-10-05)
+## Historical native async ownership revision (2026-10-05)
+
+This superseded revision cancelled exact-owned jobs and filtered stale native
+results. The current lifecycle above deliberately removes both behaviors; this
+section records only what was tested at that earlier revision.
 
 Auto no longer requires `async.enabled`, `bash.autoBackground.enabled`, or
 `eval.autoBackground.enabled` to be false. It leaves host settings unchanged and
@@ -348,7 +398,7 @@ Model responses and review/decision providers remain deterministic local fixture
 No paid provider run, private upload, publishing, merge, deployment, or
 macOS/Windows execution is claimed. Remote CI must verify the published commit.
 
-## Completion diagnostics and durable fixture evidence (2026-10-05)
+## Historical completion diagnostics and durable fixture evidence (2026-10-05)
 
 The real-CLI fixture now follows native task settlement instead of indexing its
 script by model-request count. It retains observed terminal job receipts before

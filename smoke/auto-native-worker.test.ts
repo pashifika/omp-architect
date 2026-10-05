@@ -19,9 +19,18 @@ import { MemorySessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-
 import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { extensionFactory } from "../src/extension.ts";
 import type { RasenSnapshot } from "../src/auto/rasen.ts";
+import { fallbackWorkflow } from "../src/auto/workflow.ts";
 import { withAgentDir } from "./isolated-host.ts";
 
-type Mode = "success" | "prompt" | "deny" | "cancel" | "child-abort" | "recursion" | "nested-bash";
+type Mode =
+  | "success"
+  | "prompt"
+  | "deny"
+  | "held-yield"
+  | "child-abort"
+  | "recursion"
+  | "nested-bash"
+  | "messages";
 type NativeEvent = {
   id: string;
   event: {
@@ -46,10 +55,19 @@ type NativeLifecycle = {
  */
 async function nativeFixture(
   mode: Mode,
-  options: { detached?: boolean; mainMode?: "pause" | "wait" | "stream" } = {},
+  options: {
+    detached?: boolean;
+    mainMode?: "pause" | "wait" | "stream";
+    parked?: boolean;
+    verification?: boolean;
+    activeSteering?: boolean;
+  } = {},
 ) {
   const detached = options.detached ?? false;
   const mainMode = options.mainMode ?? "pause";
+  const verification = options.verification ?? false;
+  const activeSteering = options.activeSteering ?? false;
+  const agent = verification ? "omp-reviewer" : "omp-worker";
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-auto-native-"));
   const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
   if (mode === "nested-bash") {
@@ -76,11 +94,15 @@ async function nativeFixture(
     "memory.backend": "off",
     "async.enabled": detached,
     "bash.autoBackground.enabled": false,
+    // Exercise native async Bash jobs, not named-service process launching.
+    "launch.enabled": false,
     "tools.approvalMode": "yolo",
     "tools.approval.bash": mode === "nested-bash" ? "allow" : mode === "prompt" ? "prompt" : "deny",
     "task.speculativeLaunch": false,
     "task.maxRuntimeMs": 30000,
-    "task.agentIdleTtlMs": 1,
+    // Park once before rerequest, then consume the revived session's evidence
+    // while live. MemorySessionStorage does not verify disk-only transcript reads.
+    "task.agentIdleTtlMs": mode === "messages" ? (options.parked ? 1000 : 60000) : 1,
     modelRoles: Object.fromEntries(
       [
         "default",
@@ -96,8 +118,8 @@ async function nativeFixture(
     ),
   });
   await Bun.write(
-    path.join(cwd, ".omp/agents/omp-worker.md"),
-    await Bun.file(path.resolve(import.meta.dir, "../agents/omp-worker.md")).text(),
+    path.join(cwd, `.omp/agents/${agent}.md`),
+    await Bun.file(path.resolve(import.meta.dir, `../agents/${agent}.md`)).text(),
   );
   const registry = new ModelRegistry(auth, path.join(cwd, "models.yml"), { settings });
   const lifecycles: NativeLifecycle[] = [];
@@ -108,6 +130,9 @@ async function nativeFixture(
   const mainTools: string[] = [];
   const leafResult = `Synthetic native leaf result ${id}`;
   let releaseChild: (() => void) | undefined;
+  let releaseMain: (() => void) | undefined;
+  const messageResults: Array<{ isError: boolean; details: unknown }> = [];
+  const childContexts: string[] = [];
   const taskResults: Array<{ isError: boolean; details: unknown }> = [];
   const errors: unknown[] = [];
   const sends: Promise<unknown>[] = [];
@@ -141,6 +166,7 @@ async function nativeFixture(
       if (main) mainContexts.push(JSON.stringify(context.messages));
       if (child) {
         childTools.push((context.tools ?? []).map((tool) => tool.name));
+        childContexts.push(JSON.stringify(context.messages));
         childStarted();
       }
       const stream = createAssistantMessageEventStream();
@@ -157,47 +183,68 @@ async function nativeFixture(
             ? [
                 call("task", {
                   name: id,
-                  agent: "omp-worker",
+                  agent,
                   task: "Execute the local fake-provider test assignment once",
                   solutionSpace: "Only the fixture action and one terminal yield",
                 }),
               ]
-            : main && detached && mainMode === "wait" && request === 3
+            : main &&
+                verification &&
+                (activeSteering ? request === 4 : request === 3 || request === 6)
               ? [call("wait", {})]
-              : child && mode === "nested-bash" && request === 1
+              : main &&
+                  verification &&
+                  (activeSteering ? request === 5 : request === 4 || request === 7)
                 ? [
-                    call("bash", {
-                      command: "sleep 30",
-                      async: true,
-                      timeout: 30,
-                      intent: "Exercise cancellation of a native child-owned async job",
+                    call("auto_step", {
+                      summary: "Consume only the newly settled native verification receipt",
                     }),
                   ]
-                : child && mode === "recursion" && request === 1
+                : main &&
+                    mode === "messages" &&
+                    request === (verification && !activeSteering ? 5 : 3)
                   ? [
-                      call("task", {
-                        agent: "omp-worker",
-                        task: "Forbidden nested fixture",
-                        solutionSpace: "Must be rejected",
+                      call("write", {
+                        path: `agent://${id}`,
+                        content: "Recheck the native fixture and yield a fresh result",
                       }),
                     ]
-                  : child && (mode === "prompt" || mode === "deny") && request === 1
-                    ? [
-                        call("bash", {
-                          command: "printf synthetic-test",
-                          intent: "Verify native approval denial",
-                        }),
-                      ]
-                    : child && mode !== "cancel" && mode !== "nested-bash"
+                  : main && detached && mainMode === "wait" && request === 3
+                    ? [call("wait", {})]
+                    : child && mode === "nested-bash" && request === 1
                       ? [
-                          call(
-                            "yield",
-                            mode === "child-abort"
-                              ? { error: "Synthetic child cancellation" }
-                              : { data: leafResult },
-                          ),
+                          call("bash", {
+                            command: "sleep 1; printf native-descendant-finished",
+                            async: true,
+                            timeout: 30,
+                            intent: "Exercise draining a native child-owned async job",
+                          }),
                         ]
-                      : [];
+                      : child && mode === "recursion" && request === 1
+                        ? [
+                            call("task", {
+                              agent: "omp-worker",
+                              task: "Forbidden nested fixture",
+                              solutionSpace: "Must be rejected",
+                            }),
+                          ]
+                        : child && (mode === "prompt" || mode === "deny") && request === 1
+                          ? [
+                              call("bash", {
+                                command: "printf synthetic-test",
+                                intent: "Verify native approval denial",
+                              }),
+                            ]
+                          : child
+                            ? [
+                                call(
+                                  "yield",
+                                  mode === "child-abort"
+                                    ? { error: "Synthetic child cancellation" }
+                                    : { data: leafResult },
+                                ),
+                              ]
+                            : [];
       const message: AssistantMessage = {
         role: "assistant",
         api,
@@ -262,10 +309,20 @@ async function nativeFixture(
         stream.end();
       };
       const heldChild =
-        child && (mode === "cancel" || mode === "nested-bash" || (detached && request === 1));
-      const heldMain = main && detached && mainMode === "stream" && request === 3;
+        child &&
+        ((mode === "held-yield" && request === 1) ||
+          (mode === "nested-bash" && request <= 2) ||
+          (mode === "messages" && request <= 2) ||
+          (detached && request === 1));
+      const heldMain =
+        main &&
+        detached &&
+        mainMode === "stream" &&
+        (request === 3 ||
+          (mode === "messages" && request === (verification && !activeSteering ? 6 : 4)));
       if (heldChild || heldMain) {
         if (heldChild) releaseChild = finish;
+        if (heldMain) releaseMain = finish;
         options?.signal?.addEventListener("abort", abort, { once: true });
         if (options?.signal?.aborted) abort();
       } else finish();
@@ -285,6 +342,25 @@ async function nativeFixture(
     contextFiles: [],
     fingerprint: "fixture-ready",
   };
+  if (verification) {
+    snapshot.state = "all_done";
+    snapshot.progress = { total: 1, complete: 1, remaining: 0 };
+    snapshot.tasks[0]!.done = true;
+  }
+  const verificationWorkflow = fallbackWorkflow(snapshot);
+  verificationWorkflow.fingerprint = "two-sequential-checks";
+  if (!activeSteering)
+    verificationWorkflow.stages.push({
+      id: "security",
+      kind: "standard",
+      skill: "rasen-verify-change",
+      role: "research",
+      runtime: "omp",
+      dispatchMode: "native",
+      requires: ["verify"],
+      status: "pending",
+    });
+  if (!activeSteering) verificationWorkflow.remaining.push("security");
   const sessionManager = SessionManager.inMemory(cwd);
   sessionManager.adoptArtifactManager(new ArtifactManager(path.join(cwd, ".test-artifacts")));
   const created = await createAgentSession({
@@ -306,12 +382,15 @@ async function nativeFixture(
           },
           {
             snapshot: async () => snapshot,
-            workflow: async () => ({
-              kind: "absent",
-              change: "fixture-change",
-              reason: "Synthetic pipeline not yet recorded",
-              fingerprint: "absent",
-            }),
+            workflow: async () =>
+              verification
+                ? verificationWorkflow
+                : {
+                    kind: "absent",
+                    change: "fixture-change",
+                    reason: "Synthetic pipeline not yet recorded",
+                    fingerprint: "absent",
+                  },
             validate: async () => {},
             decision: () => async () => ({ choice: "continue", confidence: 0.99 }),
           },
@@ -332,6 +411,8 @@ async function nativeFixture(
         pi.on("tool_result", (event, ctx) => {
           if (ctx.agent.kind === "main" && event.toolName === "task")
             taskResults.push({ isError: event.isError, details: event.details });
+          if (ctx.agent.kind === "main" && event.toolName === "write")
+            messageResults.push({ isError: event.isError, details: event.details });
         });
       },
     ],
@@ -343,16 +424,19 @@ async function nativeFixture(
     slashCommands: [],
     enableMCP: false,
     enableLsp: false,
-    enableIrc: false,
+    enableIrc: mode === "messages",
     skipPythonPreflight: true,
-    spawns: "omp-worker",
-    toolNames: ["task", "wait"],
+    spawns: agent,
+    toolNames: mode === "messages" ? ["task", "wait", "write"] : ["task", "wait"],
     cacheWarming: false,
     bindProcessState: false,
     systemPrompt: "Execute only this local fake-provider fixture",
     hasUI: true,
   });
   const session = created.session;
+  const nativeExecutors = new Map(
+    ["task", "wait", "write"].map((name) => [name, session.getToolByName(name)?.execute]),
+  );
   // awaitingAsyncWork belongs to public session events. Extension agent_end
   // notifications expose willContinue but deliberately omit that native marker.
   const unsubscribe = session.subscribe((event) => {
@@ -382,6 +466,7 @@ async function nativeFixture(
   return {
     id,
     session,
+    nativeExecutors,
     started,
     start,
     lifecycles,
@@ -395,6 +480,12 @@ async function nativeFixture(
       if (!releaseChild) throw new Error("Native child stream has not reached its fixture gate");
       releaseChild();
     },
+    releaseMain() {
+      if (!releaseMain) throw new Error("Native Main has not reached its fixture gate");
+      releaseMain();
+    },
+    messageResults,
+    childContexts,
     taskResults,
     errors,
     counts: () => ({ mainRequests, childRequests, childAborted, reviews }),
@@ -442,7 +533,7 @@ for (const mode of ["success", "prompt", "deny", "child-abort", "recursion"] as 
       expect(fixture.childTools.length).toBeGreaterThan(0);
 
       expect(fixture.counts().reviews).toBe(0);
-      const status = await fixture.status();
+      const status = await pausedStatus(fixture);
       expect(status.completionVerified).toBe(false);
       if (mode === "success" || mode === "recursion") {
         const result = fixture.taskResults[0]?.details as {
@@ -464,8 +555,9 @@ for (const mode of ["success", "prompt", "deny", "child-abort", "recursion"] as 
           );
         }
       } else {
-        expect(status.status).toBe("needs_user");
-        expect(status.reason).toMatch(/native|worker|authoriz|cancel/i);
+        expect(status.status).toBe("paused");
+        expect(status.outcome).toBe("needs_user");
+        expect(status.reason).toMatch(/native|worker|authoriz|cancel|scoped workflow/i);
         if (mode === "prompt" || mode === "deny") {
           const refusal = fixture.childEvents.find(
             ({ event }) =>
@@ -473,7 +565,7 @@ for (const mode of ["success", "prompt", "deny", "child-abort", "recursion"] as 
           );
           expect(refusal).toBeDefined();
           expect(JSON.stringify(refusal)).toMatch(/requires approval|blocked by user policy/);
-          expect(fixture.counts().childRequests).toBe(1);
+          expect(fixture.counts().childRequests).toBe(2);
         } else {
           const result = fixture.taskResults[0]?.details as {
             results: Array<{ aborted: boolean; abortReason: string }>;
@@ -488,25 +580,24 @@ for (const mode of ["success", "prompt", "deny", "child-abort", "recursion"] as 
   }, 30000);
 }
 
-test("Auto stop aborts an in-flight actual native leaf before further model work", async () => {
-  const fixture = await nativeFixture("cancel");
+test("Auto stop drains an in-flight foreground native leaf without aborting it", async () => {
+  const fixture = await nativeFixture("held-yield");
   let running: Promise<void> | undefined;
   try {
     running = fixture.start();
-    await Promise.race([
-      fixture.started,
-      Bun.sleep(10000).then(() => {
-        throw new Error("Native fixture child did not start");
-      }),
-    ]);
-    await fixture.session
-      .extensionRunner!.getCommand("auto")!
-      .handler("stop", fixture.session.extensionRunner!.createCommandContext());
+    await fixture.started;
+    await stopNativeAuto(fixture);
+    expect(fixture.counts()).toMatchObject({ childRequests: 1, childAborted: false, reviews: 0 });
+    expect(await fixture.status()).toMatchObject({ status: "draining", completionVerified: false });
+    fixture.releaseChild();
     await running;
-    expect(fixture.counts()).toMatchObject({ childRequests: 1, childAborted: true, reviews: 0 });
-    expect(fixture.lifecycles.some((event) => event.status === "aborted")).toBe(true);
-    expect(await fixture.status()).toMatchObject({
-      status: "cancelled",
+    expect(fixture.counts().childAborted).toBe(false);
+    expect(fixture.taskResults[0]?.details).toMatchObject({
+      results: [expect.objectContaining({ exitCode: 0, aborted: false })],
+    });
+    expect(JSON.stringify(fixture.session.messages)).toContain(fixture.leafResult);
+    expect(await pausedStatus(fixture)).toMatchObject({
+      status: "paused",
       completionVerified: false,
     });
   } finally {
@@ -524,6 +615,17 @@ async function waitUntil(predicate: () => boolean, description: string): Promise
 }
 
 type NativeFixture = Awaited<ReturnType<typeof nativeFixture>>;
+
+async function pausedStatus(fixture: NativeFixture) {
+  const deadline = Date.now() + 8000;
+  for (;;) {
+    const status = await fixture.status();
+    if (status.status !== "draining") return status;
+    if (Date.now() >= deadline)
+      throw new Error(`Auto did not finish its detached drain: ${JSON.stringify(status)}`);
+    await Bun.sleep(10);
+  }
+}
 
 async function detachedJob(fixture: NativeFixture, mainMode: "pause" | "wait" | "stream") {
   await waitUntil(
@@ -577,9 +679,10 @@ for (const [mode, mainMode] of [
       await fixture.session.waitForIdle();
       expect(fixture.errors).toEqual([]);
       expect(fixture.counts().reviews).toBe(0);
-      const status = await fixture.status();
+      const status = await pausedStatus(fixture);
       expect(status.completionVerified).toBe(false);
-      expect(status.status).toBe("needs_user");
+      expect(status.status).toBe("paused");
+      expect(status.outcome).toBe("needs_user");
       if (mode === "success" || mode === "recursion") {
         expect(job.status).toBe("completed");
         expect(job.resultText).toContain(fixture.leafResult);
@@ -615,11 +718,11 @@ for (const [mode, mainMode] of [
         );
         expect(refusal).toBeDefined();
         expect(JSON.stringify(refusal)).toMatch(/requires approval|blocked by user policy/);
-        expect(fixture.counts().childRequests).toBe(1);
-        expect(status.reason).toMatch(/authoriz|denied|policy/i);
+        expect(fixture.counts().childRequests).toBe(2);
+        expect(status.reason).toMatch(/authoriz|denied|policy|scoped workflow/i);
       } else {
         expect(fixture.lifecycles.some((event) => event.status === "aborted")).toBe(true);
-        expect(status.reason).toMatch(/native|worker|cancel/i);
+        expect(status.reason).toMatch(/native|worker|cancel|scoped workflow/i);
       }
     } finally {
       await fixture.close();
@@ -628,75 +731,111 @@ for (const [mode, mainMode] of [
   }, 30000);
 }
 
-for (const interruption of ["ESC", "auto stop", "new user input"] as const) {
-  test(`Auto ${interruption} cancels only its exact detached native child`, async () => {
-    // ESC is the native live-stream interrupt path. When Main is idle, /auto stop
-    // and new user input must also retain exact ownership of its detached child.
-    const mainMode = interruption === "ESC" ? "stream" : "pause";
-    const fixture = await nativeFixture("cancel", { detached: true, mainMode });
+async function stopNativeAuto(fixture: NativeFixture) {
+  await fixture.session
+    .extensionRunner!.getCommand("auto")!
+    .handler("stop", fixture.session.extensionRunner!.createCommandContext());
+}
+
+for (const interruption of ["auto stop", "new user input"] as const) {
+  test(`Auto ${interruption} drains its detached child and preserves unrelated native work`, async () => {
+    const fixture = await nativeFixture("held-yield", { detached: true, mainMode: "pause" });
     let running: Promise<void> | undefined;
     let unrelatedAborted = false;
+    const releaseUnrelated = Promise.withResolvers<void>();
     try {
       const manager = fixture.session.asyncJobManager!;
-      // Reserve the child's requested job ID with a pre-existing same-Main job.
-      // Native task registration must suffix its actual job ID; cancelling by
-      // guessed child ID or by Main owner would destroy this unrelated work.
+      running = fixture.start();
+      const owned = await detachedJob(fixture, "pause");
       const unrelatedId = manager.register(
         "bash",
         "Unrelated same-Main fixture",
         async ({ signal }) => {
-          await new Promise<void>((resolve) => {
-            const abort = () => {
+          signal.addEventListener(
+            "abort",
+            () => {
               unrelatedAborted = true;
-              resolve();
-            };
-            signal.addEventListener("abort", abort, { once: true });
-            if (signal.aborted) abort();
-          });
-          return "Unrelated fixture stopped for cleanup";
+            },
+            { once: true },
+          );
+          await releaseUnrelated.promise;
+          return "Unrelated fixture completed naturally";
         },
         { id: fixture.id, ownerId: fixture.session.getAgentId() },
       );
       const unrelated = manager.getJob(unrelatedId)!;
-      expect(unrelated.id).toBe(fixture.id);
-      running = fixture.start();
-      const owned = await detachedJob(fixture, mainMode);
       expect(owned.id).not.toBe(unrelated.id);
-      expect(owned.agentId).toBe(fixture.id);
-      if (interruption === "ESC") {
-        await fixture.session.abort({ reason: USER_INTERRUPT_LABEL });
-      } else if (interruption === "auto stop") {
-        await fixture.session.prompt("/auto stop");
-      } else {
-        await fixture.session.prompt("Replace the Auto request with this new user request");
+      if (interruption === "auto stop") await fixture.session.prompt("/auto stop");
+      else {
+        const text = "Replace the Auto request with this new user request";
+        // OMP's interactive/RPC input controller emits input before prompt();
+        // the lower-level public prompt API intentionally does not synthesize it.
+        await fixture.session.extensionRunner!.emitInput(text, undefined, "interactive");
+        await fixture.session.prompt(text);
       }
-      await waitUntil(() => fixture.counts().childAborted, "exact native child cancellation");
-      await owned.promise;
-      await running;
-      await fixture.session.waitForIdle();
-      expect(fixture.errors).toEqual([]);
-      expect(owned.status).toBe("cancelled");
-      expect(fixture.counts()).toMatchObject({ childRequests: 1, childAborted: true, reviews: 0 });
-      expect(fixture.lifecycles.some((event) => event.status === "aborted")).toBe(true);
+      expect(owned.status).toBe("running");
+      expect(unrelated.status).toBe("running");
+      expect(fixture.counts().childAborted).toBe(false);
       expect(await fixture.status()).toMatchObject({
-        status: "cancelled",
+        status: "draining",
         completionVerified: false,
       });
+      fixture.releaseChild();
+      await owned.promise;
+      expect(owned.status).toBe("completed");
+      expect(owned.resultText).toContain(fixture.leafResult);
       expect(unrelated.status).toBe("running");
       expect(unrelatedAborted).toBe(false);
-      expect(fixture.session.getAsyncJobSnapshot()?.running.map((job) => job.id)).toEqual([
-        unrelated.id,
-      ]);
-      if (interruption === "ESC") {
+      releaseUnrelated.resolve();
+      await unrelated.promise;
+      await running;
+      await fixture.session.settleAsyncWork();
+      await fixture.session.waitForIdle();
+      expect(fixture.errors).toEqual([]);
+      expect(fixture.counts()).toMatchObject({ childRequests: 1, childAborted: false, reviews: 0 });
+      expect(JSON.stringify(fixture.session.messages)).toContain(fixture.leafResult);
+      expect(await pausedStatus(fixture)).toMatchObject({
+        status: "paused",
+        completionVerified: false,
+      });
+    } finally {
+      releaseUnrelated.resolve();
+      await fixture.close();
+      await running?.catch(() => {});
+    }
+  }, 30000);
+}
+
+for (const cancellation of ["Main interrupt", "explicit native job cancellation"] as const) {
+  test(`OMP retains ${cancellation} behavior independently of Auto`, async () => {
+    const fixture = await nativeFixture("held-yield", { detached: true, mainMode: "stream" });
+    let running: Promise<void> | undefined;
+    try {
+      running = fixture.start();
+      const job = await detachedJob(fixture, "stream");
+      if (cancellation === "Main interrupt") {
+        await fixture.session.abort({ reason: USER_INTERRUPT_LABEL });
         expect(
           fixture.session.messages.some(
             (message) =>
               message.role === "assistant" && message.errorMessage === USER_INTERRUPT_LABEL,
           ),
         ).toBe(true);
+        // A Main interrupt is not an extension-owned child cancellation request.
+        expect(job.status).toBe("running");
+        expect(fixture.counts().childAborted).toBe(false);
+        fixture.releaseChild();
+      } else {
+        expect(fixture.session.cancelAsyncJob(job.id)).toBe(true);
+        fixture.releaseMain();
       }
-      expect(fixture.session.cancelAsyncJob(unrelated.id)).toBe(true);
-      await unrelated.promise;
+      await job.promise;
+      await running;
+      await fixture.session.settleAsyncWork();
+      expect(job.status).toBe(cancellation === "Main interrupt" ? "completed" : "cancelled");
+      expect(fixture.counts().childAborted).toBe(cancellation !== "Main interrupt");
+      expect(fixture.counts().reviews).toBe(0);
+      expect((await fixture.status()).completionVerified).toBe(false);
     } finally {
       await fixture.close();
       await running?.catch(() => {});
@@ -704,7 +843,7 @@ for (const interruption of ["ESC", "auto stop", "new user input"] as const) {
   }, 30000);
 }
 
-test("Auto stop cancels a real child-owned native async Bash descendant", async () => {
+test("Auto stop drains a real child-owned native async Bash descendant", async () => {
   const fixture = await nativeFixture("nested-bash", { detached: true, mainMode: "wait" });
   let running: Promise<void> | undefined;
   try {
@@ -716,35 +855,232 @@ test("Auto stop cancels a real child-owned native async Bash descendant", async 
       () =>
         fixture.counts().childRequests === 2 &&
         manager.getRunningJobs({ ownerId: fixture.id }).some((job) => job.type === "bash"),
-      "child's real async Bash receipt and next provider call",
-    ).catch(async (error) => {
-      throw new Error(
-        `${error.message}; counts=${JSON.stringify(fixture.counts())}; status=${JSON.stringify(await fixture.status())}; events=${JSON.stringify(fixture.childEvents)}; jobs=${JSON.stringify(manager.getAllJobs().map((job) => ({ id: job.id, type: job.type, ownerId: job.ownerId, status: job.status, errorText: job.errorText })))}`,
-      );
-    });
+      "child-owned native Bash job",
+    );
     const descendant = manager
       .getRunningJobs({ ownerId: fixture.id })
       .find((job) => job.type === "bash")!;
-    expect(descendant.ownerId).toBe(fixture.id);
+    await stopNativeAuto(fixture);
+    expect(owned.status).toBe("running");
     expect(descendant.status).toBe("running");
-    const receipt = fixture.childEvents.find(
-      ({ event }) => event.type === "tool_execution_end" && event.toolName === "bash",
-    );
-    expect(receipt).toBeDefined();
-    expect(receipt!.event.isError).toBe(false);
-    expect(JSON.stringify(receipt)).toContain(descendant.id);
-    expect(await fixture.status()).toMatchObject({ status: "running", completionVerified: false });
-    await fixture.session.prompt("/auto stop");
-    await Promise.all([owned.promise, descendant.promise, running]);
-    expect(fixture.errors).toEqual([]);
-    expect(owned.status).toBe("cancelled");
-    expect(descendant.status).toBe("cancelled");
-    expect(fixture.counts()).toMatchObject({ childRequests: 2, childAborted: true, reviews: 0 });
-    expect(manager.getRunningJobs({ ownerId: fixture.id })).toEqual([]);
-    expect(await fixture.status()).toMatchObject({
-      status: "cancelled",
+    expect(fixture.counts().childAborted).toBe(false);
+    expect(await fixture.status()).toMatchObject({ status: "draining", completionVerified: false });
+    await descendant.promise;
+    fixture.releaseChild();
+    await Promise.all([owned.promise, running]);
+    await fixture.session.settleAsyncWork();
+    expect(owned.status).toBe("completed");
+    expect(descendant.status).toBe("completed");
+    expect(descendant.resultText).toContain("native-descendant-finished");
+    expect(fixture.counts()).toMatchObject({ childAborted: false, reviews: 0 });
+    // Native async-result delivery may add a third turn before terminal yield.
+    expect(fixture.counts().childRequests).toBeGreaterThanOrEqual(2);
+    expect(await pausedStatus(fixture)).toMatchObject({
+      status: "paused",
       completionVerified: false,
     });
+  } finally {
+    await fixture.close();
+    await running?.catch(() => {});
+  }
+}, 30000);
+
+for (const targetState of ["active", "idle", "parked"] as const) {
+  test(`Auto Main native agent:// rereview reaches the same ${targetState} child without premature completion`, async () => {
+    const fixture = await nativeFixture("messages", {
+      detached: true,
+      mainMode: "stream",
+      parked: targetState === "parked",
+    });
+    let running: Promise<void> | undefined;
+    try {
+      running = fixture.start();
+      const firstJob = await detachedJob(fixture, "stream");
+      const initialRef = AgentRegistry.global().get(fixture.id)!;
+      const initialSession = initialRef.session;
+      if (targetState !== "active") {
+        fixture.releaseChild();
+        await firstJob.promise;
+        await waitUntil(
+          () => AgentRegistry.global().get(fixture.id)?.status === targetState,
+          `${targetState} child`,
+        );
+      }
+      fixture.releaseMain();
+      await waitUntil(
+        () => fixture.messageResults.length === 1,
+        "Main native agent:// message receipt",
+      );
+      expect(fixture.messageResults[0]!.isError).toBe(false);
+      for (const [name, execute] of fixture.nativeExecutors) {
+        expect(fixture.session.getToolByName(name)?.execute).toBe(execute);
+      }
+      const details = fixture.messageResults[0]!.details as {
+        message: { receipts: Array<{ outcome: string }> };
+      };
+      expect(details.message.receipts[0]!.outcome).toBe(
+        targetState === "active" ? "injected" : targetState === "parked" ? "revived" : "woken",
+      );
+      if (targetState === "active") fixture.releaseChild();
+      await waitUntil(
+        () => fixture.counts().childRequests >= 2 && fixture.counts().mainRequests >= 4,
+        "native rereview and Main provider gates",
+      );
+      expect(AgentRegistry.global().get(fixture.id)).toBe(initialRef);
+      if (targetState === "idle") expect(initialRef.session).toBe(initialSession);
+      if (targetState === "parked") expect(initialRef.session).not.toBe(initialSession);
+      expect(fixture.childContexts.at(-1)).toContain("Recheck the native fixture");
+      expect(await fixture.status()).toMatchObject({
+        status: "running",
+        completionVerified: false,
+      });
+      expect(fixture.counts().reviews).toBe(0);
+      await stopNativeAuto(fixture);
+      expect(fixture.counts().childAborted).toBe(false);
+      expect(await fixture.status()).toMatchObject({
+        status: "draining",
+        completionVerified: false,
+      });
+      fixture.releaseChild();
+      await initialRef.session!.waitForIdle();
+      fixture.releaseMain();
+      await running;
+      await fixture.session.settleAsyncWork();
+      expect(fixture.counts().childAborted).toBe(false);
+      expect(fixture.errors).toEqual([]);
+      expect(await pausedStatus(fixture)).toMatchObject({
+        status: "paused",
+        completionVerified: false,
+      });
+    } finally {
+      await fixture.close();
+      await running?.catch(() => {});
+    }
+  }, 30000);
+}
+
+for (const targetState of ["idle", "parked"] as const) {
+  test(`Auto consumes a fresh ${targetState} reviewer rerequest for the next sequential check`, async () => {
+    const fixture = await nativeFixture("messages", {
+      detached: true,
+      mainMode: "stream",
+      parked: targetState === "parked",
+      verification: true,
+    });
+    let running: Promise<void> | undefined;
+    try {
+      running = fixture.start();
+      const firstJob = await detachedJob(fixture, "stream");
+      const ref = AgentRegistry.global().get(fixture.id)!;
+      const initialSession = ref.session;
+      expect((await fixture.status()).hostWorkflow).toMatchObject({
+        phase: "verify",
+        stage: "verify",
+        verifiedStages: [],
+      });
+      fixture.releaseChild();
+      await firstJob.promise;
+      await waitUntil(() => ref.status === targetState, `first reviewer ${targetState}`);
+      fixture.releaseMain();
+      await waitUntil(
+        () =>
+          fixture.messageResults.length === 1 &&
+          fixture.counts().mainRequests >= 6 &&
+          fixture.counts().childRequests === 2,
+        "second check requested from the same native reviewer",
+      ).catch(async (error) => {
+        throw new Error(
+          `${error.message}; counts=${JSON.stringify(fixture.counts())}; status=${JSON.stringify(await fixture.status())}`,
+        );
+      });
+      expect(fixture.messageResults[0]!.isError).toBe(false);
+      expect(AgentRegistry.global().get(fixture.id)).toBe(ref);
+      if (targetState === "idle") expect(ref.session).toBe(initialSession);
+      else expect(ref.session).not.toBe(initialSession);
+      // The original task receipt certifies only verify. Reusing its producer,
+      // while the new native request is running, cannot certify security.
+      expect(await fixture.status()).toMatchObject({
+        completionVerified: false,
+        hostWorkflow: {
+          phase: "verify",
+          stage: "security",
+          verifiedStages: ["verify"],
+          readyForReview: false,
+        },
+      });
+      fixture.releaseChild();
+      await ref.session!.waitForIdle();
+      await waitUntil(
+        () => ref.status === "idle" || ref.status === "parked",
+        "accepted native rereview result",
+      );
+      fixture.releaseMain();
+      await running;
+      await fixture.session.settleAsyncWork();
+      const status = await pausedStatus(fixture);
+      expect(status.hostWorkflow).toMatchObject({
+        phase: "review",
+        verifiedStages: ["verify", "security"],
+        readyForReview: true,
+      });
+      expect(status.completionVerified).toBe(false);
+      expect(fixture.counts()).toMatchObject({ childRequests: 2, childAborted: false, reviews: 0 });
+      expect(fixture.errors).toEqual([]);
+    } finally {
+      await fixture.close();
+      await running?.catch(() => {});
+    }
+  }, 30000);
+}
+
+test("Auto accepts the original native reviewer task after active steering settles", async () => {
+  const fixture = await nativeFixture("messages", {
+    detached: true,
+    mainMode: "stream",
+    verification: true,
+    activeSteering: true,
+  });
+  let running: Promise<void> | undefined;
+  try {
+    running = fixture.start();
+    const original = await detachedJob(fixture, "stream");
+    fixture.releaseMain();
+    await waitUntil(
+      () => fixture.messageResults.length === 1 && fixture.counts().mainRequests >= 4,
+      "active steering and native Main wait gate",
+    );
+    expect(fixture.messageResults[0]).toMatchObject({
+      isError: false,
+      details: { message: { receipts: [{ to: fixture.id, outcome: "injected" }] } },
+    });
+    fixture.releaseChild();
+    await waitUntil(
+      () => fixture.counts().childRequests === 2,
+      "original reviewer processes its injected steering",
+    );
+    expect(fixture.childContexts.at(-1)).toContain("Recheck the native fixture");
+    // Native delivery may accept the original yield before its injected follow-up
+    // finishes. The semantic boundary must still await all native work.
+    expect(await fixture.status()).toMatchObject({
+      completionVerified: false,
+      nativeWork: { pending: true },
+      hostWorkflow: { phase: "verify", verifiedStages: [], readyForReview: false },
+    });
+    fixture.releaseChild();
+    await original.promise;
+    await fixture.session.asyncJobManager!.waitForOwnerJobs(fixture.session.getAgentId()!);
+    expect(original.status).toBe("completed");
+    fixture.releaseMain();
+    await running;
+    await fixture.session.settleAsyncWork();
+    expect((await pausedStatus(fixture)).hostWorkflow).toMatchObject({
+      phase: "review",
+      verifiedStages: ["verify"],
+      readyForReview: true,
+    });
+    expect(fixture.lifecycles.filter((event) => event.status === "started")).toHaveLength(1);
+    expect(fixture.counts()).toMatchObject({ childRequests: 2, childAborted: false, reviews: 0 });
+    expect(fixture.errors).toEqual([]);
   } finally {
     await fixture.close();
     await running?.catch(() => {});
