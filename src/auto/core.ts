@@ -22,6 +22,10 @@ export class AutoRun {
   fallbacks = 0;
   stalls = 0;
   readonly startedAt: number;
+  observedAt: number;
+  lastActivityAt: number;
+  observationError: string | null = null;
+  #completionFingerprint = "";
   readonly id = crypto.randomUUID();
   snapshot: RasenSnapshot;
   #completed: Set<string>;
@@ -37,9 +41,11 @@ export class AutoRun {
     readonly now: () => number = Date.now,
   ) {
     this.startedAt = now();
+    this.observedAt = this.startedAt;
+    this.lastActivityAt = this.startedAt;
     this.snapshot = snapshot;
     this.#taskIds = new Set(snapshot.tasks.map((task) => task.id));
-    this.#identity = `${snapshot.root}\0${snapshot.schema}`;
+    this.#identity = `${snapshot.change}\0${snapshot.root}\0${snapshot.schema}`;
     this.#scope = JSON.stringify(
       snapshot.tasks.map(({ id, description }) => ({ id, description })),
     );
@@ -48,6 +54,7 @@ export class AutoRun {
 
   stop(status: Exclude<AutoStatus, "running">, reason: string): void {
     if (this.status !== "running") return;
+    if (status === "completed") this.#completionFingerprint = this.snapshot.fingerprint;
     this.status = status;
     this.reason = reason;
   }
@@ -55,13 +62,22 @@ export class AutoRun {
   checkTime(): boolean {
     if (this.status === "running" && this.now() - this.startedAt >= this.config.maxDurationMs)
       this.stop("budget_exhausted", "Run deadline reached");
+    if (
+      this.status === "running" &&
+      this.now() - this.lastActivityAt >= this.config.noOutputTimeoutMs
+    )
+      this.stop("stalled", "No native model/tool output within the activity timeout");
     return this.status === "running";
+  }
+
+  activity(): void {
+    if (this.status === "running") this.lastActivityAt = this.now();
   }
 
   toolCall(id: string): boolean {
     if (!this.checkTime()) return false;
     if (this.#seenTools.has(id)) return true;
-    if (this.toolCalls >= this.config.maxToolCalls) {
+    if (this.config.maxToolCalls !== null && this.toolCalls >= this.config.maxToolCalls) {
       this.stop("budget_exhausted", "Tool-call budget reached");
       return false;
     }
@@ -70,17 +86,36 @@ export class AutoRun {
     return true;
   }
 
-  observe(snapshot: RasenSnapshot): void {
-    if (!this.checkTime()) return;
+  private sameScope(snapshot: RasenSnapshot): boolean {
     // The run's scope is fixed. Removing/replacing tasks cannot manufacture progress.
     const ids = new Set(snapshot.tasks.map((task) => task.id));
     if (
-      `${snapshot.root}\0${snapshot.schema}` !== this.#identity ||
+      `${snapshot.change}\0${snapshot.root}\0${snapshot.schema}` !== this.#identity ||
       ids.size !== this.#taskIds.size ||
       [...ids].some((id) => !this.#taskIds.has(id)) ||
       JSON.stringify(snapshot.tasks.map(({ id, description }) => ({ id, description }))) !==
         this.#scope
     ) {
+      return false;
+    }
+    return true;
+  }
+
+  /** Fresh read-only facts may change after execution stops. Never resume or approve here. */
+  reconcile(snapshot: RasenSnapshot): boolean {
+    if (!this.sameScope(snapshot)) {
+      this.observationError = "Rasen task scope changed; current progress cannot be reconciled";
+      return false;
+    }
+    this.snapshot = snapshot;
+    this.observedAt = this.now();
+    this.observationError = null;
+    return true;
+  }
+
+  observe(snapshot: RasenSnapshot): void {
+    if (!this.checkTime()) return;
+    if (!this.sameScope(snapshot)) {
       this.stop("needs_user", "Rasen task scope changed; review it and explicitly start a new run");
       return;
     }
@@ -88,17 +123,17 @@ export class AutoRun {
     const progress = [...completed].some((id) => !this.#completed.has(id));
     this.stalls = progress || snapshot.state === "all_done" ? 0 : this.stalls + 1;
     for (const id of completed) this.#completed.add(id);
-    this.snapshot = snapshot;
+    this.reconcile(snapshot);
     if (snapshot.state === "blocked") this.stop("blocked", "Rasen prerequisites are blocked");
   }
 
   continue(): boolean {
     if (!this.checkTime()) return false;
-    if (this.steps >= this.config.maxSteps) {
+    if (this.config.maxSteps !== null && this.steps >= this.config.maxSteps) {
       this.stop("budget_exhausted", "Turn budget reached");
       return false;
     }
-    if (this.stalls >= this.config.maxStalls) {
+    if (this.config.maxStalls !== null && this.stalls >= this.config.maxStalls) {
       this.stop("stalled", "No completed-task progress within the stall budget");
       return false;
     }
@@ -194,13 +229,29 @@ export class AutoRun {
       status: this.status,
       reason: this.reason || null,
       progress: this.snapshot.progress,
-      steps: `${this.steps}/${this.config.maxSteps}`,
-      toolCalls: `${this.toolCalls}/${this.config.maxToolCalls}`,
+      steps:
+        this.config.maxSteps === null ? `${this.steps}` : `${this.steps}/${this.config.maxSteps}`,
+      toolCalls:
+        this.config.maxToolCalls === null
+          ? `${this.toolCalls}`
+          : `${this.toolCalls}/${this.config.maxToolCalls}`,
       decisions: this.decisions,
       fallbacks: `${this.fallbacks}/${this.config.maxFallbacks}`,
-      stalls: `${this.stalls}/${this.config.maxStalls}`,
+      stalls:
+        this.config.maxStalls === null
+          ? `${this.stalls}`
+          : `${this.stalls}/${this.config.maxStalls}`,
       elapsedMs: this.now() - this.startedAt,
-      completionVerified: this.status === "completed",
+      completionVerified:
+        this.status === "completed" &&
+        this.snapshot.fingerprint === this.#completionFingerprint &&
+        !this.observationError,
+      observation: { at: this.observedAt, error: this.observationError },
+      supervision: {
+        maxDurationMs: this.config.maxDurationMs,
+        noOutputTimeoutMs: this.config.noOutputTimeoutMs,
+        lastActivityAt: this.lastActivityAt,
+      },
     };
   }
 }

@@ -1,5 +1,97 @@
 # Rasen Auto verification
 
+## Native builtin-full workflow port (2026-10-05)
+
+This section describes the current Auto implementation. The older records below
+are historical evidence for the earlier apply-loop and transport layers.
+
+The port reads the complete generated `rasen-auto` skill from Rasen's **builtin
+full profile**, using the running OMP host's native autoload API. It preserves
+Rasen's workflow as the driver, with a scoped OMP host adaptation and Jev advice
+at recorded semantic stage boundaries. The UI supervisor is the reference for
+finite wall-clock/activity supervision and independent progress observation;
+its Claude process launcher is not copied. The full profile does not select the
+`full-feature` pipeline.
+
+Source reference remains Rasen `dev/0.1.8` at
+`f0ae20d19a30c265ad3f3ffaaa5bb3cd148d12dd`, especially
+`src/core/templates/workflows/auto.ts`, `_orchestration.ts`, and
+`src/core/management-api/{sessions,supervisor,whitelist}.ts`.
+
+### Final verification
+
+All of the following passed on the frozen implementation:
+
+- Locked OMP **18.6.0**: formatting, typecheck, **291 unit/installer tests
+  (1,975 assertions)**, separate **111 installer tests (902 assertions)**,
+  **145 smoke tests (1,226 assertions)**, 40-entry packed loading, workflow/ruleset
+  checks, and `git diff --check`
+- Supported minimum OMP **18.5.1** and current compatibility target **18.6.1**:
+  each passed formatting/typecheck, **291 unit/installer tests (1,975 assertions)**,
+  a separate **111 installer tests (902 assertions)**, **145 smoke tests
+  (1,225 assertions)**, 40-entry packed loading, and workflow/ruleset checks
+- Bun **1.3.14** and actual Node **24.19.0**, with the pinned installed Rasen
+  `0.1.8 (dev.local f0ae20d)`. The compatibility runner initially selected Bun's
+  Node shim from its sanitized PATH; both complete smoke suites were subsequently
+  rerun successfully with the actual Node executable. The authoritative CLI
+  results above are the real-Node reruns
+
+The lockfile remains on 18.6.0, with the existing `latest` development declarations
+and `>=18.5.1` peer minimum unchanged. Compatibility runs use isolated copies with
+exact SDK installations, not a changed project lockfile. Remote CI must still
+verify the published commit separately.
+
+### What the integration proves
+
+- A real `rasen init --tools omp --profile full` generates the Auto body, over
+  110,000 UTF-8 bytes. Native autoload admits its complete non-whitespace content
+  separately from the 64 KiB task-evidence cap; the native renderer compacts
+  Markdown table whitespace. The exact admitted message is retained in native
+  session artifacts
+- The combined actual CLI/SDK fixture performs **85 distinct native reads**, native
+  fixture writes, **two Jev stage choices**, and **two charged completion reviews
+  in one LEAD turn**, then settles completed. It crosses the former global
+  80-call limit without a forced task turn. Model transports are deterministic
+  fixtures; this verifies orchestration, not a model's ability to implement a
+  real product change
+- The existing native-file `architect_checkpoint` handles Auto completion with
+  fresh task/workflow/strict-validation evidence and the configured Architect
+  timeout. No model review runs inside the 30-second SDK stop hook. A timed fixture
+  covers review beyond the former 24-second boundary; stop-time settlement checks
+  the exact approved fingerprints without charging another review
+- Real native task tests cover success, headless approval refusal, explicit policy
+  denial, child abort, recursive-task refusal, and user cancellation. Denied child
+  tools stop Auto before another child model turn, including when the native task
+  envelope itself reports no top-level error
+- Fresh terminal status updates task progress without resuming execution or awarding
+  approval. Tests cover changed observations during review, stale Jev advice,
+  same-frontier advice caching, preserved plan/recovery gates, no-output supervision,
+  and optional explicit legacy limits, as well as existing delivery/brief safety
+- Public pipeline resume/execution reads distinguish absent, invalid and pipelineless
+  state, enforce local bounded contracts, preserve real native worker facts, and
+  reject unsupported foreign routes. Scoped completion leaves downstream delivery
+  outside permission; the Rasen review-cycle record is not fabricated as a host
+  approval
+
+### Coverage limits and resolved checks
+
+All new model/provider responses are local fixtures; no paid provider calls,
+external private data uploads, actual project publishing, or live implementation
+quality claims are involved. Native child journal tests use a narrowly scoped
+SDK `MemorySessionStorage` injection because this container returns `EPERM` for
+native journal OS locks before child inference. Task dispatch, tools, routing,
+permissions and cancellation remain real; persistent child journals and OS locks
+are not covered by those fixtures.
+
+A sparse bundled-CLI test caught an unsupported `eval/settings` module import.
+The final code reads that setting through the bundled native registry alias;
+both sparse-host variants pass. One integration run during active edits produced
+extra completion reminders without capturing enough diagnostics to establish a
+cause. Targeted and full frozen reruns passed without relaxing the one-turn
+assertions; the final supported-host runs had no failures. macOS/Windows behavior
+remains the responsibility of the existing cross-platform CI.
+
+
 ## Tested contracts
 
 - OMP 18.6.0 and Bun 1.3.14 (current locked host; the initial core was tested on OMP 18.5.1)
@@ -63,3 +155,33 @@ bun run check:workflows
 ```
 
 No model credentials are needed for this suite. The Rasen preparation step downloads pinned public upstream source and locked dependencies, builds an installable tarball, and installs it locally. It does not publish packages or modify the user's global installation. Generated fixture projects and private profiles are kept outside the distributable.
+
+## Native internal startup and multiline confirmation (2026-10-05)
+
+Auto startup now uses hidden, agent-attributed native custom context rather than
+`sendUserMessage`. Real OMP AgentSession fixtures verify canonical developer-role
+payloads, no user transcript entry, actual implementation-provider execution,
+completion review, and native continuation delivery. The originating session's
+artifact is read back byte-for-byte before dispatch. Added cases cover idle
+context admission, repeated preparation, changed content/session identity,
+stop/new-input/session-switch during persistence, unavailable storage, canceled
+historical payload removal, and stale continuations after a new user finishes.
+
+The confirmation suite exercises Japanese Markdown, blank rows and wrapping at
+24/40/80/120 columns, scrolling/resizing, ordinary and Kitty Enter, cancellation,
+and abort timing. A real native TSP reconciler receives already-wrapped rows
+instead of a multiline picker subtitle. The original legacy selector did not
+reproduce the reported broken border locally; the exact user-terminal symptom
+remains unverified. This change avoids the separate native subtitle path without
+modifying brief/guidance text.
+
+Verification used Bun **1.3.14**, freshly rebuilt pinned Rasen, the locked OMP
+**18.6.0**, and isolated npm-verified **18.5.1** / current **18.6.1** hosts.
+All three passed format/typecheck, **280 unit/installer tests**, **119 smoke
+tests**, packed loading (**38 entries**), and workflow validation. The native
+confirmation subprocess adds **16 cases / 547 assertions**. Sparse/bundled-host
+loading passed with and without optional Brief. The first concurrently executed
+18.6.1 smoke run failed the real-CLI expected-two-reviews assertion; an isolated
+case retry and a subsequent complete 119-test smoke rerun passed. The cause of
+that initial timing-sensitive result was not established. No live model provider
+or user profile was used, and these local results do not establish remote CI.

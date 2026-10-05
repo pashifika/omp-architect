@@ -1,5 +1,10 @@
 # Merge only when opting in to /auto. This is a native OMP setting.
-# Auto uses foreground main-session tools so its deadline can abort them.
+# Auto uses foreground native tools and leaf tasks so cancellation can reach them.
 bash:
+  autoBackground:
+    enabled: false
+async:
+  enabled: false
+eval:
   autoBackground:
     enabled: false

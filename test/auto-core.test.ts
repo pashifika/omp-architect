@@ -34,7 +34,7 @@ test("Auto allows explicit starts by default; strict config rejects unknown keys
   for (const invalid of [
     { enabled: "true" },
     { unknown: 1 },
-    { maxSteps: 9 },
+    { maxSteps: 10001 },
     { maxToolCalls: 0 },
     { minConfidence: NaN },
     { minConfidence: 0.1 },
@@ -168,4 +168,78 @@ test("a provider's synchronous caller abort cannot escape the core deadline", as
   };
   expect(await run.decide(evidence, provider, undefined, controller.signal)).toBeUndefined();
   expect(run.status).toBe("cancelled");
+});
+
+test("default supervision permits more than eighty tools and eight boundaries without count caps", () => {
+  const run = new AutoRun(parseAutoConfig({}), snapshot());
+  for (let i = 0; i < 125; i++) expect(run.toolCall(`read-${i}`)).toBe(true);
+  for (let i = 0; i < 12; i++) expect(run.continue()).toBe(true);
+  expect(run.status).toBe("running");
+  expect(run.config.maxDurationMs).toBe(4 * 60 * 60 * 1000);
+  expect(run.config.noOutputTimeoutMs).toBe(10 * 60 * 1000);
+  expect(run.statusView().toolCalls).toBe("125");
+});
+
+test("finite output watchdog resets only with activity; absolute deadline never resets", () => {
+  let now = 0;
+  const run = new AutoRun(
+    parseAutoConfig({ maxDurationMs: 4000, noOutputTimeoutMs: 1000 }),
+    snapshot(),
+    () => now,
+  );
+  now = 900;
+  run.activity();
+  now = 1500;
+  expect(run.checkTime()).toBe(true);
+  now = 1900;
+  expect(run.checkTime()).toBe(false);
+  expect(run.status).toBe("stalled");
+  const absolute = new AutoRun(
+    parseAutoConfig({ maxDurationMs: 2000, noOutputTimeoutMs: 1000 }),
+    snapshot(),
+    () => now,
+  );
+  now = 2800;
+  absolute.activity();
+  now = 3700;
+  absolute.activity();
+  now = 3900;
+  expect(absolute.checkTime()).toBe(false);
+  expect(absolute.status).toBe("budget_exhausted");
+});
+
+test("terminal reconciliation refreshes facts without resuming, spending counters or approving completion", () => {
+  let now = 0;
+  const run = new AutoRun(parseAutoConfig({ maxToolCalls: 1 }), snapshot(), () => now);
+  run.toolCall("one");
+  run.toolCall("two");
+  expect(run.status).toBe("budget_exhausted");
+  now = 2000;
+  expect(run.reconcile(snapshot(["1.1"]))).toBe(true);
+  expect(run.statusView()).toMatchObject({
+    status: "budget_exhausted",
+    progress: { complete: 1 },
+    completionVerified: false,
+    toolCalls: "1/1",
+    observation: { at: 2000, error: null },
+  });
+  const done = new AutoRun(parseAutoConfig({}), snapshot(["1.1", "1.2"]));
+  done.stop("completed", "Verified");
+  expect(done.statusView().completionVerified).toBe(true);
+  done.reconcile(snapshot(["1.1"]));
+  expect(done.status).toBe("completed");
+  expect(done.statusView().completionVerified).toBe(false);
+});
+
+test("null legacy limits are explicit and supervision caps remain finite", () => {
+  expect(
+    parseAutoConfig({ maxSteps: null, maxToolCalls: null, maxStalls: null }).maxToolCalls,
+  ).toBeNull();
+  for (const invalid of [
+    { maxDurationMs: 43200001 },
+    { noOutputTimeoutMs: 1800001 },
+    { noOutputTimeoutMs: null },
+    { maxSteps: -1 },
+  ])
+    expect(() => parseAutoConfig(invalid)).toThrow();
 });

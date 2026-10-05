@@ -36,7 +36,7 @@ test("missing config and omitted enabled use defaults; explicit false and invali
   expect(await loadAutoConfig(cwd)).toMatchObject({ enabled: true, maxSteps: 2 });
   await Bun.write(path.join(cwd, ".omp/auto.json"), '{"enabled":false}');
   expect((await loadAutoConfig(cwd)).enabled).toBe(false);
-  await Bun.write(path.join(cwd, ".omp/auto.json"), '{"maxSteps":99}');
+  await Bun.write(path.join(cwd, ".omp/auto.json"), '{"maxSteps":10001}');
   await expect(loadAutoConfig(cwd)).rejects.toThrow();
   await Bun.write(path.join(cwd, ".omp/auto.json"), "{");
   await expect(loadAutoConfig(cwd)).rejects.toThrow();

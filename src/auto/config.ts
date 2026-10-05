@@ -2,10 +2,11 @@ import * as path from "node:path";
 
 export interface AutoConfig {
   enabled: boolean;
-  maxSteps: number;
-  maxToolCalls: number;
-  maxStalls: number;
+  maxSteps: number | null;
+  maxToolCalls: number | null;
+  maxStalls: number | null;
   maxDurationMs: number;
+  noOutputTimeoutMs: number;
   cliTimeoutMs: number;
   decisionTimeoutMs: number;
   maxEvidenceChars: number;
@@ -18,11 +19,13 @@ export interface AutoConfig {
 export const autoDefaults: AutoConfig = {
   // Allows an explicit, confirmed /auto start; never starts or resumes a run itself.
   enabled: true,
-  // OMP 18.5.1 itself caps hidden session-stop continuations at eight.
-  maxSteps: 8,
-  maxToolCalls: 80,
-  maxStalls: 3,
-  maxDurationMs: 600000,
+  // The generated workflow owns task/stage iteration. Counts are diagnostic by default.
+  // Explicit legacy caps remain honored; time supervision is always finite.
+  maxSteps: null,
+  maxToolCalls: null,
+  maxStalls: null,
+  maxDurationMs: 4 * 60 * 60 * 1000,
+  noOutputTimeoutMs: 10 * 60 * 1000,
   cliTimeoutMs: 5000,
   decisionTimeoutMs: 8000,
   maxEvidenceChars: 12000,
@@ -45,10 +48,11 @@ export function parseAutoConfig(value: unknown): AutoConfig {
     result.enabled = input.enabled;
   }
   const ranges = {
-    maxSteps: [1, 8],
-    maxToolCalls: [1, 500],
-    maxStalls: [1, 8],
-    maxDurationMs: [1000, 3600000],
+    maxSteps: [1, 10000],
+    maxToolCalls: [1, 100000],
+    maxStalls: [1, 10000],
+    maxDurationMs: [1000, 12 * 60 * 60 * 1000],
+    noOutputTimeoutMs: [1000, 30 * 60 * 1000],
     cliTimeoutMs: [100, 5000],
     decisionTimeoutMs: [100, 8000],
     maxEvidenceChars: [1000, 24000],
@@ -56,6 +60,10 @@ export function parseAutoConfig(value: unknown): AutoConfig {
   } as const;
   for (const [key, [min, max]] of Object.entries(ranges)) {
     if (input[key] === undefined) continue;
+    if (["maxSteps", "maxToolCalls", "maxStalls"].includes(key) && input[key] === null) {
+      result[key as "maxSteps" | "maxToolCalls" | "maxStalls"] = null;
+      continue;
+    }
     if (!Number.isSafeInteger(input[key]) || Number(input[key]) < min || Number(input[key]) > max)
       throw new Error(`${key} must be an integer from ${min} to ${max}`);
     result[key as keyof typeof ranges] = input[key] as number;

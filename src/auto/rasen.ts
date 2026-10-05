@@ -96,16 +96,21 @@ async function prepare(cwd: string, change: string, signal?: AbortSignal) {
   return { root, changeDir };
 }
 
-async function boundedText(root: string, file: string, signal?: AbortSignal): Promise<string> {
+async function boundedText(
+  root: string,
+  file: string,
+  signal?: AbortSignal,
+  limit = MAX_CONTEXT_BYTES,
+): Promise<string> {
   signal?.throwIfAborted();
   const resolved = await localPath(root, file);
   try {
     const handle = await fs.open(resolved, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     try {
       const stat = await handle.stat();
-      if (!stat.isFile() || stat.size > MAX_CONTEXT_BYTES)
+      if (!stat.isFile() || stat.size > limit)
         throw new Error("Rasen context must contain bounded regular text files");
-      const buffer = Buffer.alloc(MAX_CONTEXT_BYTES + 1);
+      const buffer = Buffer.alloc(limit + 1);
       let length = 0;
       while (length < buffer.length) {
         signal?.throwIfAborted();
@@ -113,7 +118,7 @@ async function boundedText(root: string, file: string, signal?: AbortSignal): Pr
         if (read.bytesRead === 0) break;
         length += read.bytesRead;
       }
-      if (length > MAX_CONTEXT_BYTES) throw new Error("Rasen context exceeds the 64 KiB limit");
+      if (length > limit) throw new Error(`Rasen text exceeds its ${limit}-byte limit`);
       const result = new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, length));
       if (result.includes("\0")) throw new Error("Rasen context must be UTF-8 text");
       return result;
@@ -384,4 +389,48 @@ export async function validateRasenChange(
     result.summary.totals.failed !== 0
   )
     throw invalid();
+}
+
+export interface RasenAutoSkill {
+  message: string;
+  path: string;
+  sha256: string;
+  bytes: number;
+}
+
+/** Use the running host's native autoload renderer; no source-SDK runtime import. */
+export async function loadRasenAutoSkill(
+  cwd: string,
+  args: string,
+  host: Pick<import("@oh-my-pi/pi-coding-agent").ExtensionAPI["pi"], "buildSkillPromptMessage">,
+  signal?: AbortSignal,
+): Promise<RasenAutoSkill> {
+  const root = await fs.realpath(cwd);
+  const file = path.join(root, ".omp", "skills", "rasen-auto", "SKILL.md");
+  const limit = 256 * 1024;
+  const content = await boundedText(root, file, signal, limit);
+  const frontmatter = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1];
+  if (!frontmatter || !/^name:\s*["']?rasen-auto["']?\s*$/m.test(frontmatter))
+    throw new Error(
+      "Installed rasen-auto skill is missing or has the wrong identity; initialize Rasen with the builtin full profile",
+    );
+  const rendered = await host.buildSkillPromptMessage(
+    { name: "rasen-auto", filePath: file, baseDir: path.dirname(file) },
+    { args },
+    "autoload",
+  );
+  signal?.throwIfAborted();
+  if ((await boundedText(root, file, signal, limit)) !== content)
+    throw new Error("Rasen Auto skill changed during admission");
+  const body = content.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, "").trim();
+  // Native prompt rendering compacts Markdown table whitespace. Verify every
+  // non-whitespace source character survives; never truncate the skill to fit task evidence.
+  if (!body || !rendered.message.replace(/\s/g, "").includes(body.replace(/\s/g, "")))
+    throw new Error("Native skill loader did not preserve the complete Rasen Auto body");
+  return {
+    message: rendered.message,
+    path: file,
+    sha256: createHash("sha256").update(content).digest("hex"),
+    bytes: Buffer.byteLength(content),
+  };
 }

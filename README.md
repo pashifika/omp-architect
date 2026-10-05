@@ -9,7 +9,7 @@ while a separate reviewer checks plans, recovery approaches, and completion evid
 - **Role-based agents:** Send coding tasks to `omp-worker` and read-only research to `omp-explorer`.
 - **Independent reviews:** Hand a complete native OMP file to an architect model at meaningful checkpoints.
 - **Bounded review rounds:** Set minimum and maximum rounds; unresolved findings stop the workflow.
-- **Optional Rasen Auto:** Run prepared [Rasen](https://github.com/DumoeDss/rasen) changes through limited implementation turns and completion review.
+- **Optional Rasen Auto:** Load the full generated [Rasen](https://github.com/DumoeDss/rasen) Auto workflow through native OMP skill autoload for a prepared change. The main LEAD uses foreground native implementation/research/reviewer leaves, with Jev stage-boundary advice, time supervision, and the existing synchronous native-file Architect checkpoint as its sole bounded completion-review loop.
 
 ## Install
 
@@ -63,11 +63,17 @@ direct and `xd://` calls. Restricted Eval carriers require `language: "js"` and
 `reset: true` on each outer Eval call, which discards previous Eval variables.
 
 Use `/architect` or `auto_status` to inspect blocked work and review status.
-Completion requested inside Eval is queued without approval and reviewed once at
-the turn boundary after outer results arrive. Wait for background jobs to finish
-and submit fresh evidence before completion review. The extension does not silently
-switch your active main model. Reviews send the full admitted file and bounded
-host evidence to your configured provider; do not include secrets. These checks
+Outside Auto, completion requested inside Eval is queued without approval and
+reviewed once at the turn boundary after outer results arrive. Auto instead uses
+the native completion checkpoint synchronously in the LEAD turn, with fresh Rasen
+evidence and the full configured review timeout. Its Eval route requires a
+dedicated foreground JavaScript `reset: true` single-call checkpoint carrier;
+general or batched carriers are rejected without spending a review. Auto requires
+both `async.enabled: false` and `bash.autoBackground.enabled: false`. Its stop hook
+only validates fresh facts against the approval; it does not run the reviewer.
+Wait for background jobs to finish and submit fresh evidence before review. The
+extension does not silently switch your active main model. Reviews send the full
+admitted file and bounded host evidence to your configured provider; do not include secrets. These checks
 do not replace tool approvals or prove that assistant-authored claims occurred.
 
 ## Configuration and guides
@@ -77,7 +83,7 @@ do not replace tool approvals or prove that assistant-authored claims occurred.
 | Install, preview, update, or remove the local plugin | [Installation guide](docs/installation.md) |
 | Choose models and reasoning effort | Native OMP `modelRoles`; [model-role guide](docs/architect.md#one-source-of-truth-for-models-and-reasoning) |
 | Set review rounds, role names, and thresholds | Project `.omp/architect.json`; [review guide](docs/architect.md#bounded-review-rounds) and [sample settings](examples/architect.json) |
-| Run a prepared Rasen change, with extra instructions or existing brief packs | [Rasen Auto setup and limits](docs/rasen-auto.md); `.omp/auto.json` is optional; pinned Rasen and TypeSafe authentication through OMP `/login` or `TYPESAFE_API_KEY` are required |
+| Apply, verify, and review a prepared Rasen change, with extra instructions or existing brief packs | [Rasen Auto setup and limits](docs/rasen-auto.md); initialize pinned Rasen with `rasen init --tools omp --profile full` (builtin profile, not the `full-feature` pipeline). `.omp/auto.json` is optional; TypeSafe authentication through OMP `/login` or `TYPESAFE_API_KEY` is required |
 | Add the standalone `/brief` command with Tab completion | [Optional brief installation](docs/installation.md); use `bun run dev:install -- --with-brief` only when another `/brief` is not installed |
 | Understand tested behavior and reproduce verification | [Verification record](docs/rasen-auto-verification.md) |
 | Develop, run local checks, or submit a pull request | [Contributing](CONTRIBUTING.md) |

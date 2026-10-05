@@ -111,6 +111,7 @@ export function planSteps(input: Record<string, unknown>): string[] {
 }
 export function routeAgent(agent: string, config: Config): string | undefined {
   if (agent === "omp-worker") return `@${config.roles.implementation}`;
+  if (agent === "omp-reviewer") return `@${config.roles.architect}`;
   if (agent === "omp-explorer") return `@${config.roles.research}`;
   return undefined;
 }

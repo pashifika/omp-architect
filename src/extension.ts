@@ -7,7 +7,13 @@ import {
   type Phase,
   type ReviewMaterial,
 } from "./core.ts";
-import { loadReviewMaterial, saveReviewMaterial, reviewWrite, reviewCarrier } from "./artifacts.ts";
+import {
+  loadReviewMaterial,
+  saveReviewMaterial,
+  reviewWrite,
+  reviewCarrier,
+  completionCarrier,
+} from "./artifacts.ts";
 import { createReviewer } from "./reviewer.ts";
 import { createAutoController, type AutoDependencies } from "./auto/extension.ts";
 import instructions from "./prompts/orchestration.md" with { type: "text" };
@@ -17,6 +23,7 @@ function effectiveToolName(toolName: string, input: object): string {
   if (toolName === "write" && "path" in input) {
     if (input.path === "xd://architect_checkpoint") return "architect_checkpoint";
     if (input.path === "xd://auto_status") return "auto_status";
+    if (input.path === "xd://auto_step") return "auto_step";
   }
   return toolName;
 }
@@ -70,6 +77,7 @@ export function extensionFactory(
     let acceptedPrompt = "";
     let newUserRequest = false;
     const activeEvals = new Map<string, Record<string, unknown>>();
+    const autoCompletionCarriers = new Set<string>();
     let queuedCompletion:
       | {
           material: ReviewMaterial;
@@ -114,6 +122,7 @@ export function extensionFactory(
     const initialize = async (ctx: ExtensionContext) => {
       generation++;
       activeEvals.clear();
+      autoCompletionCarriers.clear();
       clearQueuedCompletion();
       stopped = false;
       newUserRequest = false;
@@ -157,6 +166,8 @@ export function extensionFactory(
       pi,
       {
         state: () => state,
+        instructions: () => instructions,
+        acceptInternal: (text, ctx) => prepareStart(text, ctx),
         review: async (phase, body, ctx, signal, invocationId) => {
           const current = state;
           const requestGeneration = generation;
@@ -211,6 +222,7 @@ export function extensionFactory(
       lifetime.abort();
       clearQueuedCompletion();
       activeEvals.clear();
+      autoCompletionCarriers.clear();
     });
     pi.on("input", (event, ctx) => {
       if (ctx.agent.kind !== "main" || event.source === "extension") return;
@@ -229,11 +241,9 @@ export function extensionFactory(
     pi.on("turn_start", (_, ctx) => {
       if (ctx.agent.kind === "main") acceptedPrompt = "";
     });
-    pi.on("before_agent_start", async (event, ctx) => {
-      if (ctx.agent.kind !== "main") return;
-      if (!state && !configError) await initialize(ctx);
-      if (!acceptedPrompt || event.prompt !== acceptedPrompt) {
-        const autoStart = auto.beforeStart(event.prompt, ctx);
+    const prepareStart = (text: string, ctx: ExtensionContext) => {
+      if (!acceptedPrompt || text !== acceptedPrompt) {
+        const autoStart = auto.beforeStart(text, ctx);
         if (autoStart === "blocked") stopped = true;
         // A preparation/queued-delivery hook alone is not a new user request.
         // A confirmed Auto start has its own exact bootstrap ownership check.
@@ -246,21 +256,31 @@ export function extensionFactory(
         newUserRequest = false;
         const expected = expectedContinuation;
         expectedContinuation = "";
-        const unexpected = expected !== "" && event.prompt !== expected;
+        const unexpected = expected !== "" && text !== expected;
         if (unexpected)
           stopBlocked("Unexpected continuation context; a new user request is required", ctx);
         const preserving =
-          autoStart !== "new" || (expected !== "" && event.prompt === expected) || unexpected;
+          autoStart !== "new" || (expected !== "" && text === expected) || unexpected;
         if (!preserving) {
           stopped = false;
           generation++;
           activeEvals.clear();
+          autoCompletionCarriers.clear();
           clearQueuedCompletion();
-          state?.begin(auto.request() ?? event.prompt);
+          state?.begin(auto.request() ?? text);
         }
-        if (!unexpected && autoStart !== "blocked") acceptedPrompt = event.prompt;
+        if (!unexpected && autoStart !== "blocked") acceptedPrompt = text;
         else acceptedPrompt = "";
       }
+    };
+    pi.on("context", (event, ctx) => {
+      if (ctx.agent.kind !== "main") return;
+      return { messages: auto.context(event, ctx) };
+    });
+    pi.on("before_agent_start", async (event, ctx) => {
+      if (ctx.agent.kind !== "main") return;
+      if (!state && !configError) await initialize(ctx);
+      prepareStart(event.prompt, ctx);
       return {
         systemPrompt: [
           ...event.systemPrompt,
@@ -272,7 +292,7 @@ export function extensionFactory(
     });
     pi.on("before_subagent_spawn", (event, ctx) => {
       if (ctx.agent.kind !== "main" || !state) return;
-      const autoGate = auto.spawnGate();
+      const autoGate = auto.spawnGate(event.agent, event.invocationKind);
       if (autoGate) return { block: true, reason: autoGate };
       const role = routeAgent(event.agent, state.config);
       if (!role) return;
@@ -339,18 +359,38 @@ export function extensionFactory(
     pi.on("tool_result", (event, ctx) => {
       if (ctx.agent.kind !== "main" || !state) return;
       const toolName = effectiveToolName(event.toolName, event.input);
-      if (toolName === "eval") activeEvals.delete(event.toolCallId);
+      if (toolName === "eval") {
+        activeEvals.delete(event.toolCallId);
+        if (autoCompletionCarriers.delete(event.toolCallId)) return;
+      }
       if (toolName === "auto_status" || toolName === "architect_checkpoint") return;
       const text = event.content
         .filter((c) => c.type === "text")
         .map((c) => c.text)
         .join("\n");
+      // Native task envelopes may omit isError even when a child failed. Keep
+      // the ordinary repeated-failure recovery gate effective for Auto leaves.
+      const results =
+        event.details && typeof event.details === "object" && "results" in event.details
+          ? event.details.results
+          : undefined;
+      const failedLeaf =
+        auto.isRunning() &&
+        toolName === "task" &&
+        Array.isArray(results) &&
+        results.some(
+          (result) =>
+            result &&
+            typeof result === "object" &&
+            ((typeof result.exitCode === "number" && result.exitCode !== 0) ||
+              (typeof result.error === "string" && result.error.length > 0)),
+        );
       const repeated = state.observe(
         event.toolCallId,
         toolName,
         event.input,
         text,
-        event.isError,
+        event.isError || failedLeaf,
         captureMetadata(event.details),
       );
       if (repeated)
@@ -438,16 +478,6 @@ export function extensionFactory(
             isError: true,
           };
         }
-        if (params.phase === "completion" && auto.handlesCompletion())
-          return {
-            content: [
-              {
-                type: "text",
-                text: "OMP Auto will collect fresh Rasen CLI validation and perform this completion checkpoint at the turn boundary. No review round was charged. Return a factual progress summary; do not claim completion yet.",
-              },
-            ],
-            isError: false,
-          };
         const admissionState = state;
         const admissionGeneration = generation;
         const invocationId = `${ctx.sessionManager.getSessionId()}:${generation}:${id}`.slice(
@@ -540,6 +570,52 @@ export function extensionFactory(
             content: [{ type: "text", text: JSON.stringify(result) }],
             details: result,
             isError: true,
+          };
+        }
+        if (params.phase === "completion" && auto.handlesCompletion()) {
+          if (
+            activeEvals.size &&
+            (activeEvals.size !== 1 ||
+              ![...activeEvals.values()].every((input) =>
+                completionCarrier(input, state?.config.maxReviewBytes ?? 131072),
+              ))
+          ) {
+            const verdict = state?.rejectReview(
+              "completion",
+              invocationId,
+              "Auto completion inside Eval requires one dedicated foreground JavaScript reset=true single-call native checkpoint carrier; await all other effects first",
+            );
+            const result = { ...verdict, invocationId, status: "input_rejected", charged: false };
+            return {
+              content: [{ type: "text", text: JSON.stringify(result) }],
+              details: result,
+              isError: true,
+            };
+          }
+          for (const evalId of activeEvals.keys()) autoCompletionCarriers.add(evalId);
+          const current = state;
+          const requestGeneration = generation;
+          const verdict = await auto.complete(material, ctx, signal, invocationId);
+          if (
+            state &&
+            state === current &&
+            generation === requestGeneration &&
+            state.terminalReason
+          )
+            stopBlocked(state.terminalReason, ctx);
+          const result = {
+            ...verdict,
+            invocationId,
+            review: state?.lastReview?.invocationId === invocationId ? state.lastReview : null,
+            next:
+              verdict.decision === "approve"
+                ? "Return a factual final summary; Auto will settle only if fresh Rasen facts still match this approval"
+                : "Address the finding or required independent round and resubmit native completion evidence within this LEAD turn",
+          };
+          return {
+            content: [{ type: "text", text: JSON.stringify(result) }],
+            details: result,
+            isError: verdict.decision !== "approve",
           };
         }
         if (params.phase === "completion" && activeEvals.size) {
