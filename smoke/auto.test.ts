@@ -29,7 +29,7 @@ import { readRasenWorkflow, type RasenWorkflow } from "../src/auto/workflow.ts";
 import type { AutoConfig } from "../src/auto/config.ts";
 import { autoStepCarrier, type AutoDependencies } from "../src/auto/extension.ts";
 import { readRasenSnapshot, validateRasenChange, type RasenSnapshot } from "../src/auto/rasen.ts";
-import { createJevProvider } from "../src/auto/decision.ts";
+import { buildJevRequest, createJevProvider } from "../src/auto/decision.ts";
 import type { Reviewer } from "../src/core.ts";
 import { extensionFactory } from "../src/extension.ts";
 import { withAgentDir } from "./isolated-host.ts";
@@ -3316,6 +3316,127 @@ test("unreceipted interrupted native work cannot pass Auto completion", async ()
       completionVerified: false,
       nativeWork: { settlementUnverified: ["interrupted"] },
     });
+  } finally {
+    await f.close();
+  }
+});
+
+test("built-in apply sends its native host route to Jev even without external run-state", async () => {
+  let request: ReturnType<typeof buildJevRequest> | undefined;
+  const f = await loaderFixture(
+    {},
+    {
+      dependencies: {
+        workflow: async () => ({
+          kind: "absent",
+          change: "fixture-change",
+          reason: "No external run-state",
+          fingerprint: "absent",
+        }),
+        decision: () =>
+          createJevProvider(
+            { model: "jev-latest", timeoutMs: 500, maxEvidenceChars: 12000 },
+            {
+              readApiKey: () => "fixture-not-a-secret",
+              fetch: async (_url, init) => {
+                request = JSON.parse(String(init.body));
+                return new Response(
+                  JSON.stringify({
+                    model: "jev-latest",
+                    answers: {
+                      next: {
+                        type: "choice",
+                        choice: "continue",
+                        confidence: 0.95,
+                        probabilities: {
+                          continue: 0.95,
+                          replan: 0.01,
+                          needs_user: 0.02,
+                          uncertain: 0.02,
+                        },
+                      },
+                    },
+                    usage: { input_tokens: 1, output_tokens: 1 },
+                  }),
+                );
+              },
+            },
+          ),
+      },
+    },
+  );
+  try {
+    await f.start();
+    expect(await f.step("Need to apply remaining prepared tasks")).toMatchObject({
+      choice: "continue",
+      allowedNextPhase: "apply",
+    });
+    const facts = JSON.parse(request!.state.summary);
+    expect(facts).toMatchObject({
+      allowedPhase: "apply",
+      hostSource: "builtin",
+      hostBlocker: null,
+      stage: { role: "implementer", runtime: "omp", dispatchMode: "native" },
+      nativeWorkSettled: true,
+    });
+    expect(facts.nextStep).toContain("native omp-worker");
+    expect(facts.workflowContext).toContain("external Rasen run-state is not required");
+    expect(await f.status()).toMatchObject({
+      status: "running",
+      decisionDiagnostics: {
+        attempts: [{ provider: "jev", outcome: "accepted", confidence: 0.95 }],
+      },
+    });
+  } finally {
+    await f.close();
+  }
+});
+
+test("small decision evidence budgets preserve complete JSON and built-in next-step facts", async () => {
+  const f = await loaderFixture(
+    { maxEvidenceChars: 1000 },
+    {
+      dependencies: {
+        workflow: async () => ({
+          kind: "absent",
+          change: "fixture-change",
+          reason: "No external run-state",
+          fingerprint: "absent",
+        }),
+        decision: () => async (evidence) => {
+          const request = buildJevRequest(evidence, {
+            model: "jev-latest",
+            maxEvidenceChars: 1000,
+          });
+          const facts = JSON.parse(request.state.summary);
+          expect(facts).toMatchObject({
+            hostSource: "builtin",
+            allowedPhase: "apply",
+            externalRunStateRequired: false,
+            truncated: true,
+          });
+          expect(facts.nextStep).toContain("native omp-worker");
+          return { choice: "continue", confidence: 0.95 };
+        },
+      },
+    },
+  );
+  try {
+    await f.start();
+    for (const handler of f.extension.handlers.get("tool_result") ?? []) {
+      await handler(
+        {
+          type: "tool_result",
+          toolName: "read",
+          toolCallId: "escaped-evidence",
+          input: { path: "tasks.md" },
+          content: [{ type: "text", text: '\"'.repeat(1000) }],
+          isError: false,
+        },
+        f.ctx,
+      );
+    }
+    expect(await f.step("Untrusted claim ".repeat(1000))).toMatchObject({ choice: "continue" });
   } finally {
     await f.close();
   }

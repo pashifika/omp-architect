@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test";
+import { JevError } from "../src/auto/decision.ts";
+import { DecisionFailure } from "../src/auto/decision-diagnostics.ts";
 import { AutoRun } from "../src/auto/core.ts";
 import { parseAutoConfig } from "../src/auto/config.ts";
 import type { RasenSnapshot } from "../src/auto/rasen.ts";
@@ -77,6 +79,11 @@ test("deadline and cancellation remain terminal despite high-confidence decision
   expect(await cancelled.decide(evidence, good, good, abort.signal)).toBeUndefined();
   expect(cancelled.status).toBe("cancelled");
   expect(cancelled.fallbacks).toBe(0);
+  expect(cancelled.statusView().decisionDiagnostics.attempts[0]).toMatchObject({
+    provider: "jev",
+    outcome: "error",
+    errorCode: "DECISION_CANCELLED",
+  });
 });
 
 test("stall budget uses new completed task IDs, not instruction/fingerprint churn or checkbox toggling", () => {
@@ -242,4 +249,101 @@ test("null legacy limits are explicit and supervision caps remain finite", () =>
     { maxSteps: -1 },
   ])
     expect(() => parseAutoConfig(invalid)).toThrow();
+});
+
+test("decision diagnostics preserve primary and fallback provenance without secrets", async () => {
+  const run = new AutoRun(parseAutoConfig({}), snapshot());
+  await run.decide(
+    evidence,
+    async () => {
+      throw new JevError("JEV_MISSING_API_KEY");
+    },
+    async () => {
+      throw new Error("secret credential and response body");
+    },
+    signal(),
+  );
+  expect(run.status).toBe("uncertain");
+  expect(run.statusView().decisionDiagnostics).toMatchObject({
+    minConfidence: 0.8,
+    attempts: [
+      { provider: "jev", outcome: "error", errorCode: "JEV_MISSING_API_KEY" },
+      { provider: "architect", outcome: "error", errorCode: "PROVIDER_ERROR" },
+    ],
+  });
+  expect(JSON.stringify(run.statusView())).not.toContain("secret");
+  expect(run.reason).toContain("JEV_MISSING_API_KEY");
+  expect(run.fallbacks).toBe(1);
+  expect(run.decisions).toBe(1);
+});
+
+test("diagnostics distinguish timeout, low confidence, uncertainty and missing user input", async () => {
+  for (const [provider, outcome, extra] of [
+    [() => new Promise(() => {}), "error", { errorCode: "DECISION_TIMEOUT" }],
+    [
+      async () => ({ choice: "continue", confidence: 0.79 }),
+      "low_confidence",
+      { confidence: 0.79 },
+    ],
+    [async () => ({ choice: "uncertain", confidence: 0.99 }), "uncertain", { confidence: 0.99 }],
+    [
+      async () => ({ choice: "needs_user", confidence: 0.99 }),
+      "accepted",
+      { choice: "needs_user" },
+    ],
+    [
+      async () => {
+        throw new DecisionFailure("FALLBACK_INVALID_RESPONSE");
+      },
+      "error",
+      { errorCode: "FALLBACK_INVALID_RESPONSE" },
+    ],
+  ] as const) {
+    const run = new AutoRun(
+      parseAutoConfig({ fallback: "stop", decisionTimeoutMs: 100 }),
+      snapshot(),
+    );
+    await run.decide(evidence, provider as DecisionProvider, undefined, signal());
+    expect(run.statusView().decisionDiagnostics.attempts[0]).toMatchObject({ outcome, ...extra });
+    expect(run.status).toBe(
+      "choice" in extra && extra.choice === "needs_user" ? "needs_user" : "uncertain",
+    );
+  }
+});
+
+test("a successful fallback remains visible and does not bypass minimum confidence", async () => {
+  const run = new AutoRun(parseAutoConfig({}), snapshot());
+  const result = await run.decide(
+    evidence,
+    async () => {
+      throw new JevError("JEV_INVALID_RESPONSE");
+    },
+    good,
+    signal(),
+  );
+  expect(result?.choice).toBe("continue");
+  expect(run.statusView().decisionDiagnostics.attempts).toMatchObject([
+    { provider: "jev", outcome: "error", errorCode: "JEV_INVALID_RESPONSE" },
+    { provider: "architect", outcome: "accepted", confidence: 0.95 },
+  ]);
+});
+
+test("decision status snapshots are defensive and the next decision replaces provenance", async () => {
+  const run = new AutoRun(parseAutoConfig({}), snapshot());
+  await run.decide(
+    evidence,
+    async () => {
+      throw new JevError("JEV_HTTP_ERROR");
+    },
+    good,
+    signal(),
+  );
+  run.statusView().decisionDiagnostics.attempts[0].errorCode = "mutated";
+  expect(run.statusView().decisionDiagnostics.attempts[0].errorCode).toBe("JEV_HTTP_ERROR");
+  await run.decide(evidence, good, good, signal());
+  expect(run.statusView().decisionDiagnostics.attempts).toHaveLength(1);
+  expect(run.statusView().decisionDiagnostics.attempts[0]).toMatchObject({
+    provider: "jev",
+    outcome: "accepted",
+  });
 });

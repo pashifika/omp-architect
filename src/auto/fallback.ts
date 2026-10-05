@@ -3,6 +3,7 @@ import {
   type ExtensionAPI,
   type ExtensionContext,
 } from "@oh-my-pi/pi-coding-agent";
+import { DecisionFailure } from "./decision-diagnostics.ts";
 import type { Config } from "../config.ts";
 import { reviewOptions } from "../reviewer.ts";
 import type { AutoConfig } from "./config.ts";
@@ -17,7 +18,7 @@ export function createDecisionFallback(
   return async (evidence, signal) => {
     signal.throwIfAborted();
     if (!ctx.models.resolve(`@${architect.roles.architect}`))
-      throw new Error("Auto fallback role is unavailable");
+      throw new DecisionFailure("FALLBACK_ROLE_UNAVAILABLE");
     const { session } = await createAgentSession({
       ...reviewOptions(pi, ctx, architect),
       deadline: Date.now() + auto.decisionTimeoutMs,
@@ -40,24 +41,31 @@ export function createDecisionFallback(
         answer.role !== "assistant" ||
         ["error", "aborted"].includes(answer.stopReason)
       )
-        throw new Error("Auto fallback returned no response");
+        throw new DecisionFailure("FALLBACK_NO_RESPONSE");
       const text = answer.content
         .filter((part) => part.type === "text")
         .map((part) => part.text)
         .join("\n");
-      const value = JSON.parse(text.trim().replace(/^```(?:json)?\s*|\s*```$/g, ""));
+      let value: unknown;
+      try {
+        value = JSON.parse(text.trim().replace(/^```(?:json)?\s*|\s*```$/g, ""));
+      } catch {
+        throw new DecisionFailure("FALLBACK_INVALID_RESPONSE");
+      }
       if (
         !value ||
         typeof value !== "object" ||
+        !("choice" in value) ||
+        !("confidence" in value) ||
         Array.isArray(value) ||
         Object.keys(value).some((key) => key !== "choice" && key !== "confidence") ||
-        !["continue", "replan", "needs_user", "uncertain"].includes(value.choice) ||
+        !["continue", "replan", "needs_user", "uncertain"].includes(value.choice as string) ||
         typeof value.confidence !== "number" ||
         !Number.isFinite(value.confidence) ||
         value.confidence < 0 ||
         value.confidence > 1
       )
-        throw new Error("Auto fallback returned an invalid decision");
+        throw new DecisionFailure("FALLBACK_INVALID_RESPONSE");
       return value as Decision;
     } finally {
       signal.removeEventListener("abort", abort);

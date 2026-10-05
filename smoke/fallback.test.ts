@@ -22,6 +22,7 @@ test("real SDK semantic fallback uses the native architect role with zero tools"
   const provider = `architect-fixture-${crypto.randomUUID()}`;
   const api = `architect-api-${crypto.randomUUID()}`;
   let requests = 0;
+  let responseText = '{"choice":"replan","confidence":0.9}';
   let observedToolCount = -1;
   let observedReasoning: unknown;
   registry.registerProvider(
@@ -43,7 +44,7 @@ test("real SDK semantic fallback uses the native architect role with zero tools"
           content: [
             {
               type: "text",
-              text: '{"choice":"replan","confidence":0.9}',
+              text: responseText,
             },
           ],
           stopReason: "stop",
@@ -105,6 +106,39 @@ test("real SDK semantic fallback uses the native architect role with zero tools"
     expect(requests).toBe(1);
     expect(observedToolCount).toBe(0);
     expect(observedReasoning).toBe("high");
+    const evidence = {
+      change: "fixture",
+      remaining: 1,
+      completed: 0,
+      summary: "Local fixture",
+      recentTools: [],
+    };
+    for (const invalid of [
+      "private malformed response",
+      '{"choice":"continue","confidence":0.99,"secret":"withheld"}',
+    ]) {
+      responseText = invalid;
+      await expect(
+        createDecisionFallback(
+          pi,
+          ctx,
+          parseConfig({}),
+          parseAutoConfig({}),
+        )(evidence, new AbortController().signal),
+      ).rejects.toMatchObject({ code: "FALLBACK_INVALID_RESPONSE" });
+    }
+    const unavailable = {
+      ...ctx,
+      models: { resolve: () => undefined },
+    } as unknown as ExtensionContext;
+    await expect(
+      createDecisionFallback(
+        pi,
+        unavailable,
+        parseConfig({}),
+        parseAutoConfig({}),
+      )(evidence, new AbortController().signal),
+    ).rejects.toMatchObject({ code: "FALLBACK_ROLE_UNAVAILABLE" });
   } finally {
     registry.clearSourceRegistrations(provider);
     auth.close();

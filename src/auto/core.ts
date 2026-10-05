@@ -1,5 +1,10 @@
 import type { AutoConfig } from "./config.ts";
 import type { Decision, DecisionProvider, DecisionEvidence } from "./decision.ts";
+import {
+  DecisionFailure,
+  decisionFailureCode,
+  type DecisionAttempt,
+} from "./decision-diagnostics.ts";
 import type { RasenSnapshot } from "./rasen.ts";
 
 export type AutoStatus =
@@ -34,6 +39,7 @@ export class AutoRun {
   #identity: string;
   #seenTools = new Set<string>();
   #deciding = false;
+  #decisionAttempts: DecisionAttempt[] = [];
 
   constructor(
     readonly config: AutoConfig,
@@ -161,13 +167,44 @@ export class AutoRun {
       value.confidence >= this.config.minConfidence &&
       value.confidence <= 1 &&
       value.choice !== "uncertain";
+    const attempt = async (provider: DecisionProvider, name: DecisionAttempt["provider"]) => {
+      const started = this.now();
+      try {
+        const value = await this.bounded(provider, evidence, signal);
+        const valid =
+          !!value &&
+          ["continue", "replan", "needs_user", "uncertain"].includes(value.choice) &&
+          Number.isFinite(value.confidence) &&
+          value.confidence >= 0 &&
+          value.confidence <= 1;
+        const accepted: boolean = acceptable(value);
+        this.#decisionAttempts.push({
+          provider: name,
+          outcome: !valid
+            ? "invalid_response"
+            : accepted
+              ? "accepted"
+              : value.choice === "uncertain"
+                ? "uncertain"
+                : "low_confidence",
+          ...(valid ? { choice: value.choice, confidence: value.confidence } : {}),
+          elapsedMs: Math.max(0, this.now() - started),
+        });
+        return valid ? value : undefined;
+      } catch (error) {
+        this.#decisionAttempts.push({
+          provider: name,
+          outcome: "error",
+          errorCode: decisionFailureCode(error),
+          elapsedMs: Math.max(0, this.now() - started),
+        });
+        return undefined;
+      }
+    };
     try {
       this.decisions++;
-      try {
-        decision = await this.bounded(primary, evidence, signal);
-      } catch {
-        // Failed calls consume the same fixed budget. Never echo provider errors/secrets.
-      }
+      this.#decisionAttempts = [];
+      decision = await attempt(primary, "jev");
       if (signal.aborted) {
         this.stop("cancelled", "Decision cancelled or timed out");
         return;
@@ -180,16 +217,22 @@ export class AutoRun {
           this.checkTime()
         ) {
           this.fallbacks++;
-          try {
-            decision = await this.bounded(fallback, evidence, signal);
-          } catch {
-            decision = undefined;
-          }
+          decision = await attempt(fallback, "architect");
         } else decision = undefined;
       }
       if (signal.aborted) this.stop("cancelled", "Decision cancelled or timed out");
-      else if (!acceptable(decision)) this.stop("uncertain", "No sufficiently certain next action");
-      else if (decision.choice === "needs_user")
+      else if (!acceptable(decision)) {
+        const detail = this.#decisionAttempts
+          .map(
+            (item) =>
+              `${item.provider}: ${item.errorCode ?? item.outcome}${item.confidence === undefined ? "" : ` (${item.choice}, confidence ${item.confidence})`}`,
+          )
+          .join("; ");
+        this.stop(
+          "uncertain",
+          `No sufficiently certain next action (${detail}); inspect decisionDiagnostics before explicitly restarting`,
+        );
+      } else if (decision.choice === "needs_user")
         this.stop("needs_user", "User input or authorization is required");
       return this.checkTime() ? decision : undefined;
     } finally {
@@ -204,12 +247,13 @@ export class AutoRun {
   ): Promise<Decision> {
     const timeout = new AbortController();
     const combined = AbortSignal.any([signal, timeout.signal]);
-    combined.throwIfAborted();
+    if (combined.aborted) throw new DecisionFailure("DECISION_CANCELLED");
     const timer = setTimeout(() => timeout.abort(), this.config.decisionTimeoutMs);
     let abort: () => void = () => {};
     try {
       const cancelled = new Promise<never>((_, reject) => {
-        abort = () => reject(new Error("Decision cancelled"));
+        abort = () =>
+          reject(new DecisionFailure(signal.aborted ? "DECISION_CANCELLED" : "DECISION_TIMEOUT"));
         combined.addEventListener("abort", abort, { once: true });
         if (combined.aborted) abort();
       });
@@ -236,6 +280,11 @@ export class AutoRun {
           ? `${this.toolCalls}`
           : `${this.toolCalls}/${this.config.maxToolCalls}`,
       decisions: this.decisions,
+      decisionDiagnostics: {
+        minConfidence: this.config.minConfidence,
+        timeoutMs: this.config.decisionTimeoutMs,
+        attempts: this.#decisionAttempts.map((item) => ({ ...item })),
+      },
       fallbacks: `${this.fallbacks}/${this.config.maxFallbacks}`,
       stalls:
         this.config.maxStalls === null

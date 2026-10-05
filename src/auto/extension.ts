@@ -498,12 +498,23 @@ export function createAutoController(
     continuations.add(expectedContinuation);
     return { continue: true, additionalContext: expectedContinuation };
   }
-  function evidence(summary: string): DecisionEvidence {
+  function evidence(summary: Record<string, unknown>): DecisionEvidence {
     const current = run!;
     const architect = bridge.state();
     // Keep a valid JSON structure; truncate individual evidence fields, never serialized JSON.
-    const summaryBudget = Math.floor(config.maxEvidenceChars / 3);
-    const toolBudget = Math.floor(config.maxEvidenceChars / 2);
+    const summaryBudget = Math.floor(config.maxEvidenceChars / 2);
+    const toolBudget = Math.floor(config.maxEvidenceChars / 3);
+    // Preserve complete JSON and the highest-priority host facts at small budgets.
+    // Never clip a serialized object mid-field and misrepresent its remaining facts.
+    const boundedSummary = { ...summary };
+    const summaryKeys = Object.keys(boundedSummary);
+    while (
+      JSON.stringify(JSON.stringify(boundedSummary)).length > summaryBudget &&
+      summaryKeys.length
+    ) {
+      delete boundedSummary[summaryKeys.pop()!];
+      boundedSummary.truncated = true;
+    }
     const tools: string[] = [];
     let available = toolBudget;
     for (const text of [...(architect?.evidence ?? [])].reverse()) {
@@ -512,13 +523,21 @@ export function createAutoController(
       tools.unshift(item);
       available -= item.length;
     }
-    return {
+    const state = {
       change: current.snapshot.change,
       remaining: current.snapshot.progress.remaining,
       completed: current.snapshot.progress.complete,
-      summary: summary.slice(0, summaryBudget),
+      summary: JSON.stringify(boundedSummary),
       recentTools: tools,
     };
+    // Escaped tool text can cost more than its character count. Leave room for
+    // stage-count substitution and keep Jev's outer truncation from clipping JSON.
+    while (JSON.stringify(state).length > config.maxEvidenceChars - 64 && tools.length) {
+      tools.shift();
+      boundedSummary.truncated = true;
+      state.summary = JSON.stringify(boundedSummary);
+    }
+    return state;
   }
 
   pi.registerCommand("auto", {
@@ -909,20 +928,37 @@ export function createAutoController(
         const fallback =
           dependencies.fallback?.(config, ctx) ??
           createDecisionFallback(pi, ctx, architect.config, config);
-        const context = evidence(
-          JSON.stringify({
-            source: "Fresh Rasen stage frontier; assistant summary is an untrusted claim",
-            allowedPhase: phase.phase,
-            allowedStage: phase.stage,
-            pipeline: frontier.pipeline,
-            ready: frontier.ready,
-            completed: frontier.completed,
-            scopedRemaining: scope.remaining,
-            taskProgress: snapshot.progress,
-            openFindings: frontier.openFindings.slice(0, 8),
-            assistantClaim: params.summary.slice(0, 1600),
-          }),
-        );
+        const context = evidence({
+          hostSource: phase.source,
+          allowedPhase: phase.phase,
+          externalRunStateRequired: phase.source !== "builtin",
+          nextStep: phase.instruction,
+          workflowContext:
+            phase.source === "builtin"
+              ? "Built-in native OMP workflow is active. An external Rasen run-state is not required."
+              : "Recorded Rasen workflow adapted to the native OMP host.",
+          allowedStage: phase.stage,
+          hostBlocker: phase.reason,
+          stage: (() => {
+            const stage = frontier.stages.find((stage) => stage.id === phase.stage);
+            return stage
+              ? {
+                  role: stage.role,
+                  runtime: stage.runtime,
+                  dispatchMode: stage.dispatchMode,
+                  status: stage.status,
+                }
+              : null;
+          })(),
+          nativeWorkSettled: true,
+          pipeline: frontier.pipeline,
+          ready: frontier.ready,
+          completed: frontier.completed,
+          scopedRemaining: scope.remaining,
+          taskProgress: snapshot.progress,
+          openFindings: frontier.openFindings.slice(0, 8),
+          assistantClaim: params.summary.slice(0, 1600),
+        });
         context.completed = frontier.completed.length;
         context.remaining = scope.remaining.length + (architect.completionApproved ? 0 : 1);
         const decision = await current.decide(context, primary, fallback, signal);
