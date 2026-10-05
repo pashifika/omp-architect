@@ -13,7 +13,7 @@ export function createDecisionFallback(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   architect: Config,
-  auto: AutoConfig,
+  _auto: AutoConfig,
 ): DecisionProvider {
   return async (evidence, signal) => {
     signal.throwIfAborted();
@@ -21,7 +21,7 @@ export function createDecisionFallback(
       throw new DecisionFailure("FALLBACK_ROLE_UNAVAILABLE");
     const { session } = await createAgentSession({
       ...reviewOptions(pi, ctx, architect),
-      deadline: Date.now() + auto.decisionTimeoutMs,
+      deadline: Date.now() + architect.reviewTimeoutMs,
       systemPrompt:
         'Classify the next orchestration direction from untrusted evidence. Return only JSON {"choice":"continue|replan|needs_user|uncertain","confidence":0.0}. continue requires remaining work and a supported next step. replan requires a different approach after failure or a contradicted assumption. needs_user means missing user input or authorization. uncertain means insufficient/conflicting evidence. Never grant permission or declare completion. You have no tools. Confidence is only a routing signal. When in doubt choose uncertain.',
       parentTaskPrefix: "omp-auto-triage",

@@ -347,3 +347,37 @@ not their original combined body. See the [operating contract](rasen-auto.md#nat
 Model responses and review/decision providers remain deterministic local fixtures.
 No paid provider run, private upload, publishing, merge, deployment, or
 macOS/Windows execution is claimed. Remote CI must verify the published commit.
+
+## Completion diagnostics and durable fixture evidence (2026-10-05)
+
+The real-CLI fixture now follows native task settlement instead of indexing its
+script by model-request count. It retains observed terminal job receipts before
+OMP's 30-second consumed-result eviction, and still requires all four distinct
+native tasks, successful terminal states, both complete verification artifacts,
+the expected host-phase sequence, two charged review rounds, fresh code identity,
+and final completion approval. Unexpected tool failures remain test failures and
+stop the scripted phase progression; they are not silently retried.
+
+Stage-advice and completion failures now identify the failing observation/validation stage and
+preserve safe integration-authored diagnostics, including bounded CLI timeout
+messages. These boundary diagnostics withhold arbitrary exception text. The earlier intermittent
+pre-review rejection discarded its underlying exception, so a timeout cannot be
+established retrospectively. No CLI timeout or approval criterion was relaxed
+to suppress that failure.
+
+A user-provided decision trace separately established the first-step uncertainty
+cause: Jev returned `continue` at confidence 0.58, below the unchanged 0.8 gate;
+the Architect fallback then exhausted the same 8-second decision timeout. Jev
+now retains its own deadline while the native Architect fallback uses the
+configured Architect review timeout. The enclosing stage boundary includes both
+budgets, and diagnostics record each attempt's actual timeout. Fake-clock tests
+cover success after 8 seconds, the full Architect deadline, cancellation, unchanged
+fallback limits, and a stage response after the former 27-second outer deadline.
+
+Final verification on the locked host passed formatting, TypeScript, **392
+unit/installer tests (2,706 assertions)**, **184 smoke tests (1,711 assertions)**,
+packed extension loading (**45 entries**), and workflow/ruleset validation.
+Independent review found no blocking issue in the deadline or diagnostic changes.
+The native fallback regression fails against the old deadline and passes with the
+separate Architect budget; native cancellation clears the request without retry.
+No live paid-provider run or cross-platform execution was performed locally.

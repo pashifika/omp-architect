@@ -2,8 +2,10 @@ import { expect, test } from "bun:test";
 import {
   AutoPreflightError,
   type AutoPreflightStage,
+  autoCompletionDiagnostic,
   autoPreflightDiagnostic,
   diagnosticPath,
+  WorkspaceEvidenceError,
 } from "../src/auto/diagnostics.ts";
 
 test("preflight shows only integration-owned diagnostics and allowlisted OS codes", () => {
@@ -24,6 +26,28 @@ test("preflight shows only integration-owned diagnostics and allowlisted OS code
   ).toContain("Expected local change");
   expect(diagnosticPath("a\x1b[31m\n\u202eb")).toBe("a?[31m??b");
   expect(diagnosticPath("x".repeat(1000))).toHaveLength(240);
+});
+
+test("completion diagnostics retain actionable stage guidance and redact untrusted values", () => {
+  const secret = "PRIVATE PROVIDER CONTENT\x1b[31m";
+  for (const stage of ["change snapshot", "workflow", "validation", "review"] as const) {
+    for (const error of [secret, { message: secret, code: secret }, null, undefined]) {
+      const message = autoCompletionDiagnostic(stage, error);
+      expect(message).toContain(`[${stage}]`);
+      expect(message).toContain("raw error details withheld");
+      expect(message).not.toContain(secret);
+      expect(message).not.toContain("undefined");
+    }
+  }
+  expect(autoCompletionDiagnostic("validation", new Error(secret))).toContain(
+    "rasen validate <change> --type change --strict --json",
+  );
+  const workspace = autoCompletionDiagnostic(
+    "change snapshot",
+    new WorkspaceEvidenceError("Cannot read the Git-inventoried project file"),
+  );
+  expect(workspace).toContain("Check the named project path and its link target");
+  expect(workspace).not.toContain("rasen status");
 });
 
 test("supported admission diagnostics do not require a generated Auto workflow skill", () => {

@@ -152,6 +152,7 @@ export class AutoRun {
     primary: DecisionProvider,
     fallback: DecisionProvider | undefined,
     signal: AbortSignal,
+    fallbackTimeoutMs = this.config.decisionTimeoutMs,
   ): Promise<Decision | undefined> {
     if (!this.checkTime()) return;
     if (this.#deciding) {
@@ -169,8 +170,9 @@ export class AutoRun {
       value.choice !== "uncertain";
     const attempt = async (provider: DecisionProvider, name: DecisionAttempt["provider"]) => {
       const started = this.now();
+      const timeoutMs = name === "architect" ? fallbackTimeoutMs : this.config.decisionTimeoutMs;
       try {
-        const value = await this.bounded(provider, evidence, signal);
+        const value = await this.bounded(provider, evidence, signal, timeoutMs);
         const valid =
           !!value &&
           ["continue", "replan", "needs_user", "uncertain"].includes(value.choice) &&
@@ -180,6 +182,7 @@ export class AutoRun {
         const accepted: boolean = acceptable(value);
         this.#decisionAttempts.push({
           provider: name,
+          timeoutMs,
           outcome: !valid
             ? "invalid_response"
             : accepted
@@ -194,6 +197,7 @@ export class AutoRun {
       } catch (error) {
         this.#decisionAttempts.push({
           provider: name,
+          timeoutMs,
           outcome: "error",
           errorCode: decisionFailureCode(error),
           elapsedMs: Math.max(0, this.now() - started),
@@ -244,11 +248,12 @@ export class AutoRun {
     provider: DecisionProvider,
     evidence: DecisionEvidence,
     signal: AbortSignal,
+    timeoutMs: number,
   ): Promise<Decision> {
     const timeout = new AbortController();
     const combined = AbortSignal.any([signal, timeout.signal]);
     if (combined.aborted) throw new DecisionFailure("DECISION_CANCELLED");
-    const timer = setTimeout(() => timeout.abort(), this.config.decisionTimeoutMs);
+    const timer = setTimeout(() => timeout.abort(), timeoutMs);
     let abort: () => void = () => {};
     try {
       const cancelled = new Promise<never>((_, reject) => {

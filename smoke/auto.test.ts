@@ -1440,6 +1440,53 @@ test("external completion flags and model claims cannot replace a native verific
   }
 });
 
+test("Auto stage fallback uses the Architect review deadline beyond the old 27s boundary", async () => {
+  const started = Promise.withResolvers<void>();
+  const response = Promise.withResolvers<{ choice: "continue"; confidence: number }>();
+  let fallbackSignal: AbortSignal | undefined;
+  const f = await loaderFixture(
+    {},
+    {
+      dependencies: {
+        decision: () => async () => ({ choice: "continue", confidence: 0.58 }),
+        fallback: () => async (_evidence, signal) => {
+          fallbackSignal = signal;
+          started.resolve();
+          return response.promise;
+        },
+      },
+    },
+  );
+  let pending: ReturnType<typeof f.step> | undefined;
+  try {
+    await f.start();
+    jest.useFakeTimers();
+    pending = f.step();
+    await started.promise;
+    jest.advanceTimersByTime(40000);
+    await Promise.resolve();
+    expect(fallbackSignal?.aborted).toBe(false);
+    response.resolve({ choice: "continue", confidence: 0.95 });
+    expect(await pending).toMatchObject({ choice: "continue", isError: false });
+    expect(await f.status()).toMatchObject({
+      status: "running",
+      completionVerified: false,
+      fallbacks: "1/2",
+      decisionDiagnostics: {
+        attempts: [
+          { provider: "jev", confidence: 0.58, timeoutMs: 8000 },
+          { provider: "architect", outcome: "accepted", timeoutMs: 120000 },
+        ],
+      },
+    });
+  } finally {
+    response.resolve({ choice: "continue", confidence: 0.95 });
+    jest.useRealTimers();
+    await pending;
+    await f.close();
+  }
+});
+
 test("Auto checkpoint review keeps the normal Architect timeout beyond the 24s stop-hook window", async () => {
   const started = Promise.withResolvers<void>();
   const cancel = new AbortController();
@@ -1802,6 +1849,27 @@ for (const mode of [
     const prompts: string[] = [];
     const childTurns = new Map<string, number>();
     const nativeTaskResults: unknown[] = [];
+    // Native consumed jobs are evicted after 30 seconds. Preserve receipts when
+    // observed, rather than treating the live job cache as a durable journal.
+    const nativeJobReceipts = new Map<
+      string,
+      { agentId?: string; type: string; status: string; resultText?: string }
+    >();
+    const captureNativeReceipts = () => {
+      for (const job of session?.asyncJobManager?.getAllJobs() ?? []) {
+        if (workerIds.includes(job.agentId ?? "") && job.status !== "running")
+          nativeJobReceipts.set(job.id, {
+            agentId: job.agentId,
+            type: job.type,
+            status: job.status,
+            resultText: job.resultText,
+          });
+      }
+    };
+    const realCliSteps = [1, "reads", 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16] as const;
+    let realCliCursor = 0;
+    let scriptFailed = false;
+    const executedRealCliSteps: Array<number | string> = [];
     const phaseResults: unknown[] = [];
     const decisionStates: Array<Record<string, unknown>> = [];
     const providerConfig: Parameters<ModelRegistry["registerProvider"]>[1] = {
@@ -1872,32 +1940,23 @@ for (const mode of [
             });
           }
         } else if (main) {
+          captureNativeReceipts();
+          // Background settlement may take any number of wait calls. Advance
+          // the deterministic model script by completed actions, never by a
+          // transport request index or wall-clock-dependent wait count.
+          const pendingNative = session?.asyncJobManager
+            ?.getAllJobs()
+            .some((job) => workerIds.includes(job.agentId ?? "") && job.status === "running");
           const step =
             mode === "real-cli"
-              ? [
-                  1,
-                  "reads",
-                  2,
-                  "wait",
-                  3,
-                  4,
-                  "wait",
-                  5,
-                  6,
-                  7,
-                  8,
-                  9,
-                  "wait",
-                  10,
-                  11,
-                  "wait",
-                  12,
-                  13,
-                  14,
-                  15,
-                  16,
-                ][requests - 1]
+              ? scriptFailed
+                ? undefined
+                : pendingNative
+                  ? "wait"
+                  : realCliSteps[realCliCursor++]
               : requests;
+          if (mode === "real-cli" && step !== "wait" && step !== undefined)
+            executedRealCliSteps.push(step);
           if (requests === 1)
             call("auto_step", { summary: "Initial extension-owned prepared-change frontier" });
           else if (step === "wait") call("wait", {});
@@ -2162,6 +2221,21 @@ for (const mode of [
             });
             pi.on("tool_result", (event, ctx) => {
               if (ctx.agent.kind !== "main") return;
+              captureNativeReceipts();
+              if (mode === "real-cli" && event.isError) {
+                const expectedRevision =
+                  event.toolName === "architect_checkpoint" &&
+                  reviews === 1 &&
+                  (event.details as { review?: { charged?: boolean } })?.review?.charged === true;
+                if (!expectedRevision) {
+                  scriptFailed = true;
+                  errors.push({
+                    tool: event.toolName,
+                    content: event.content,
+                    details: event.details,
+                  });
+                }
+              }
               if (event.toolName === "task") nativeTaskResults.push(event.details);
               if (event.toolName === "auto_step") phaseResults.push(event.content);
             });
@@ -2267,7 +2341,8 @@ for (const mode of [
       expect(saved).toContain("Auto run:");
       expect(saved).not.toContain("installed rasen-auto workflow");
       expect(confirms).toBe(1);
-      expect(requests).toBe(mode === "max-cap" ? 6 : mode === "real-cli" ? 21 : 11);
+      if (mode === "real-cli") expect(executedRealCliSteps).toEqual([...realCliSteps]);
+      else expect(requests).toBe(mode === "max-cap" ? 6 : 11);
       if (mode !== "real-cli") expect(reads).toBeGreaterThanOrEqual(mode === "max-cap" ? 3 : 4);
       expect(decisions).toBe(mode === "max-cap" ? 3 : mode === "real-cli" ? 6 : 4);
       expect(validations).toBe(mode === "max-cap" ? 1 : 3);
@@ -2329,10 +2404,10 @@ for (const mode of [
         );
         await expect(fs.lstat(workflowPath)).rejects.toMatchObject({ code: "ENOENT" });
         expect(nativeTaskResults).toHaveLength(4);
-        const nativeJobs = session
-          .asyncJobManager!.getAllJobs()
-          .filter((job) => workerIds.includes(job.agentId ?? ""));
+        captureNativeReceipts();
+        const nativeJobs = [...nativeJobReceipts.values()];
         expect(nativeJobs).toHaveLength(4);
+        expect(nativeJobs.map((job) => job.agentId).sort()).toEqual([...workerIds].sort());
         expect(nativeJobs.every((job) => job.type === "task" && job.status === "completed")).toBe(
           true,
         );

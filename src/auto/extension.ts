@@ -1,5 +1,11 @@
 import {
   AutoPreflightError,
+  AutoObservationError,
+  autoObservation,
+  autoCompletionDiagnostic,
+  type AutoCompletionStage,
+  autoStepDiagnostic,
+  type AutoStepStage,
   autoPreflightDiagnostic,
   type AutoPreflightStage,
 } from "./diagnostics.ts";
@@ -843,23 +849,30 @@ export function createAutoController(
       inFlight = true;
       const boundaryGeneration = generation;
       const timeout = new AbortController();
+      const fallbackTimeoutMs = bridge.state()?.config.reviewTimeoutMs ?? config.decisionTimeoutMs;
       const timer = setTimeout(
         () => timeout.abort(new DOMException("Auto stage boundary timed out", "TimeoutError")),
-        2 * config.cliTimeoutMs + 2 * config.decisionTimeoutMs + 1000,
+        2 * config.cliTimeoutMs + config.decisionTimeoutMs + fallbackTimeoutMs + 1000,
       );
       const signal = AbortSignal.any([
         lifetime.signal,
         timeout.signal,
         ...(toolSignal ? [toolSignal] : []),
       ]);
+      let stage: AutoStepStage = "change snapshot";
       try {
         const [snapshot, observedWorkflow] = await Promise.all([
-          readSnapshot(ctx.cwd, current.snapshot.change, cliOptions(), signal),
-          readWorkflow(ctx.cwd, current.snapshot.change, cliOptions(), signal),
+          autoObservation("change snapshot", () =>
+            readSnapshot(ctx.cwd, current.snapshot.change, cliOptions(), signal),
+          ),
+          autoObservation("workflow", () =>
+            readWorkflow(ctx.cwd, current.snapshot.change, cliOptions(), signal),
+          ),
         ]);
         if (run !== current || signal.aborted || generation !== boundaryGeneration)
           return result({ error: "Stage advice was superseded" }, true);
         current.observe(snapshot);
+        stage = "workflow";
         workflow = observedWorkflow;
         workflowError = null;
         if (!hostWorkflow) throw new Error("Host workflow unavailable");
@@ -872,7 +885,9 @@ export function createAutoController(
             },
             true,
           );
+        stage = "native verification";
         await consumeLeafResults(signal, boundaryCalls);
+        stage = "workflow";
         if (hostWorkflow.statusView().phase === "settled" && !bridge.state()?.completionApproved)
           hostWorkflow.invalidateVerification();
         let phase = hostWorkflow.observe(snapshot, observedWorkflow, { settledBoundary: true });
@@ -915,6 +930,7 @@ export function createAutoController(
         }
         const architect = bridge.state();
         if (!architect) throw new Error("Architect unavailable");
+        stage = "advice";
         const primary =
           dependencies.decision?.(config, ctx) ??
           createJevProvider(
@@ -961,7 +977,13 @@ export function createAutoController(
         });
         context.completed = frontier.completed.length;
         context.remaining = scope.remaining.length + (architect.completionApproved ? 0 : 1);
-        const decision = await current.decide(context, primary, fallback, signal);
+        const decision = await current.decide(
+          context,
+          primary,
+          fallback,
+          signal,
+          fallbackTimeoutMs,
+        );
         if (run !== current || signal.aborted || generation !== boundaryGeneration)
           return result({ error: "Stage advice was superseded" }, true);
         if (!decision) {
@@ -995,15 +1017,23 @@ export function createAutoController(
         if (decision.choice === "continue") admittedBoundary = exactPhase;
         activity(ctx);
         return result(advice);
-      } catch {
-        if (run === current && generation === boundaryGeneration) {
-          current.stop(
-            signal.aborted ? "cancelled" : "blocked",
-            "Auto stage observation or advice failed; completion is unverified",
+      } catch (error) {
+        if (error instanceof AutoObservationError) {
+          stage = error.stage;
+          error = error.cause;
+        }
+        if (signal.aborted)
+          error = new AutoPreflightError(
+            timeout.signal.aborted
+              ? "Auto stage boundary timed out"
+              : "Auto stage boundary was cancelled or superseded",
           );
+        const diagnostic = autoStepDiagnostic(stage, error);
+        if (run === current && generation === boundaryGeneration) {
+          current.stop(signal.aborted ? "cancelled" : "blocked", diagnostic);
           notify(ctx, true);
         }
-        return result({ error: "Auto stage observation or advice failed" }, true);
+        return result({ error: diagnostic }, true);
       } finally {
         clearTimeout(timer);
         if (generation === boundaryGeneration) inFlight = false;
@@ -1478,13 +1508,19 @@ export function createAutoController(
       const valid = () =>
         run === current && ownsTurn && generation === boundaryGeneration && !signal.aborted;
       approvedFacts = undefined;
+      let stage: AutoCompletionStage = "change snapshot";
       try {
         const [snapshot, observedWorkflow] = await Promise.all([
-          readSnapshot(ctx.cwd, current.snapshot.change, cliOptions(), signal),
-          readWorkflow(ctx.cwd, current.snapshot.change, cliOptions(), signal),
+          autoObservation("change snapshot", () =>
+            readSnapshot(ctx.cwd, current.snapshot.change, cliOptions(), signal),
+          ),
+          autoObservation("workflow", () =>
+            readWorkflow(ctx.cwd, current.snapshot.change, cliOptions(), signal),
+          ),
         ]);
         if (!valid()) return reject("Auto completion was cancelled or superseded before review");
         current.observe(snapshot);
+        stage = "workflow";
         workflow = observedWorkflow;
         workflowError = null;
         const phase = hostWorkflow?.observe(snapshot, observedWorkflow);
@@ -1506,6 +1542,7 @@ export function createAutoController(
           return reject(
             "Auto-owned native work is active or its termination is unverified; resolve it before completion review",
           );
+        stage = "validation";
         await validate(ctx.cwd, snapshot.change, cliOptions(), signal);
         if (!valid()) return reject("Auto completion verification was cancelled or superseded");
         const facts = { snapshot: snapshot.fingerprint, workflow: observedWorkflow.fingerprint };
@@ -1517,6 +1554,7 @@ export function createAutoController(
           `Strict CLI artifact validation passed; tasks ${JSON.stringify(snapshot.tasks)}; progress ${JSON.stringify(snapshot.progress)}; workflow ${JSON.stringify(scope)}; fingerprints ${JSON.stringify(facts)}`,
           false,
         );
+        stage = "review";
         const verdict = await bridge.review(
           "completion",
           JSON.stringify({
@@ -1585,10 +1623,18 @@ export function createAutoController(
         if (verdict.decision === "approve" && architect.completionApproved) approvedFacts = facts;
         activity(ctx);
         return verdict;
-      } catch {
-        return reject(
-          "Auto completion observation/validation failed or was cancelled; no completion approval is available",
-        );
+      } catch (error) {
+        if (error instanceof AutoObservationError) {
+          stage = error.stage;
+          error = error.cause;
+        }
+        if (signal.aborted)
+          error = new AutoPreflightError(
+            timeout.signal.aborted
+              ? "Auto completion boundary timed out"
+              : "Auto completion was cancelled or superseded",
+          );
+        return reject(autoCompletionDiagnostic(stage, error));
       } finally {
         clearTimeout(timer);
         if (generation === boundaryGeneration) {

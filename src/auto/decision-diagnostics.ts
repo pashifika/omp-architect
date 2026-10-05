@@ -47,4 +47,5 @@ export interface DecisionAttempt {
   confidence?: number;
   errorCode?: string;
   elapsedMs: number;
+  timeoutMs: number;
 }

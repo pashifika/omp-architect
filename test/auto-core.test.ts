@@ -1,10 +1,10 @@
-import { expect, test } from "bun:test";
+import { expect, jest, test } from "bun:test";
 import { JevError } from "../src/auto/decision.ts";
 import { DecisionFailure } from "../src/auto/decision-diagnostics.ts";
 import { AutoRun } from "../src/auto/core.ts";
 import { parseAutoConfig } from "../src/auto/config.ts";
 import type { RasenSnapshot } from "../src/auto/rasen.ts";
-import type { DecisionEvidence, DecisionProvider } from "../src/auto/decision.ts";
+import type { Decision, DecisionEvidence, DecisionProvider } from "../src/auto/decision.ts";
 
 const signal = () => new AbortController().signal;
 function snapshot(done: string[] = []): RasenSnapshot {
@@ -347,3 +347,70 @@ test("decision status snapshots are defensive and the next decision replaces pro
     outcome: "accepted",
   });
 });
+
+for (const outcome of ["success", "timeout", "cancel"] as const) {
+  test(`Architect fallback has its own review deadline: ${outcome}`, async () => {
+    const run = new AutoRun(parseAutoConfig({ maxFallbacks: 1 }), snapshot(), () => Date.now());
+    const started = Promise.withResolvers<void>();
+    const response = Promise.withResolvers<Decision>();
+    const caller = new AbortController();
+    let fallbackSignal: AbortSignal | undefined;
+    let calls = 0;
+    const weak: DecisionProvider = async () => ({ choice: "continue", confidence: 0.58 });
+    jest.useFakeTimers();
+    try {
+      const pending = run.decide(
+        evidence,
+        weak,
+        async (_evidence, signal) => {
+          calls++;
+          fallbackSignal = signal;
+          started.resolve();
+          return response.promise;
+        },
+        caller.signal,
+        120000,
+      );
+      await started.promise;
+      jest.advanceTimersByTime(8001);
+      await Promise.resolve();
+      expect(fallbackSignal?.aborted).toBe(false);
+      expect(run.fallbacks).toBe(1);
+      if (outcome === "success") response.resolve({ choice: "continue", confidence: 0.95 });
+      else if (outcome === "cancel") caller.abort();
+      else jest.advanceTimersByTime(120000 - 8001);
+      const result = await pending;
+      expect(calls).toBe(1);
+      expect(run.statusView().decisionDiagnostics.attempts).toMatchObject([
+        { provider: "jev", outcome: "low_confidence", confidence: 0.58, timeoutMs: 8000 },
+        {
+          provider: "architect",
+          timeoutMs: 120000,
+          ...(outcome === "success"
+            ? { outcome: "accepted" }
+            : {
+                outcome: "error",
+                errorCode: outcome === "cancel" ? "DECISION_CANCELLED" : "DECISION_TIMEOUT",
+              }),
+        },
+      ]);
+      if (outcome === "success") {
+        expect(result?.choice).toBe("continue");
+        expect(run.status).toBe("running");
+        // A longer deadline never buys another fallback or lowers confidence.
+        expect(await run.decide(evidence, weak, good, signal(), 120000)).toBeUndefined();
+        expect(run.fallbacks).toBe(1);
+        expect(run.status).toBe("uncertain");
+      } else {
+        expect(result).toBeUndefined();
+        expect(fallbackSignal?.aborted).toBe(true);
+        expect(run.status).toBe(outcome === "cancel" ? "cancelled" : "uncertain");
+      }
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      caller.abort();
+      response.resolve({ choice: "uncertain", confidence: 0 });
+      jest.useRealTimers();
+    }
+  });
+}
