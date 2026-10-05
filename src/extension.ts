@@ -227,6 +227,9 @@ export function extensionFactory(
     });
     pi.on("input", (event, ctx) => {
       if (ctx.agent.kind !== "main" || event.source === "extension") return;
+      // Native RPC emits input before discarding an empty submission. It is not
+      // a request, while an image-only submission still is genuine user input.
+      if (!event.text.trim() && !event.images?.length) return;
       // These commands are consumed by our handlers. Status/usage errors must not
       // impersonate a new model request; start/stop invalidate ownership themselves.
       if (!event.images?.length && /^\/(?:auto|architect)(?:\s|$)/.test(event.text.trim())) {
@@ -237,7 +240,7 @@ export function extensionFactory(
       expectedContinuation = "";
       newUserRequest = true;
       clearQueuedCompletion();
-      auto.userInput();
+      auto.userInput(event);
     });
     pi.on("turn_start", (_, ctx) => {
       if (ctx.agent.kind === "main") acceptedPrompt = "";
@@ -758,7 +761,7 @@ export function extensionFactory(
                 next:
                   verdict.decision === "approve"
                     ? "Copy the canonical approved steps exactly into todo; await successful registration before execution. Do not batch todo registration with execution."
-                    : "Review the pending canonical steps with phase=plan and address the findings, or stop with phase=blocked. Approval requires exact steps, including punctuation, whitespace and order.",
+                    : "Address the findings within the remaining review allowance. If the plan must change, resubmit phase=plan with a matching review file and the full corrected steps array; editing only the review body does not replace pending canonical steps. Keep authorized work executable, but explicitly mark unauthorized portions blocked pending separate user authorization; do not execute those portions or mark their unfinished task complete. Approval never grants permission. After approval, register the exact returned steps, including punctuation, whitespace and order. If you cannot proceed, stop with phase=blocked.",
               }
             : { ...verdict, invocationId, review: reviewOutcome };
         return {

@@ -8,6 +8,60 @@ context and public Rasen pipeline observations; it does not load the generated
 it uses session-local apply/verification/review phases without creating external
 pipeline state. See [setup and limits](rasen-auto.md) for the current contract.
 
+## Input attribution and original stop evidence (2026-10-05)
+
+An input event followed by `before_agent_start` previously overwrote any earlier
+draining timeout/failure with a user-request reason. The original failure outcome
+and reason now survive those later hooks. Status also preserves `initialStop`
+(time, status and reason) and the first qualifying `inputEvent` (time, host source,
+text/command/image kind, text length, image count and prior run status/outcome).
+No prompt text, command names, brief content or image data enter `inputEvent`.
+`initialStop` retains the already displayed reason, which can include a bounded
+operator-blocker summary. The first event is retained until an explicit new Auto
+start or session reset; its host source identifies the input route, not proof of
+human authorship.
+
+OMP's RPC input hook runs before it discards empty submissions. Whitespace-only
+input with no images now leaves Auto untouched; image-only and ordinary user
+requests still pause scheduling and drain native work without cancellation.
+New requests still revoke completion that has not passed final native settlement.
+General slash-command classification is unchanged because the public host API
+does not expose whether a command will invoke a model or finish locally.
+
+These corrections reproduce diagnostic overwriting and empty-input false pauses.
+They do not establish which input route fired in the reported live incident.
+
+On locked **OMP 18.6.0**, Bun **1.3.14**, Node **24.19.0**, and the pinned Rasen
+development build, formatting, TypeScript, **432 unit/installer tests / 2,951
+assertions**, **206 smoke tests / 2,043 assertions**, **46-entry** packed loading,
+and workflow/ruleset checks passed. Focused compatibility checks on **18.5.1** and
+**18.6.1** each passed **8 tests / 65 assertions**, including actual native-child
+drainage after new user input. Independent review found no remaining issue after
+privacy wording and populated-run restart coverage were tightened. The live user
+session was not replayed, and these tests do not prove a particular input source
+caused that incident.
+
+## Canonical plan revision guidance (2026-10-05)
+
+Plan-review recovery now explicitly distinguishes the review body from the
+canonical `steps` array. Findings that change a plan require both to be corrected;
+prose-only deferral cannot replace an executable publication step. Mixed-scope
+tasks retain their authorized work while unauthorized portions remain blocked
+pending separate authorization. Minimum-round-only review does not require an
+artificial plan change. No gate, native error display, review allowance, or
+execution-ownership semantics changed.
+
+On locked **OMP 18.6.0**, Bun **1.3.14**, Node **24.19.0**, and the existing pinned
+Rasen development build, formatting, TypeScript, the full unit/installer suite,
+**201 smoke tests / 2,004 assertions**, **46-entry** packed loading, and
+workflow/ruleset checks passed. The native and XD regressions prove that body-only
+edits preserve rejected canonical steps and keep execution gated; explicit exact
+replacement approves on the third existing attempt, registers successfully, and
+leaves the mixed-scope task pending. Independent review found no issues and reran
+those **2 tests / 38 assertions** successfully. Reviewer responses are deterministic
+fixtures; this does not establish live model compliance or replay the reported
+user session.
+
 ## Pending-task verification frontier (2026-10-05)
 
 The LEAD's explicit `auto_step transition=verify` now admits independent checks

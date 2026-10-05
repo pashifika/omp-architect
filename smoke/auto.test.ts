@@ -1070,12 +1070,220 @@ test("real loader gives an unrelated user request ownership while holding the ex
     expect(await fixture.status()).toMatchObject({
       status: "draining",
       outcome: "needs_user",
-      reason: "Superseded by a new user request",
+      reason: "Superseded by new user input",
     });
     await fixture.stop();
     expect(fixture.counts()).toMatchObject({ decisions: 0, aborts: 0 });
   } finally {
     await fixture.close();
+  }
+});
+
+test("input and start hooks preserve the first timeout cause and bounded input provenance", async () => {
+  let now = 100000;
+  const f = await loaderFixture({ noOutputTimeoutMs: 1000 }, { dependencies: { now: () => now } });
+  const idle = Promise.withResolvers<void>();
+  f.nativeSession.waitForIdle = async () => idle.promise;
+  try {
+    await f.start();
+    now += 1001;
+    await f.extension.handlers.get("tool_call")![0](
+      { type: "tool_call", toolCallId: "expired", toolName: "read", input: { path: "tasks.md" } },
+      f.ctx,
+    );
+    const first = await f.status();
+    expect(first).toMatchObject({
+      status: "draining",
+      outcome: "stalled",
+      inputEvent: null,
+      initialStop: { at: now, status: "stalled", reason: first.reason },
+    });
+    now += 1;
+    const text = "/PRIVATE_COMMAND private brief and prompt";
+    await f.extension.handlers.get("input")![0]({ type: "input", text, source: "rpc" }, f.ctx);
+    const inputEvent = {
+      at: now,
+      source: "rpc",
+      kind: "command",
+      textLength: text.length,
+      imageCount: 0,
+      statusBefore: "draining",
+      outcomeBefore: "stalled",
+    };
+    now += 1;
+    await f.extension.handlers.get("before_agent_start")![0](
+      { type: "before_agent_start", prompt: text, systemPrompt: [] },
+      f.ctx,
+    );
+    // A second user request and a hidden native start must not replace the
+    // event that first arrived after the original hold.
+    await f.extension.handlers.get("input")![0](
+      { type: "input", text: "Another request", source: "interactive" },
+      f.ctx,
+    );
+    await f.extension.handlers.get("before_agent_start")![0](
+      { type: "before_agent_start", prompt: "Native result follow-up", systemPrompt: [] },
+      f.ctx,
+    );
+    idle.resolve();
+    const held = await f.settled();
+    expect(held).toMatchObject({
+      status: "paused",
+      outcome: "stalled",
+      reason: first.reason,
+      initialStop: first.initialStop,
+      inputEvent,
+      completionVerified: false,
+    });
+    expect(
+      JSON.stringify({ inputEvent: held.inputEvent, initialStop: held.initialStop }),
+    ).not.toContain("PRIVATE_COMMAND");
+    expect(f.counts().aborts).toBe(0);
+  } finally {
+    idle.resolve();
+    await f.close();
+  }
+});
+
+for (const source of ["interactive", "rpc"] as const) {
+  test(`empty ${source} input leaves Auto running but image-only input pauses it`, async () => {
+    const f = await loaderFixture();
+    try {
+      await f.start();
+      for (const text of ["", " \t\n"]) {
+        await f.extension.handlers.get("input")![0]({ type: "input", text, source }, f.ctx);
+        expect(await f.status()).toMatchObject({
+          status: "running",
+          initialStop: null,
+          inputEvent: null,
+        });
+      }
+      await f.extension.handlers.get("input")![0](
+        {
+          type: "input",
+          text: "",
+          source,
+          images: [{ type: "image", data: "PRIVATE_IMAGE", mimeType: "image/png" }],
+        },
+        f.ctx,
+      );
+      const first = await f.status();
+      expect(first).toMatchObject({
+        outcome: "needs_user",
+        reason: "Superseded by new user input",
+        inputEvent: {
+          source,
+          kind: "images",
+          textLength: 0,
+          imageCount: 1,
+          statusBefore: "running",
+          outcomeBefore: null,
+        },
+        initialStop: { status: "needs_user", reason: "Superseded by new user input" },
+      });
+      await f.extension.handlers.get("before_agent_start")![0](
+        { type: "before_agent_start", prompt: "", systemPrompt: [] },
+        f.ctx,
+      );
+      expect(await f.status()).toMatchObject({
+        outcome: first.outcome,
+        reason: first.reason,
+        initialStop: first.initialStop,
+        inputEvent: first.inputEvent,
+      });
+      expect(JSON.stringify(first.inputEvent)).not.toContain("PRIVATE_IMAGE");
+      expect(f.counts().aborts).toBe(0);
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+test("Auto start resets old input provenance and internal hooks cannot fabricate a user stop", async () => {
+  const f = await loaderFixture();
+  try {
+    await f.extension.handlers.get("input")![0](
+      { type: "input", text: "Earlier request", source: "interactive" },
+      f.ctx,
+    );
+    await f.start();
+    await f.extension.handlers.get("input")![0](
+      { type: "input", text: "Native notification", source: "extension" },
+      f.ctx,
+    );
+    await f.extension.handlers.get("input")![0](
+      { type: "input", text: "/auto status", source: "interactive" },
+      f.ctx,
+    );
+    await f.extension.handlers.get("before_agent_start")![0](
+      { type: "before_agent_start", prompt: "Native IRC result follow-up", systemPrompt: [] },
+      f.ctx,
+    );
+    expect(await f.status()).toMatchObject({
+      status: "running",
+      reason: null,
+      initialStop: null,
+      inputEvent: null,
+    });
+    await f.extension.handlers.get("input")![0](
+      { type: "input", text: "New request after Auto started", source: "interactive" },
+      f.ctx,
+    );
+    expect(await f.settled()).toMatchObject({
+      status: "paused",
+      initialStop: { status: "needs_user" },
+      inputEvent: { kind: "text", source: "interactive" },
+    });
+    await f.extension.commands.get("auto")!.handler("start fixture-change", f.ctx);
+    expect(f.bootstraps).toHaveLength(2);
+    await f.extension.handlers.get("before_agent_start")![0](
+      { type: "before_agent_start", prompt: f.bootstraps[1], systemPrompt: [] },
+      f.ctx,
+    );
+    expect(await f.status()).toMatchObject({
+      status: "running",
+      reason: null,
+      initialStop: null,
+      inputEvent: null,
+    });
+    expect(f.counts().aborts).toBe(0);
+  } finally {
+    await f.close();
+  }
+});
+
+test("new input still revokes provisional completion while preserving its initial stop", async () => {
+  const f = await loaderFixture({}, { dependencies: { snapshot: async () => snapshot(2) } });
+  const idle = Promise.withResolvers<void>();
+  f.nativeSession.waitForIdle = async () => idle.promise;
+  try {
+    await f.start();
+    await f.verify();
+    expect((await f.checkpoint()).isError).toBe(false);
+    await f.stop();
+    const first = await f.status();
+    expect(first).toMatchObject({ status: "draining", outcome: "completed" });
+    await f.extension.handlers.get("input")![0](
+      { type: "input", text: "A new user request", source: "interactive" },
+      f.ctx,
+    );
+    await f.extension.handlers.get("before_agent_start")![0](
+      { type: "before_agent_start", prompt: "A new user request", systemPrompt: [] },
+      f.ctx,
+    );
+    idle.resolve();
+    expect(await f.settled()).toMatchObject({
+      status: "paused",
+      outcome: "needs_user",
+      reason: "Superseded by new user input",
+      initialStop: first.initialStop,
+      inputEvent: { kind: "text", statusBefore: "draining", outcomeBefore: "completed" },
+      completionVerified: false,
+    });
+    expect(f.counts().aborts).toBe(0);
+  } finally {
+    idle.resolve();
+    await f.close();
   }
 });
 

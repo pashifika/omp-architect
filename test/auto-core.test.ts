@@ -428,3 +428,22 @@ test("semantic stop drains without resuming budgets and completes only after set
   run.stop("completed", "Late approval cannot resume a held run");
   expect(run.status).toBe("paused");
 });
+
+test("initial stop evidence survives drainage and status callers cannot mutate it", () => {
+  let now = 100000;
+  const run = new AutoRun(parseAutoConfig({}), snapshot(), () => now);
+  expect(run.statusView().initialStop).toBeNull();
+  run.stop("stalled", "No native output");
+  run.beginDrain();
+  now += 1000;
+  run.stop("needs_user", "Later input");
+  const initial = run.statusView().initialStop!;
+  expect(initial).toEqual({ at: 100000, status: "stalled", reason: "No native output" });
+  initial.reason = "Changed by a status caller";
+  run.finishDrain();
+  expect(run.statusView()).toMatchObject({
+    status: "paused",
+    outcome: "stalled",
+    initialStop: { at: 100000, status: "stalled", reason: "No native output" },
+  });
+});

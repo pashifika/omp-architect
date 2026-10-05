@@ -33,6 +33,7 @@ export class AutoRun {
   observedAt: number;
   lastActivityAt: number;
   observationError: string | null = null;
+  #initialStop: { at: number; status: Exclude<AutoStatus, "running">; reason: string } | undefined;
   #completionFingerprint = "";
   readonly id = crypto.randomUUID();
   snapshot: RasenSnapshot;
@@ -63,6 +64,7 @@ export class AutoRun {
 
   stop(status: Exclude<AutoStatus, "running">, reason: string): void {
     if (this.status !== "running") return;
+    this.#initialStop = { at: this.now(), status, reason };
     if (status === "completed") this.#completionFingerprint = this.snapshot.fingerprint;
     this.status = status;
     this.reason = reason;
@@ -293,6 +295,7 @@ export class AutoRun {
       status: this.status,
       reason: this.reason || null,
       outcome: this.outcome ?? null,
+      initialStop: this.#initialStop ? { ...this.#initialStop } : null,
       progress: this.snapshot.progress,
       steps:
         this.config.maxSteps === null ? `${this.steps}` : `${this.steps}/${this.config.maxSteps}`,

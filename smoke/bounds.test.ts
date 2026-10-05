@@ -881,6 +881,119 @@ const canonicalSteps = [
   "Validate artifacts",
 ];
 
+for (const transport of ["native", "xd"] as const)
+  test(`${transport} plan revision must repair canonical steps, not only review prose`, async () => {
+    const original = [
+      "Implement the prepared change",
+      "Verify implementation and review the results",
+      "5.2 Reconcile requirements, retain verification evidence, deliver the product PR and commit/push planning separately",
+    ];
+    const corrected = [
+      ...original.slice(0, 2),
+      "5.2 Reconcile requirements and retain verification evidence. Commit/push/PR delivery and planning-Git publication are blocked pending separate user authorization; keep those portions pending and do not mark 5.2 complete",
+    ];
+    const f = await xdCheckpointFixture(
+      { min: 1, max: 3 },
+      async ({ canonicalPlan }) =>
+        canonicalPlan[2] === corrected[2]
+          ? { decision: "approve", summary: "Authorized scope is explicit", issues: [] }
+          : {
+              decision: "revise",
+              summary: "The review body defers publication, but canonical step 5.2 does not",
+              issues: ["Mark only the unauthorized portions of 5.2 blocked pending authorization"],
+            },
+      "Resume implementation, verification and review only; publication needs separate authorization",
+    );
+    try {
+      const checkpoint = async (id: string, body: string, steps?: string[]) => {
+        const params = {
+          phase: "plan" as const,
+          evidenceRef: await f.evidence(body),
+          ...(steps ? { steps } : {}),
+        };
+        const result =
+          transport === "native"
+            ? await f.checkpoint.execute(id, params)
+            : await f.write.execute(id, {
+                path: "xd://architect_checkpoint",
+                content: JSON.stringify(params),
+              });
+        const content = result.content[0];
+        if (content.type !== "text") throw new Error("Missing checkpoint result");
+        return { isError: result.isError, ...JSON.parse(content.text) };
+      };
+      const first = await checkpoint(
+        "initial-plan",
+        "Review implementation and verification",
+        original,
+      );
+      expect(first).toMatchObject({
+        isError: true,
+        decision: "revise",
+        review: { status: "provider_verdict", charged: true, attempt: 1 },
+        plan: { pending: { steps: original, approved: false }, approved: null },
+      });
+      expect(first.next).toContain("full corrected steps array");
+      expect(first.next).toContain("editing only the review body does not replace");
+      expect(first.next).toContain("Keep authorized work executable");
+      const body =
+        "Implement and verify. Publication is deferred pending separate user authorization";
+      const proseOnly = await checkpoint("prose-only-repair", body);
+      expect(proseOnly).toMatchObject({
+        isError: true,
+        decision: "revise",
+        review: { status: "provider_verdict", charged: true, attempt: 2 },
+        plan: { pending: { id: first.plan.pending.id, steps: original, approved: false } },
+      });
+      await expect(
+        f.write.execute("still-gated", {
+          path: path.join(f.cwd, "implementation.md"),
+          content: "Not yet admitted",
+        }),
+      ).rejects.toThrow("Pending plan");
+      expect(await Bun.file(path.join(f.cwd, "implementation.md")).exists()).toBe(false);
+
+      const repaired = await checkpoint("canonical-repair", body, corrected);
+      expect(repaired).toMatchObject({
+        isError: false,
+        decision: "approve",
+        review: { status: "provider_verdict", charged: true, attempt: 3 },
+        plan: { pending: { steps: corrected, approved: true }, approved: { steps: corrected } },
+      });
+      expect(repaired.plan.pending.id).not.toBe(first.plan.pending.id);
+      expect(f.requests.map((request) => request.canonicalPlan)).toEqual([
+        original,
+        original,
+        corrected,
+      ]);
+      expect(f.requests[1].material.content).toBe(body);
+      expect(f.requests[2].material.content).toBe(body);
+      expect(f.aborts()).toBe(0);
+      await f.todo.execute("register-repaired", {
+        op: "init",
+        items: repaired.plan.approved.steps,
+      });
+      await f.write.execute("authorized-part", {
+        path: path.join(f.cwd, "implementation.md"),
+        content: "Authorized implementation evidence",
+      });
+      expect(await Bun.file(path.join(f.cwd, "implementation.md")).text()).toBe(
+        "Authorized implementation evidence",
+      );
+      expect(f.phases().flatMap((phase) => phase.tasks)[2]).toMatchObject({
+        content: corrected[2],
+        status: "pending",
+      });
+      const status = await f.status.execute("no-spurious-recovery", {});
+      const content = status.content[0];
+      if (content.type !== "text") throw new Error("Missing status");
+      expect(JSON.parse(content.text).architect.pendingRecovery).toBe(false);
+      expect(f.requests).toHaveLength(3);
+    } finally {
+      await f.close();
+    }
+  });
+
 test("real host returns canonical plan identity, explains punctuation mismatch and restores approved todo", async () => {
   const f = await xdCheckpointFixture();
   try {
