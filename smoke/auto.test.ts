@@ -34,6 +34,9 @@ import type { Reviewer } from "../src/core.ts";
 import { extensionFactory } from "../src/extension.ts";
 import { withAgentDir } from "./isolated-host.ts";
 
+import { supportsSymlinks } from "../test/fixtures/symlink-support.ts";
+import { readWorkspaceEvidence } from "../src/auto/workspace.ts";
+
 const approved = { decision: "approve" as const, summary: "Fixture evidence checked", issues: [] };
 
 function snapshot(complete = 0): RasenSnapshot {
@@ -1716,6 +1719,13 @@ for (const mode of [
     if (mode === "real-cli") {
       const initialized = spawnSync("git", ["init", "--quiet"], { cwd, encoding: "utf8" });
       expect(initialized.status).toBe(0);
+      // Exercise the real default snapshot reader with the common tracked
+      // CLAUDE.md -> AGENTS.md convention, not a mocked workspace snapshot.
+      if (supportsSymlinks) {
+        await fs.writeFile(path.join(cwd, "AGENTS.md"), "Local fixture instructions\n");
+        await fs.symlink("AGENTS.md", path.join(cwd, "CLAUDE.md"), "file");
+        expect(spawnSync("git", ["add", "AGENTS.md", "CLAUDE.md"], { cwd }).status).toBe(0);
+      }
       await Bun.write(
         path.join(cwd, ".gitignore"),
         ".test-artifacts/\nisolated-agent/\nisolated-home/\nisolated-config/\nisolated-data/\nisolated-state/\n",
@@ -2352,6 +2362,23 @@ for (const mode of [
           expect(evidence).toContain("Strict CLI artifact validation passed");
         }
         expect(Number(JSON.parse(result.content[0].text).toolCalls)).toBeGreaterThan(80);
+        if (supportsSymlinks) {
+          const before = await readWorkspaceEvidence(cwd);
+          await fs.writeFile(path.join(cwd, "AGENTS.md"), "Changed fixture instructions\n");
+          expect((await readWorkspaceEvidence(cwd)).fingerprint).not.toBe(before.fingerprint);
+          const refreshed = await tool.execute(
+            "status-after-link-target-edit",
+            {},
+            undefined,
+            undefined,
+            session.extensionRunner!.createContext(),
+          );
+          if (refreshed.content[0].type !== "text") throw new Error("Missing refreshed status");
+          expect(JSON.parse(refreshed.content[0].text)).toMatchObject({
+            status: "completed",
+            completionVerified: false,
+          });
+        }
         const readResults = session.agent.state.messages.filter(
           (message) => message.role === "toolResult" && message.toolName === "read",
         );

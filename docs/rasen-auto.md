@@ -8,9 +8,17 @@ The extension reads Rasen's public pipeline resume/execution state. When a recor
 
 Auto runs from the Git project root. Fresh review identity includes HEAD, the
 current tracked diff, and bounded hashes of tracked and non-ignored untracked
-files; raw workspace contents are not sent to Jev by this observation. Gitlinks,
-assume-unchanged/skip-worktree entries, workspace symlinks, more than 20,000 files, or more than 32 MiB
-of file content fail closed. Non-Git roots require version control before Auto
+files; raw workspace contents are not sent to Jev by this observation. File
+symlinks such as tracked `CLAUDE.md → AGENTS.md` are supported: entry type and
+link text are fingerprinted, and existing targets must be observed through the
+same Git inventory. Target edits, retargeting, deletion, and file/link type
+changes invalidate the evidence. A missing final internal target is supported;
+a newly created target must enter the inventory or observation fails. External
+or ignored targets, excluded execution records, directory targets, and paths
+traversing symlink/non-directory/missing ancestors fail with a named diagnostic.
+The observer does not follow links to read content. Gitlinks,
+assume-unchanged/skip-worktree entries, more than 20,000 files, or more than 32 MiB
+of file content and link text also fail closed. Non-Git roots require version control before Auto
 can bind independent verification to the current code. The extension never
 initializes Git or changes index flags automatically.
 

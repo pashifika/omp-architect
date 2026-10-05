@@ -2,6 +2,9 @@
  * Never expose arbitrary host exceptions, CLI output, environment or file contents. */
 export class AutoPreflightError extends Error {}
 
+/** Code inventory failures need workspace guidance, not Rasen status guidance. */
+export class WorkspaceEvidenceError extends AutoPreflightError {}
+
 export type AutoPreflightStage =
   | "confirmation"
   | "change snapshot"
@@ -47,5 +50,9 @@ export function autoPreflightDiagnostic(stage: AutoPreflightStage, error: unknow
     error instanceof AutoPreflightError
       ? error.message
       : `Operation failed (${systemErrorCode(error)}); raw error details withheld`;
-  return `Auto preflight failed [${stage}]: ${detail}. ${hints[stage]}`;
+  const hint =
+    error instanceof WorkspaceEvidenceError
+      ? "Check the named project path and its link target; Auto only verifies Git-inventoried project files"
+      : hints[stage];
+  return `Auto preflight failed [${stage}]: ${detail}. ${hint}`;
 }
