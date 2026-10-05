@@ -1,3 +1,5 @@
+import { nativeAsyncHost } from "./auto/async.ts";
+import { nativeWriteTarget } from "./auto/evidence.ts";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { loadConfig, type Config } from "./config.ts";
 import {
@@ -7,16 +9,31 @@ import {
   type Phase,
   type ReviewMaterial,
 } from "./core.ts";
-import { loadReviewMaterial, saveReviewMaterial, reviewWrite, reviewCarrier } from "./artifacts.ts";
+import {
+  loadReviewMaterial,
+  saveReviewMaterial,
+  reviewWrite,
+  reviewCarrier,
+  completionCarrier,
+} from "./artifacts.ts";
 import { createReviewer } from "./reviewer.ts";
-import { createAutoController, type AutoDependencies } from "./auto/extension.ts";
+import { createAutoController, autoStepCarrier, type AutoDependencies } from "./auto/extension.ts";
 import instructions from "./prompts/orchestration.md" with { type: "text" };
 
 // Only the documented canonical devices share their native tool identity.
 function effectiveToolName(toolName: string, input: object): string {
-  if (toolName === "write" && "path" in input) {
-    if (input.path === "xd://architect_checkpoint") return "architect_checkpoint";
-    if (input.path === "xd://auto_status") return "auto_status";
+  if (toolName === "write") {
+    // Whole-file display selectors are native write spellings. Keep control
+    // devices bookkeeping-only even before the host registers its XD handler.
+    const path = nativeWriteTarget(input)
+      ?.trim()
+      .replace(/^xd:\/\//i, "xd://")
+      .replace(/:(?:raw|conflicts)$/, "");
+    if (path === "xd://architect_checkpoint") return "architect_checkpoint";
+    if (path === "xd://auto_status") return "auto_status";
+    // Legacy Auto bookkeeping stays identifiable, but is not a registered tool.
+    if (path === "xd://auto_record") return "auto_record";
+    if (path === "xd://auto_step") return "auto_step";
   }
   return toolName;
 }
@@ -70,6 +87,7 @@ export function extensionFactory(
     let acceptedPrompt = "";
     let newUserRequest = false;
     const activeEvals = new Map<string, Record<string, unknown>>();
+    const autoCompletionCarriers = new Set<string>();
     let queuedCompletion:
       | {
           material: ReviewMaterial;
@@ -109,11 +127,12 @@ export function extensionFactory(
         { triggerTurn: false, deliverAs: "nextTurn" },
       );
       ctx.ui.notify(`OMP Architect blocked: ${reason}. Completion remains unverified.`, "warning");
-      ctx.abort();
+      if (!auto.handlesCompletion()) ctx.abort();
     };
     const initialize = async (ctx: ExtensionContext) => {
       generation++;
       activeEvals.clear();
+      autoCompletionCarriers.clear();
       clearQueuedCompletion();
       stopped = false;
       newUserRequest = false;
@@ -157,6 +176,8 @@ export function extensionFactory(
       pi,
       {
         state: () => state,
+        instructions: () => instructions,
+        acceptInternal: (text, ctx) => prepareStart(text, ctx),
         review: async (phase, body, ctx, signal, invocationId) => {
           const current = state;
           const requestGeneration = generation;
@@ -211,9 +232,13 @@ export function extensionFactory(
       lifetime.abort();
       clearQueuedCompletion();
       activeEvals.clear();
+      autoCompletionCarriers.clear();
     });
     pi.on("input", (event, ctx) => {
       if (ctx.agent.kind !== "main" || event.source === "extension") return;
+      // Native RPC emits input before discarding an empty submission. It is not
+      // a request, while an image-only submission still is genuine user input.
+      if (!event.text.trim() && !event.images?.length) return;
       // These commands are consumed by our handlers. Status/usage errors must not
       // impersonate a new model request; start/stop invalidate ownership themselves.
       if (!event.images?.length && /^\/(?:auto|architect)(?:\s|$)/.test(event.text.trim())) {
@@ -224,20 +249,24 @@ export function extensionFactory(
       expectedContinuation = "";
       newUserRequest = true;
       clearQueuedCompletion();
-      auto.userInput();
+      auto.userInput(event);
     });
     pi.on("turn_start", (_, ctx) => {
       if (ctx.agent.kind === "main") acceptedPrompt = "";
     });
-    pi.on("before_agent_start", async (event, ctx) => {
-      if (ctx.agent.kind !== "main") return;
-      if (!state && !configError) await initialize(ctx);
-      if (!acceptedPrompt || event.prompt !== acceptedPrompt) {
-        const autoStart = auto.beforeStart(event.prompt, ctx);
+    const prepareStart = (text: string, ctx: ExtensionContext) => {
+      if (!acceptedPrompt || text !== acceptedPrompt) {
+        const autoStart = auto.beforeStart(text, ctx);
         if (autoStart === "blocked") stopped = true;
         // A preparation/queued-delivery hook alone is not a new user request.
         // A confirmed Auto start has its own exact bootstrap ownership check.
-        if (stopped && autoStart !== "blocked" && !newUserRequest && !auto.request()) {
+        if (
+          stopped &&
+          autoStart !== "blocked" &&
+          !newUserRequest &&
+          !auto.request() &&
+          !auto.handlesCompletion()
+        ) {
           acceptedPrompt = "";
           expectedContinuation = "";
           ctx.abort();
@@ -246,21 +275,31 @@ export function extensionFactory(
         newUserRequest = false;
         const expected = expectedContinuation;
         expectedContinuation = "";
-        const unexpected = expected !== "" && event.prompt !== expected;
+        const unexpected = expected !== "" && text !== expected;
         if (unexpected)
           stopBlocked("Unexpected continuation context; a new user request is required", ctx);
         const preserving =
-          autoStart !== "new" || (expected !== "" && event.prompt === expected) || unexpected;
+          autoStart !== "new" || (expected !== "" && text === expected) || unexpected;
         if (!preserving) {
           stopped = false;
           generation++;
           activeEvals.clear();
+          autoCompletionCarriers.clear();
           clearQueuedCompletion();
-          state?.begin(auto.request() ?? event.prompt);
+          state?.begin(auto.request() ?? text);
         }
-        if (!unexpected && autoStart !== "blocked") acceptedPrompt = event.prompt;
+        if (!unexpected && autoStart !== "blocked") acceptedPrompt = text;
         else acceptedPrompt = "";
       }
+    };
+    pi.on("context", (event, ctx) => {
+      if (ctx.agent.kind !== "main") return;
+      return { messages: auto.context(event, ctx) };
+    });
+    pi.on("before_agent_start", async (event, ctx) => {
+      if (ctx.agent.kind !== "main") return;
+      if (!state && !configError) await initialize(ctx);
+      prepareStart(event.prompt, ctx);
       return {
         systemPrompt: [
           ...event.systemPrompt,
@@ -272,15 +311,38 @@ export function extensionFactory(
     });
     pi.on("before_subagent_spawn", (event, ctx) => {
       if (ctx.agent.kind !== "main" || !state) return;
-      const autoGate = auto.spawnGate();
-      if (autoGate) return { block: true, reason: autoGate };
+      const deny = (reason: string) => {
+        // This host event has no parent tool-call ID. Keep its native identity
+        // as context; do not guess a task result or count another execution failure.
+        state!.deny(
+          `spawn:${crypto.randomUUID()}`,
+          "before_subagent_spawn",
+          {
+            agent: event.agent,
+            invocationKind: event.invocationKind,
+            ...(event.spawnKey !== undefined ? { spawnKey: event.spawnKey } : {}),
+          },
+          reason,
+        );
+        return { block: true as const, reason };
+      };
+      const autoSpawn = auto.routeSpawn(event);
+      if (autoSpawn.handled) {
+        if (autoSpawn.reason) return deny(autoSpawn.reason);
+        if (autoSpawn.model && !ctx.models.resolve(autoSpawn.model))
+          return deny(
+            "The admitted native Auto model route is no longer available; no silent substitution is permitted",
+          );
+        return autoSpawn.model
+          ? { model: autoSpawn.model, note: "OMP Auto: preserved admitted native task route" }
+          : undefined;
+      }
       const role = routeAgent(event.agent, state.config);
       if (!role) return;
       if (!ctx.models.resolve(role))
-        return {
-          block: true,
-          reason: `Configure authenticated modelRoles.${role.slice(1)} before spawning ${event.agent}`,
-        };
+        return deny(
+          `Configure authenticated modelRoles.${role.slice(1)} before spawning ${event.agent}`,
+        );
       return { model: role, note: `OMP Architect: ${event.agent} uses ${role}` };
     });
     pi.on("tool_call", (event, ctx) => {
@@ -290,9 +352,16 @@ export function extensionFactory(
       // Diagnostics must remain available even after Auto or Architect stops.
       if (toolName === "auto_status" && (stopped || !auto.isRunning())) return;
       const deny = (reason: string) => {
+        auto.rejectToolCall(event.toolCallId);
         state?.deny(event.toolCallId, toolName, { ...event.input }, reason);
         return { block: true as const, reason };
       };
+      if (
+        stopped &&
+        auto.handlesCompletion() &&
+        ["wait", "read", "grep", "glob", "find", "ls"].includes(toolName)
+      )
+        return;
       if (stopped)
         return deny(
           "OMP Architect stopped this request; start a new user request after resolving the blocker",
@@ -336,21 +405,71 @@ export function extensionFactory(
       if (reason) return deny(reason);
       if (toolName === "eval") activeEvals.set(event.toolCallId, input);
     });
+    const nativeSettlement = (details: unknown, ctx: ExtensionContext) => {
+      const id = (details as { async?: { jobId?: string } } | undefined)?.async?.jobId;
+      return id
+        ? nativeAsyncHost(pi, ctx)?.session.asyncJobManager?.getJob(id)?.promise
+        : undefined;
+    };
     pi.on("tool_result", (event, ctx) => {
       if (ctx.agent.kind !== "main" || !state) return;
       const toolName = effectiveToolName(event.toolName, event.input);
-      if (toolName === "eval") activeEvals.delete(event.toolCallId);
-      if (toolName === "auto_status" || toolName === "architect_checkpoint") return;
+      if (toolName === "eval") {
+        const pending = nativeSettlement(event.details, ctx);
+        if (pending) {
+          const input = activeEvals.get(event.toolCallId);
+          void pending.then(() => {
+            if (activeEvals.get(event.toolCallId) === input) activeEvals.delete(event.toolCallId);
+            autoCompletionCarriers.delete(event.toolCallId);
+          });
+        } else activeEvals.delete(event.toolCallId);
+        if (autoCompletionCarriers.has(event.toolCallId)) {
+          if (!pending) autoCompletionCarriers.delete(event.toolCallId);
+          return;
+        }
+      }
+      if (toolName === "eval" && auto.isRunning() && !event.isError && autoStepCarrier(event.input))
+        return;
+      if (toolName === "architect_checkpoint" || (toolName === "auto_step" && !event.isError))
+        return;
       const text = event.content
         .filter((c) => c.type === "text")
         .map((c) => c.text)
         .join("\n");
+      if (toolName === "auto_status") {
+        state.diagnose(
+          event.toolCallId,
+          toolName,
+          event.input,
+          text,
+          event.isError,
+          captureMetadata(event.details),
+        );
+        return;
+      }
+      // Native task envelopes may omit isError even when a child failed. Keep
+      // the ordinary repeated-failure recovery gate effective for Auto leaves.
+      const results =
+        event.details && typeof event.details === "object" && "results" in event.details
+          ? event.details.results
+          : undefined;
+      const failedLeaf =
+        auto.isRunning() &&
+        toolName === "task" &&
+        Array.isArray(results) &&
+        results.some(
+          (result) =>
+            result &&
+            typeof result === "object" &&
+            ((typeof result.exitCode === "number" && result.exitCode !== 0) ||
+              (typeof result.error === "string" && result.error.length > 0)),
+        );
       const repeated = state.observe(
         event.toolCallId,
         toolName,
         event.input,
         text,
-        event.isError,
+        event.isError || failedLeaf,
         captureMetadata(event.details),
       );
       if (repeated)
@@ -365,6 +484,7 @@ export function extensionFactory(
     pi.on("tool_execution_end", (event, ctx) => {
       if (ctx.agent.kind !== "main" || event.toolName !== "eval") return;
       const input = activeEvals.get(event.toolCallId);
+      if (nativeSettlement((event.result as { details?: unknown })?.details, ctx)) return; // Initial native background receipt, not settlement.
       if (!input) return; // The normal tool_result already recorded this execution.
       activeEvals.delete(event.toolCallId);
       state?.observe(
@@ -438,16 +558,6 @@ export function extensionFactory(
             isError: true,
           };
         }
-        if (params.phase === "completion" && auto.handlesCompletion())
-          return {
-            content: [
-              {
-                type: "text",
-                text: "OMP Auto will collect fresh Rasen CLI validation and perform this completion checkpoint at the turn boundary. No review round was charged. Return a factual progress summary; do not claim completion yet.",
-              },
-            ],
-            isError: false,
-          };
         const admissionState = state;
         const admissionGeneration = generation;
         const invocationId = `${ctx.sessionManager.getSessionId()}:${generation}:${id}`.slice(
@@ -528,6 +638,7 @@ export function extensionFactory(
         }
         if (
           params.phase === "completion" &&
+          !auto.handlesCompletion() &&
           (ctx.getAsyncJobSnapshot?.()?.running.length ?? 0) > 0
         ) {
           const verdict = state?.rejectReview(
@@ -540,6 +651,58 @@ export function extensionFactory(
             content: [{ type: "text", text: JSON.stringify(result) }],
             details: result,
             isError: true,
+          };
+        }
+        if (params.phase === "completion" && auto.handlesCompletion()) {
+          if (
+            activeEvals.size &&
+            (activeEvals.size !== 1 ||
+              ![...activeEvals.values()].every((input) =>
+                completionCarrier(input, state?.config.maxReviewBytes ?? 131072),
+              ))
+          ) {
+            const verdict = state?.rejectReview(
+              "completion",
+              invocationId,
+              "Auto completion inside Eval requires one dedicated JavaScript reset=true single-call native checkpoint carrier; await all other effects first",
+            );
+            const result = { ...verdict, invocationId, status: "input_rejected", charged: false };
+            return {
+              content: [{ type: "text", text: JSON.stringify(result) }],
+              details: result,
+              isError: true,
+            };
+          }
+          for (const evalId of activeEvals.keys()) autoCompletionCarriers.add(evalId);
+          const current = state;
+          const requestGeneration = generation;
+          const verdict = await auto.complete(
+            material,
+            ctx,
+            signal,
+            invocationId,
+            new Set([id, ...autoCompletionCarriers]),
+          );
+          if (
+            state &&
+            state === current &&
+            generation === requestGeneration &&
+            state.terminalReason
+          )
+            stopBlocked(state.terminalReason, ctx);
+          const result = {
+            ...verdict,
+            invocationId,
+            review: state?.lastReview?.invocationId === invocationId ? state.lastReview : null,
+            next:
+              verdict.decision === "approve"
+                ? "Return a factual final summary; Auto will settle only if fresh Rasen facts still match this approval"
+                : "Address the finding or required independent round and resubmit native completion evidence within this LEAD turn",
+          };
+          return {
+            content: [{ type: "text", text: JSON.stringify(result) }],
+            details: result,
+            isError: verdict.decision !== "approve",
           };
         }
         if (params.phase === "completion" && activeEvals.size) {
@@ -617,7 +780,7 @@ export function extensionFactory(
                 next:
                   verdict.decision === "approve"
                     ? "Copy the canonical approved steps exactly into todo; await successful registration before execution. Do not batch todo registration with execution."
-                    : "Review the pending canonical steps with phase=plan and address the findings, or stop with phase=blocked. Approval requires exact steps, including punctuation, whitespace and order.",
+                    : "Address the findings within the remaining review allowance. If the plan must change, resubmit phase=plan with a matching review file and the full corrected steps array; editing only the review body does not replace pending canonical steps. Keep authorized work executable, but explicitly mark unauthorized portions blocked pending separate user authorization; do not execute those portions or mark their unfinished task complete. Approval never grants permission. After approval, register the exact returned steps, including punctuation, whitespace and order. If you cannot proceed, stop with phase=blocked.",
               }
             : { ...verdict, invocationId, review: reviewOutcome };
         return {

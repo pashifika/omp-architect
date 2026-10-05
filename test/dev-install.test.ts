@@ -660,8 +660,13 @@ describe("development installer against the installed native OMP host", () => {
   test.each([
     false,
     true,
-  ])("bundled CLI loads installed plugins without source SDK natives, optional brief=%s", async (withBrief) => {
-    const f = await fixture();
+  ])("bundled CLI loads installed plugins and Auto config without source SDK natives, optional brief=%s", async (withBrief) => {
+    // Exercise the running host's directory resolver both with an explicit
+    // agent override and with a named profile that takes precedence over it.
+    const f = await fixture({
+      customAgent: true,
+      ...(withBrief ? { profile: "auto-config" } : {}),
+    });
     succeeded(install(f));
     if (withBrief) {
       // Match an existing main installation opting into brief later, then rerun
@@ -701,14 +706,22 @@ describe("development installer against the installed native OMP host", () => {
     }
     const project = path.join(f.base, "unrelated project");
     await mkdir(path.join(project, ".git"), { recursive: true });
+    const globalConfig = path.join(f.agent, "auto.json");
+    const projectConfig = path.join(project, ".omp", "auto.json");
+    await put(globalConfig, { enabled: false });
+    await put(projectConfig, { maxFallbacks: 1 });
     const networkGuard = path.join(f.base, "no-network.ts");
     await put(
       networkGuard,
       `globalThis.fetch = (() => { throw new Error("Unexpected network request in load test"); }) as typeof fetch;`,
     );
     for (const sourcePeers of ["incomplete", "absent"]) {
-      if (sourcePeers === "absent")
+      if (sourcePeers === "absent") {
         await rm(path.join(f.checkout, "node_modules"), { recursive: true });
+        await put(projectConfig, { enabled: true });
+        // A project override cannot conceal a malformed active-profile file.
+        if (withBrief) await put(globalConfig, "{");
+      }
       const result = spawnSync(
         process.execPath,
         [
@@ -728,10 +741,16 @@ describe("development installer against the installed native OMP host", () => {
         ],
         {
           cwd: project,
-          // A placeholder unlocks the bundled model list; no prompt is sent and
-          // fetch is blocked. Never inherit real credentials from the developer.
+          // A placeholder unlocks the bundled model list. The status slash
+          // command never invokes a model, and fetch is blocked throughout.
+          // Never inherit real credentials from the developer.
           env: { ...f.env, OPENAI_API_KEY: "test-placeholder-never-sent" },
-          input: `${JSON.stringify({ id: "commands", type: "get_available_commands" })}\n`,
+          input: [
+            { id: "commands", type: "get_available_commands" },
+            { id: "auto-status", type: "prompt", message: "/auto status" },
+          ]
+            .map((command) => `${JSON.stringify(command)}\n`)
+            .join(""),
           encoding: "utf8",
           timeout: 25_000,
           maxBuffer: 1024 * 1024,
@@ -753,6 +772,21 @@ describe("development installer against the installed native OMP host", () => {
       expect(commands.filter((command: string) => command === "brief")).toHaveLength(
         withBrief ? 1 : 0,
       );
+      const statusMessage = frames.find(
+        (frame) => frame.type === "message_end" && frame.message?.customType === "omp-auto",
+      );
+      expect(statusMessage, output).toBeDefined();
+      const status = JSON.parse(statusMessage.message.content);
+      expect(status.status).toBe("idle");
+      expect(status.enabled).toBe(sourcePeers === "absent" && !withBrief);
+      if (sourcePeers === "absent" && withBrief) {
+        expect(status.error).toContain(globalConfig);
+        expect(status.error).toContain("Auto is disabled");
+      } else expect(status.error).toBeNull();
+      expect(
+        frames.some((frame) => frame.type === "agent_start" || frame.type === "turn_start"),
+        output,
+      ).toBe(false);
     }
   }, 60_000);
 

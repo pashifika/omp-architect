@@ -1,8 +1,10 @@
-import { expect, test } from "bun:test";
+import { expect, jest, test } from "bun:test";
+import { JevError } from "../src/auto/decision.ts";
+import { DecisionFailure } from "../src/auto/decision-diagnostics.ts";
 import { AutoRun } from "../src/auto/core.ts";
 import { parseAutoConfig } from "../src/auto/config.ts";
 import type { RasenSnapshot } from "../src/auto/rasen.ts";
-import type { DecisionEvidence, DecisionProvider } from "../src/auto/decision.ts";
+import type { Decision, DecisionEvidence, DecisionProvider } from "../src/auto/decision.ts";
 
 const signal = () => new AbortController().signal;
 function snapshot(done: string[] = []): RasenSnapshot {
@@ -34,7 +36,7 @@ test("Auto allows explicit starts by default; strict config rejects unknown keys
   for (const invalid of [
     { enabled: "true" },
     { unknown: 1 },
-    { maxSteps: 9 },
+    { maxSteps: 10001 },
     { maxToolCalls: 0 },
     { minConfidence: NaN },
     { minConfidence: 0.1 },
@@ -46,12 +48,21 @@ test("Auto allows explicit starts by default; strict config rejects unknown keys
   expect(parseAutoConfig({ enabled: true, fallback: "stop", maxFallbacks: 0 }).enabled).toBe(true);
 });
 
+test("CLI supervision remains finite and supports slower real Rasen startup", () => {
+  expect(parseAutoConfig({}).cliTimeoutMs).toBe(10000);
+  for (const cliTimeoutMs of [100, 5000, 10000, 30000])
+    expect(parseAutoConfig({ cliTimeoutMs }).cliTimeoutMs).toBe(cliTimeoutMs);
+  for (const cliTimeoutMs of [0, 99, 30001, Infinity, null])
+    expect(() => parseAutoConfig({ cliTimeoutMs })).toThrow();
+});
+
 test("hard turn and tool caps count attempts; repeated delivery cannot reset budget", () => {
   const run = new AutoRun(parseAutoConfig({ maxSteps: 2, maxToolCalls: 2 }), snapshot());
   expect(run.toolCall("a")).toBe(true);
   expect(run.toolCall("a")).toBe(true);
   expect(run.toolCall("b")).toBe(true);
   expect(run.toolCalls).toBe(2);
+  expect(run.continue()).toBe(true);
   expect(run.continue()).toBe(true);
   expect(run.continue()).toBe(false);
   expect(run.status).toBe("budget_exhausted");
@@ -77,6 +88,11 @@ test("deadline and cancellation remain terminal despite high-confidence decision
   expect(await cancelled.decide(evidence, good, good, abort.signal)).toBeUndefined();
   expect(cancelled.status).toBe("cancelled");
   expect(cancelled.fallbacks).toBe(0);
+  expect(cancelled.statusView().decisionDiagnostics.attempts[0]).toMatchObject({
+    provider: "jev",
+    outcome: "error",
+    errorCode: "DECISION_CANCELLED",
+  });
 });
 
 test("stall budget uses new completed task IDs, not instruction/fingerprint churn or checkbox toggling", () => {
@@ -91,17 +107,17 @@ test("stall budget uses new completed task IDs, not instruction/fingerprint chur
   expect(run.status).toBe("stalled");
 });
 
-test("changing scope or removing tasks requires a new user start; all_done never self-approves", () => {
+test("planning may change tasks while fixed change identity remains guarded", () => {
   const run = new AutoRun(parseAutoConfig({}), snapshot());
   const changed = snapshot();
   changed.tasks.pop();
   run.observe(changed);
-  expect(run.status).toBe("needs_user");
+  expect(run.status).toBe("running");
   const renamed = new AutoRun(parseAutoConfig({}), snapshot());
   const changedText = snapshot();
   changedText.tasks[0].description = "Different objective";
   renamed.observe(changedText);
-  expect(renamed.status).toBe("needs_user");
+  expect(renamed.status).toBe("running");
   for (const changedIdentity of [{ root: "/other" }, { schema: "other-schema" }]) {
     const identity = new AutoRun(parseAutoConfig({}), snapshot());
     identity.observe({ ...snapshot(), ...changedIdentity });
@@ -168,4 +184,452 @@ test("a provider's synchronous caller abort cannot escape the core deadline", as
   };
   expect(await run.decide(evidence, provider, undefined, controller.signal)).toBeUndefined();
   expect(run.status).toBe("cancelled");
+});
+
+test("default supervision permits more than eighty tools and eight boundaries without count caps", () => {
+  const run = new AutoRun(parseAutoConfig({}), snapshot());
+  for (let i = 0; i < 125; i++) expect(run.toolCall(`read-${i}`)).toBe(true);
+  for (let i = 0; i < 12; i++) expect(run.continue()).toBe(true);
+  expect(run.status).toBe("running");
+  expect(run.config.maxDurationMs).toBe(4 * 60 * 60 * 1000);
+  expect(run.config.noOutputTimeoutMs).toBe(10 * 60 * 1000);
+  expect(run.statusView().toolCalls).toBe("125");
+});
+
+test("finite output watchdog resets only with activity; absolute deadline never resets", () => {
+  let now = 0;
+  const run = new AutoRun(
+    parseAutoConfig({ maxDurationMs: 4000, noOutputTimeoutMs: 1000 }),
+    snapshot(),
+    () => now,
+  );
+  now = 900;
+  run.activity();
+  now = 1500;
+  expect(run.checkTime()).toBe(true);
+  now = 1900;
+  expect(run.checkTime()).toBe(false);
+  expect(run.status).toBe("stalled");
+  const absolute = new AutoRun(
+    parseAutoConfig({ maxDurationMs: 2000, noOutputTimeoutMs: 1000 }),
+    snapshot(),
+    () => now,
+  );
+  now = 2800;
+  absolute.activity();
+  now = 3700;
+  absolute.activity();
+  now = 3900;
+  expect(absolute.checkTime()).toBe(false);
+  expect(absolute.status).toBe("budget_exhausted");
+});
+
+test("terminal reconciliation refreshes facts without resuming, spending counters or approving completion", () => {
+  let now = 0;
+  const run = new AutoRun(parseAutoConfig({ maxToolCalls: 1 }), snapshot(), () => now);
+  run.toolCall("one");
+  run.toolCall("two");
+  expect(run.status).toBe("budget_exhausted");
+  now = 2000;
+  expect(run.reconcile(snapshot(["1.1"]))).toBe(true);
+  expect(run.statusView()).toMatchObject({
+    status: "budget_exhausted",
+    progress: { complete: 1 },
+    completionVerified: false,
+    toolCalls: "1/1",
+    observation: { at: 2000, error: null },
+  });
+  const done = new AutoRun(parseAutoConfig({}), snapshot(["1.1", "1.2"]));
+  done.stop("completed", "Verified");
+  expect(done.statusView().completionVerified).toBe(true);
+  done.reconcile(snapshot(["1.1"]));
+  expect(done.status).toBe("completed");
+  expect(done.statusView().completionVerified).toBe(false);
+});
+
+test("null legacy limits are explicit and supervision caps remain finite", () => {
+  expect(
+    parseAutoConfig({ maxSteps: null, maxToolCalls: null, maxStalls: null }).maxToolCalls,
+  ).toBeNull();
+  for (const invalid of [
+    { maxDurationMs: 43200001 },
+    { noOutputTimeoutMs: 1800001 },
+    { noOutputTimeoutMs: null },
+    { maxSteps: -1 },
+  ])
+    expect(() => parseAutoConfig(invalid)).toThrow();
+});
+
+test("decision diagnostics preserve primary and fallback provenance without secrets", async () => {
+  const run = new AutoRun(parseAutoConfig({}), snapshot());
+  await run.decide(
+    evidence,
+    async () => {
+      throw new JevError("JEV_MISSING_API_KEY");
+    },
+    async () => {
+      throw new Error("secret credential and response body");
+    },
+    signal(),
+  );
+  expect(run.status).toBe("uncertain");
+  expect(run.statusView().decisionDiagnostics).toMatchObject({
+    minConfidence: 0.8,
+    attempts: [
+      { provider: "jev", outcome: "error", errorCode: "JEV_MISSING_API_KEY" },
+      { provider: "architect", outcome: "error", errorCode: "PROVIDER_ERROR" },
+    ],
+  });
+  expect(JSON.stringify(run.statusView())).not.toContain("secret");
+  expect(run.reason).toContain("JEV_MISSING_API_KEY");
+  expect(run.fallbacks).toBe(1);
+  expect(run.decisions).toBe(1);
+});
+
+test("diagnostics distinguish timeout, low confidence, uncertainty and missing user input", async () => {
+  for (const [provider, outcome, extra] of [
+    [() => new Promise(() => {}), "error", { errorCode: "DECISION_TIMEOUT" }],
+    [
+      async () => ({ choice: "continue", confidence: 0.79 }),
+      "low_confidence",
+      { confidence: 0.79 },
+    ],
+    [async () => ({ choice: "uncertain", confidence: 0.99 }), "uncertain", { confidence: 0.99 }],
+    [
+      async () => ({ choice: "needs_user", confidence: 0.99 }),
+      "accepted",
+      { choice: "needs_user" },
+    ],
+    [
+      async () => {
+        throw new DecisionFailure("FALLBACK_INVALID_RESPONSE");
+      },
+      "error",
+      { errorCode: "FALLBACK_INVALID_RESPONSE" },
+    ],
+  ] as const) {
+    const run = new AutoRun(
+      parseAutoConfig({ fallback: "stop", decisionTimeoutMs: 100 }),
+      snapshot(),
+    );
+    await run.decide(evidence, provider as DecisionProvider, undefined, signal());
+    expect(run.statusView().decisionDiagnostics.attempts[0]).toMatchObject({ outcome, ...extra });
+    expect(run.status).toBe(
+      "choice" in extra && extra.choice === "needs_user" ? "needs_user" : "uncertain",
+    );
+  }
+});
+
+test("a successful fallback remains visible and does not bypass minimum confidence", async () => {
+  const run = new AutoRun(parseAutoConfig({}), snapshot());
+  const result = await run.decide(
+    evidence,
+    async () => {
+      throw new JevError("JEV_INVALID_RESPONSE");
+    },
+    good,
+    signal(),
+  );
+  expect(result?.choice).toBe("continue");
+  expect(run.statusView().decisionDiagnostics.attempts).toMatchObject([
+    { provider: "jev", outcome: "error", errorCode: "JEV_INVALID_RESPONSE" },
+    { provider: "architect", outcome: "accepted", confidence: 0.95 },
+  ]);
+});
+
+test("decision status snapshots are defensive and the next decision replaces provenance", async () => {
+  const run = new AutoRun(parseAutoConfig({}), snapshot());
+  await run.decide(
+    evidence,
+    async () => {
+      throw new JevError("JEV_HTTP_ERROR");
+    },
+    good,
+    signal(),
+  );
+  run.statusView().decisionDiagnostics.attempts[0].errorCode = "mutated";
+  expect(run.statusView().decisionDiagnostics.attempts[0].errorCode).toBe("JEV_HTTP_ERROR");
+  await run.decide(evidence, good, good, signal());
+  expect(run.statusView().decisionDiagnostics.attempts).toHaveLength(1);
+  expect(run.statusView().decisionDiagnostics.attempts[0]).toMatchObject({
+    provider: "jev",
+    outcome: "accepted",
+  });
+});
+
+for (const outcome of ["success", "timeout", "cancel"] as const) {
+  test(`Architect fallback has its own review deadline: ${outcome}`, async () => {
+    const run = new AutoRun(parseAutoConfig({ maxFallbacks: 1 }), snapshot(), () => Date.now());
+    const started = Promise.withResolvers<void>();
+    const response = Promise.withResolvers<Decision>();
+    const caller = new AbortController();
+    let fallbackSignal: AbortSignal | undefined;
+    let calls = 0;
+    const weak: DecisionProvider = async () => ({ choice: "continue", confidence: 0.58 });
+    jest.useFakeTimers();
+    try {
+      const pending = run.decide(
+        evidence,
+        weak,
+        async (_evidence, signal) => {
+          calls++;
+          fallbackSignal = signal;
+          started.resolve();
+          return response.promise;
+        },
+        caller.signal,
+        120000,
+      );
+      await started.promise;
+      jest.advanceTimersByTime(8001);
+      await Promise.resolve();
+      expect(fallbackSignal?.aborted).toBe(false);
+      expect(run.fallbacks).toBe(1);
+      if (outcome === "success") response.resolve({ choice: "continue", confidence: 0.95 });
+      else if (outcome === "cancel") caller.abort();
+      else jest.advanceTimersByTime(120000 - 8001);
+      const result = await pending;
+      expect(calls).toBe(1);
+      expect(run.statusView().decisionDiagnostics.attempts).toMatchObject([
+        { provider: "jev", outcome: "low_confidence", confidence: 0.58, timeoutMs: 8000 },
+        {
+          provider: "architect",
+          timeoutMs: 120000,
+          ...(outcome === "success"
+            ? { outcome: "accepted" }
+            : {
+                outcome: "error",
+                errorCode: outcome === "cancel" ? "DECISION_CANCELLED" : "DECISION_TIMEOUT",
+              }),
+        },
+      ]);
+      if (outcome === "success") {
+        expect(result?.choice).toBe("continue");
+        expect(run.status).toBe("running");
+        // A longer deadline never buys another fallback or lowers confidence.
+        expect(await run.decide(evidence, weak, good, signal(), 120000)).toBeUndefined();
+        expect(run.fallbacks).toBe(1);
+        expect(run.status).toBe("uncertain");
+      } else {
+        expect(result).toBeUndefined();
+        expect(fallbackSignal?.aborted).toBe(true);
+        expect(run.status).toBe(outcome === "cancel" ? "cancelled" : "uncertain");
+      }
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      caller.abort();
+      response.resolve({ choice: "uncertain", confidence: 0 });
+      jest.useRealTimers();
+    }
+  });
+}
+
+test("semantic stop drains without resuming budgets and completes only after settlement", () => {
+  const run = new AutoRun(parseAutoConfig({}), snapshot());
+  run.stop("needs_user", "New user input");
+  run.beginDrain();
+  expect(run.status).toBe("draining");
+  expect(run.toolCall("late")).toBe(false);
+  expect(run.continue()).toBe(false);
+  run.finishDrain();
+  expect(run.status).toBe("paused");
+  expect(run.statusView().outcome).toBe("needs_user");
+  run.stop("completed", "Late approval cannot resume a held run");
+  expect(run.status).toBe("paused");
+});
+
+test("initial stop evidence survives drainage and status callers cannot mutate it", () => {
+  let now = 100000;
+  const run = new AutoRun(parseAutoConfig({}), snapshot(), () => now);
+  expect(run.statusView().initialStop).toBeNull();
+  run.stop("stalled", "No native output");
+  run.beginDrain();
+  now += 1000;
+  run.stop("needs_user", "Later input");
+  const initial = run.statusView().initialStop!;
+  expect(initial).toEqual({ at: 100000, status: "stalled", reason: "No native output" });
+  initial.reason = "Changed by a status caller";
+  run.finishDrain();
+  expect(run.statusView()).toMatchObject({
+    status: "paused",
+    outcome: "stalled",
+    initialStop: { at: 100000, status: "stalled", reason: "No native output" },
+  });
+});
+
+test("native action progress resets stall supervision without claiming change completion", () => {
+  const run = new AutoRun(parseAutoConfig({ maxStalls: 2 }), snapshot());
+  run.observe(snapshot());
+  expect(run.stalls).toBe(1);
+  run.actionProgress("propose:done");
+  expect(run.stalls).toBe(0);
+  run.observe({ ...snapshot(), state: "blocked" });
+  expect(run.status).toBe("running");
+  run.actionProgress("apply:done");
+  expect(run.stalls).toBe(0);
+  expect(run.statusView().completionVerified).toBe(false);
+});
+
+test("a completed native action does not immediately spend a one-observation stall budget", () => {
+  const run = new AutoRun(parseAutoConfig({ maxStalls: 1 }), snapshot());
+  run.actionProgress("propose:done");
+  run.observe(snapshot());
+  expect(run.stalls).toBe(0);
+  expect(run.continue()).toBe(true);
+  run.actionProgress("propose:done");
+  run.observe(snapshot());
+  expect(run.stalls).toBe(1);
+  expect(run.continue()).toBe(false);
+});
+
+const dynamicChoices = {
+  skill_0: 'Skill "continue": Create the next missing artifact.',
+  skill_1: 'Skill "apply": Implement ready change tasks.',
+  skill_2: 'Skill "verify": Verify work against the change.',
+  finish:
+    "Propose finishing only with supporting change/history evidence; requires controller validation.",
+  needs_user: "Missing user input or permission.",
+  uncertain: "No sufficiently supported next option.",
+};
+
+test("dynamic skills and finish are routing proposals, never automatic completion", async () => {
+  for (const choice of ["skill_0", "skill_1", "skill_2", "finish"]) {
+    const run = new AutoRun(parseAutoConfig({}), snapshot());
+    const result = await run.decide(
+      { ...evidence, choices: dynamicChoices },
+      async () => ({ choice, confidence: 0.95 }),
+      undefined,
+      signal(),
+    );
+    expect(result).toEqual({ choice, confidence: 0.95 });
+    expect(run.status).toBe("running");
+    expect(run.statusView().completionVerified).toBe(false);
+    expect(run.statusView().decisionDiagnostics.attempts).toMatchObject([
+      { provider: "jev", outcome: "accepted", choice, confidence: 0.95 },
+    ]);
+  }
+});
+
+test("dynamic candidates retain confidence, exact-set fallback validation, and no retries", async () => {
+  for (const primaryChoice of ["continue", "replan", "skill_99", "uncertain", "skill_0"]) {
+    const run = new AutoRun(parseAutoConfig({}), snapshot());
+    let primaryCalls = 0;
+    let fallbackCalls = 0;
+    const result = await run.decide(
+      { ...evidence, choices: dynamicChoices },
+      async () => {
+        primaryCalls++;
+        return { choice: primaryChoice, confidence: primaryChoice === "skill_0" ? 0.5 : 0.95 };
+      },
+      async (input) => {
+        fallbackCalls++;
+        expect(input.choices).toEqual(dynamicChoices);
+        return { choice: "skill_2", confidence: 0.95 };
+      },
+      signal(),
+    );
+    expect(result?.choice).toBe("skill_2");
+    expect(primaryCalls).toBe(1);
+    expect(fallbackCalls).toBe(1);
+    expect(run.decisions).toBe(1);
+    expect(run.fallbacks).toBe(1);
+  }
+  const invalidFallback = new AutoRun(parseAutoConfig({}), snapshot());
+  await invalidFallback.decide(
+    { ...evidence, choices: dynamicChoices },
+    async () => ({ choice: "uncertain", confidence: 1 }),
+    async () => ({ choice: "replan", confidence: 1 }),
+    signal(),
+  );
+  expect(invalidFallback.status).toBe("uncertain");
+  expect(invalidFallback.statusView().decisionDiagnostics.attempts[1].outcome).toBe(
+    "invalid_response",
+  );
+});
+
+test("dynamic needs_user still stops admission and exact catalogs survive caller mutation", async () => {
+  const run = new AutoRun(parseAutoConfig({}), snapshot());
+  const choices: Record<string, string> = { ...dynamicChoices };
+  const selected = await run.decide(
+    { ...evidence, choices },
+    async (input) => {
+      delete choices.skill_1;
+      choices.skill_99 = "Added after decision began";
+      expect(Object.isFrozen(input.choices)).toBe(true);
+      return { choice: "skill_1", confidence: 0.95 };
+    },
+    undefined,
+    signal(),
+  );
+  expect(selected?.choice).toBe("skill_1");
+  await run.decide(
+    { ...evidence, choices: dynamicChoices },
+    async () => ({ choice: "needs_user", confidence: 1 }),
+    undefined,
+    signal(),
+  );
+  expect(run.status).toBe("needs_user");
+  expect(run.continue()).toBe(false);
+  expect(run.toolCall("mutation")).toBe(false);
+});
+
+test("invalid and oversized catalogs stop before either provider, without partial catalogs", async () => {
+  for (const [choices, code] of [
+    [{}, "JEV_INVALID_EVIDENCE"],
+    [{ skill_0: "x".repeat(65537) }, "JEV_CATALOG_TOO_LARGE"],
+  ] as const) {
+    const run = new AutoRun(parseAutoConfig({}), snapshot());
+    let calls = 0;
+    const provider: DecisionProvider = async () => {
+      calls++;
+      return { choice: "skill_0", confidence: 1 };
+    };
+    expect(
+      await run.decide({ ...evidence, choices }, provider, provider, signal()),
+    ).toBeUndefined();
+    expect(run.status).toBe("uncertain");
+    expect(calls).toBe(0);
+    expect(run.fallbacks).toBe(0);
+    expect(run.statusView().decisionDiagnostics.attempts).toMatchObject([
+      { outcome: "error", errorCode: code },
+    ]);
+  }
+});
+
+test("primary and fallback see the same bounded immutable history and complete catalog", async () => {
+  const run = new AutoRun(parseAutoConfig({ maxEvidenceChars: 1000 }), snapshot());
+  let first: DecisionEvidence | undefined;
+  const result = await run.decide(
+    { ...evidence, summary: "x".repeat(3000), choices: dynamicChoices },
+    async (input) => {
+      first = input;
+      expect(input.summary).toContain("[Evidence truncated]");
+      expect(input.summary.length).toBeLessThan(1000);
+      expect(input.choices).toEqual(dynamicChoices);
+      return { choice: "uncertain", confidence: 1 };
+    },
+    async (input) => {
+      expect(input).toBe(first!);
+      expect(Object.isFrozen(input)).toBe(true);
+      expect(input.choices).toEqual(dynamicChoices);
+      return { choice: "skill_2", confidence: 0.99 };
+    },
+    signal(),
+  );
+  expect(result?.choice).toBe("skill_2");
+});
+
+test("caller cancellation wins over an invalid candidate catalog", async () => {
+  const run = new AutoRun(parseAutoConfig({}), snapshot());
+  const caller = new AbortController();
+  caller.abort();
+  let calls = 0;
+  const provider: DecisionProvider = async () => {
+    calls++;
+    return { choice: "skill_0", confidence: 1 };
+  };
+  await run.decide({ ...evidence, choices: {} }, provider, provider, caller.signal);
+  expect(run.status).toBe("cancelled");
+  expect(calls).toBe(0);
+  expect(run.statusView().decisionDiagnostics.attempts[0].errorCode).toBe("DECISION_CANCELLED");
 });

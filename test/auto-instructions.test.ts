@@ -2,7 +2,6 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { loadAutoConfig } from "../src/auto/config.ts";
 import { autoRequest, briefRoot, parseAutoStart, renderBrief } from "../src/auto/instructions.ts";
 import { completeAuto } from "../src/auto/completion.ts";
 import { Orchestrator } from "../src/core.ts";
@@ -28,19 +27,6 @@ async function fixture() {
   await Bun.write(path.join(pack, "ts.md"), "---\naliases: typescript, t\n---\nTS {scope}: {var}");
   return { cwd, global, pack };
 }
-
-test("missing config and omitted enabled use defaults; explicit false and invalid config are preserved", async () => {
-  const { cwd } = await fixture();
-  expect((await loadAutoConfig(cwd)).enabled).toBe(true);
-  await Bun.write(path.join(cwd, ".omp/auto.json"), '{"maxSteps":2}');
-  expect(await loadAutoConfig(cwd)).toMatchObject({ enabled: true, maxSteps: 2 });
-  await Bun.write(path.join(cwd, ".omp/auto.json"), '{"enabled":false}');
-  expect((await loadAutoConfig(cwd)).enabled).toBe(false);
-  await Bun.write(path.join(cwd, ".omp/auto.json"), '{"maxSteps":99}');
-  await expect(loadAutoConfig(cwd)).rejects.toThrow();
-  await Bun.write(path.join(cwd, ".omp/auto.json"), "{");
-  await expect(loadAutoConfig(cwd)).rejects.toThrow();
-});
 
 test("instructions preserve quotes, multiple spaces, indentation, newlines, and trailing whitespace", () => {
   for (const text of [
@@ -78,6 +64,39 @@ test.each([
   `start my-change ${"x".repeat(12000)}`,
 ])("rejects malformed or unbounded invocation", (input) => {
   expect(() => parseAutoStart(input)).toThrow();
+});
+
+test("brief comma selectors stay compatible and missing prose delimiter fails explicitly", async () => {
+  expect(parseAutoStart("start my-change --brief example,TS,rs -- Keep prose")).toEqual({
+    change: "my-change",
+    brief: { pack: "example", blocks: ["ts", "rs"] },
+    instructions: "Keep prose",
+  });
+  const { cwd, global } = await fixture();
+  const parsed = parseAutoStart("start my-change --brief example write prose");
+  await expect(renderBrief(cwd, global, parsed.brief!, parsed.change)).rejects.toThrow();
+});
+
+test("only a leading brief selector has syntax; option-looking prose remains literal", () => {
+  for (const instructions of [
+    "Use --brief example for guidance",
+    "--pipeline full-feature",
+    "--pipeline ../literal is ordinary guidance",
+    "Explain --pipeline full-feature and --brief example",
+  ])
+    expect(parseAutoStart(`start my-change ${instructions}`)).toEqual({
+      change: "my-change",
+      instructions,
+    });
+  expect(parseAutoStart("start my-change -- --brief literal")).toEqual({
+    change: "my-change",
+    instructions: "--brief literal",
+  });
+  expect(parseAutoStart("start my-change --brief example ts -- --pipeline literal")).toEqual({
+    change: "my-change",
+    brief: { pack: "example", blocks: ["ts"] },
+    instructions: "--pipeline literal",
+  });
 });
 
 test("brief v0.1 rendering matches CRLF, variables, alias order, dedupe, indentation and unknown placeholders", async () => {
@@ -204,4 +223,18 @@ test("native argument completions replace full prefix, discover actual changes a
   expect(complete("start my-change write prose ")).toBeNull();
   expect(complete("start my-change\n--brief example ")).toBeNull();
   expect(complete("status ")).toBeNull();
+});
+
+test("completion never introduces a pipeline selector or treats guidance as options", async () => {
+  const { cwd, global } = await fixture();
+  await Bun.write(
+    path.join(cwd, ".rasen/pipelines/local-flow/pipeline.yaml"),
+    "name: local-flow\n",
+  );
+  const complete = (text: string) => completeAuto(text, cwd, global);
+  expect(complete("start my-change --p")).toBeNull();
+  expect(complete("start my-change --pipeline ")).toBeNull();
+  expect(complete("start my-change --pipeline local-flow --brief ")).toBeNull();
+  expect(complete("start my-change Explain --brief ")).toBeNull();
+  expect(complete("start my-change --brief example -- --brief ")).toBeNull();
 });

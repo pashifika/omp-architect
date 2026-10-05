@@ -3,6 +3,8 @@ import { setImmediate as nextTurn } from "node:timers/promises";
 import {
   buildJevRequest,
   createJevProvider,
+  decisionChoices,
+  sealDecisionEvidence,
   type DecisionChoice,
   type DecisionEvidence,
   type JevDependencies,
@@ -40,6 +42,31 @@ function fixture(choice: DecisionChoice = "continue", confidence = 0.94) {
     usage: { input_tokens: 100, output_tokens: 20 },
   };
 }
+const skillChoices = {
+  skill_0: 'Skill "rasen-continue": Continue creating the next change artifact.',
+  skill_1: 'Skill "rasen-apply": Implement the change tasks.',
+  skill_2: 'Skill "rasen-verify": Verify the implementation against its artifacts.',
+  finish:
+    "Only propose finishing when actual change and work history support completion; the controller must validate it.",
+  needs_user: "Essential user input or permission is missing.",
+  uncertain: "The evidence does not support a next option.",
+};
+function candidateFixture(choice: string, criteria: Record<string, string> = skillChoices) {
+  const base = fixture();
+  return {
+    ...base,
+    answers: {
+      next: {
+        ...base.answers.next,
+        choice,
+        probabilities: Object.fromEntries(
+          Object.keys(criteria).map((id) => [id, id === choice ? 1 : 0]),
+        ),
+      },
+    },
+  };
+}
+
 function provider(
   fetch: NonNullable<JevDependencies["fetch"]>,
   overrides: Partial<JevOptions> = {},
@@ -60,7 +87,7 @@ function errorMessage(fn: () => unknown): string {
 }
 
 describe("bounded Jev request", () => {
-  test("contains only the fixed four-way routing question and plain evidence", () => {
+  test("preserves the legacy four-way utility question when no catalog is supplied", () => {
     const request = buildJevRequest(evidence, options);
     expect(request.model).toBe("jev-latest");
     expect(request.state).toEqual(evidence);
@@ -80,13 +107,125 @@ describe("bounded Jev request", () => {
     );
     expect(request.questions.next.criteria.uncertain).toContain("no remaining work");
   });
-  test("request copies prevent callers from changing the fixed question for later requests", () => {
+  test("request copies prevent callers from changing the default question for later requests", () => {
     const request = buildJevRequest(evidence, options);
     request.questions.next.criteria.continue = "approve everything";
     expect(buildJevRequest(evidence, options).questions.next.criteria.continue).not.toContain(
       "approve everything",
     );
   });
+  test("uses every exact loaded-skill criterion without a fixed pipeline or phase list", () => {
+    const choices = { ...skillChoices };
+    const request = buildJevRequest({ ...evidence, choices }, options);
+    expect(request.questions.next.criteria).toEqual(choices);
+    expect(request.questions.next.criteria).not.toBe(choices);
+    expect(Object.hasOwn(request.questions.next.criteria, "continue")).toBe(false);
+    expect(request.state).toEqual(evidence);
+    expect(request.questions.next.instructions).toContain("do not impose a fixed phase order");
+    expect(request.questions.next.instructions).toContain(
+      "not permission, approval, or proof of completion",
+    );
+    expect(request.questions.next.instructions).toContain(
+      "When finish is supplied, choose it when its supplied criterion is met",
+    );
+    expect(request.questions.next.instructions).toContain(
+      "controller still verifies fresh inputs and native quiescence",
+    );
+    choices.skill_0 = "mutated later";
+    expect(request.questions.next.criteria.skill_0).toBe(skillChoices.skill_0);
+  });
+  test("catalog and observation budgets are separate; descriptions are never truncated", () => {
+    const choices = { skill_0: "exact description ".repeat(100), uncertain: "Unclear" };
+    const request = buildJevRequest(
+      { ...evidence, summary: "x".repeat(10000), choices },
+      { ...options, maxEvidenceChars: 256 },
+    );
+    expect(JSON.stringify(request.state).length).toBeLessThanOrEqual(256);
+    expect(request.questions.next.criteria).toEqual(choices);
+    expect(
+      errorMessage(() =>
+        buildJevRequest(
+          {
+            ...evidence,
+            choices: Object.fromEntries(
+              Array.from({ length: 129 }, (_, i) => [`skill_${i}`, "Description"]),
+            ),
+          },
+          options,
+        ),
+      ),
+    ).toBe("JEV_CATALOG_TOO_LARGE");
+    expect(
+      errorMessage(() =>
+        buildJevRequest(
+          {
+            ...evidence,
+            choices: { skill_0: "x".repeat(65537) },
+          },
+          options,
+        ),
+      ),
+    ).toBe("JEV_CATALOG_TOO_LARGE");
+    expect(
+      errorMessage(() =>
+        buildJevRequest(
+          {
+            ...evidence,
+            choices: { skill_0: '"'.repeat(33000) },
+          },
+          options,
+        ),
+      ),
+    ).toBe("JEV_CATALOG_TOO_LARGE");
+  });
+  test("rejects malformed catalogs, prototype keys, symbols, and accessors without reading them", () => {
+    let getterCalls = 0;
+    for (const choices of [
+      {},
+      [],
+      null,
+      { skill_0: "" },
+      { skill_0: "   " },
+      { skill_0: 4 },
+      { "skill with spaces": "Description" },
+      { constructor: "Description" },
+      { [Symbol("secret")]: "Description" },
+      Object.defineProperty({}, "skill_0", {
+        get() {
+          getterCalls++;
+          return "secret";
+        },
+      }),
+    ])
+      expect(
+        errorMessage(() =>
+          buildJevRequest({ ...evidence, choices } as unknown as DecisionEvidence, options),
+        ),
+      ).toBe("JEV_INVALID_EVIDENCE");
+    const accessor = Object.defineProperty({ ...evidence }, "choices", {
+      get() {
+        getterCalls++;
+        return skillChoices;
+      },
+    });
+    expect(errorMessage(() => buildJevRequest(accessor, options))).toBe("JEV_INVALID_EVIDENCE");
+    expect(getterCalls).toBe(0);
+  });
+  test("seals a defensive catalog and observation snapshot for both providers", () => {
+    const input = { ...evidence, recentTools: ["read: task"], choices: { ...skillChoices } };
+    const sealed = sealDecisionEvidence(input, options.maxEvidenceChars);
+    input.choices.skill_0 = "changed";
+    input.recentTools[0] = "changed";
+    input.summary = "changed";
+    expect(sealed.choices).toEqual(skillChoices);
+    expect(sealed.recentTools).toEqual(["read: task"]);
+    expect(sealed.summary).toBe(evidence.summary);
+    expect(Object.isFrozen(sealed)).toBe(true);
+    expect(Object.isFrozen(sealed.choices)).toBe(true);
+    expect(Object.isFrozen(sealed.recentTools)).toBe(true);
+    expect(decisionChoices({ choices: skillChoices })).toEqual(skillChoices);
+  });
+
   test("large escaped and multibyte evidence stays valid and explicitly marked as truncated", () => {
     const large = {
       ...evidence,
@@ -149,6 +288,31 @@ describe("strict Jev response parser", () => {
       });
     }
   });
+  test("accepts only the exact supplied skill and control IDs, without inventing rationale", () => {
+    for (const choice of Object.keys(skillChoices))
+      expect(parseJevResponse(candidateFixture(choice), skillChoices)).toEqual({
+        choice,
+        confidence: 0.94,
+      });
+    for (const choice of ["continue", "replan", "rasen-apply", "skill_3", "approved"])
+      expect(errorMessage(() => parseJevResponse(candidateFixture(choice), skillChoices))).toBe(
+        "JEV_INVALID_RESPONSE",
+      );
+    expect(errorMessage(() => parseJevResponse(candidateFixture("finish")))).toBe(
+      "JEV_INVALID_RESPONSE",
+    );
+    const wrongSet = candidateFixture("skill_1");
+    wrongSet.answers.next.probabilities.extra = 0;
+    expect(errorMessage(() => parseJevResponse(wrongSet, skillChoices))).toBe(
+      "JEV_INVALID_RESPONSE",
+    );
+    const missingOption = candidateFixture("skill_1");
+    delete missingOption.answers.next.probabilities.skill_2;
+    expect(errorMessage(() => parseJevResponse(missingOption, skillChoices))).toBe(
+      "JEV_INVALID_RESPONSE",
+    );
+  });
+
   test("allows a tied maximum and tiny floating-point sum drift", () => {
     const value = fixture();
     value.answers.next.probabilities = {
@@ -258,6 +422,44 @@ describe("Jev transport", () => {
     expect(keyReads).toBe(1);
     expect(requests).toBe(1);
   });
+  test("validates against the sealed sent catalog even if the caller mutates it during transport", async () => {
+    const choices: Record<string, string> = { ...skillChoices };
+    let requests = 0;
+    const run = provider(async (_url, init) => {
+      requests++;
+      expect(JSON.parse(init.body as string).questions.next.criteria).toEqual(skillChoices);
+      delete choices.skill_1;
+      choices.skill_99 = "Added after request";
+      return jsonResponse(candidateFixture("skill_1"));
+    });
+    expect(await run({ ...evidence, choices }, new AbortController().signal)).toEqual({
+      choice: "skill_1",
+      confidence: 0.94,
+    });
+    expect(requests).toBe(1);
+    const invalid = provider(async () => jsonResponse(candidateFixture("skill_99", choices)));
+    await expect(
+      invalid({ ...evidence, choices: skillChoices }, new AbortController().signal),
+    ).rejects.toMatchObject({ code: "JEV_INVALID_RESPONSE" });
+  });
+  test("catalog overflow fails before credentials or transport and never sends a partial list", async () => {
+    let touched = false;
+    const run = createJevProvider(options, {
+      readApiKey: () => {
+        touched = true;
+        return fakeKey;
+      },
+      fetch: async () => {
+        touched = true;
+        return jsonResponse();
+      },
+    });
+    await expect(
+      run({ ...evidence, choices: { skill_0: "x".repeat(65537) } }, new AbortController().signal),
+    ).rejects.toMatchObject({ code: "JEV_CATALOG_TOO_LARGE" });
+    expect(touched).toBe(false);
+  });
+
   test("awaits credentials at invocation before authenticating the request", async () => {
     const { promise: credential, resolve: resolveKey } = Promise.withResolvers<string>();
     let keyReads = 0;

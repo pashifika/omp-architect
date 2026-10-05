@@ -11,6 +11,7 @@ import {
   loadReviewMaterial,
   saveReviewMaterial,
   reviewCarrier,
+  completionCarrier,
   reviewWrite,
 } from "../src/artifacts.ts";
 import { digest } from "../src/core.ts";
@@ -202,3 +203,30 @@ test.skipIf(process.platform === "win32")(
     }
   },
 );
+
+test("Auto completion accepts only a dedicated exact native Eval checkpoint carrier", () => {
+  const args = {
+    path: "xd://architect_checkpoint",
+    content: JSON.stringify({ phase: "completion", evidenceRef: "artifact://1" }),
+  };
+  const code = `await tool.write(${JSON.stringify(args)})`;
+  expect(completionCarrier({ language: "js", reset: true, code }, 131072)).toBe(true);
+  expect(
+    completionCarrier({ language: "js", reset: true, code: `console.log(${code})` }, 131072),
+  ).toBe(true);
+  for (const input of [
+    { language: "js", reset: false, code },
+    { language: "js", reset: true, code: `${code}; await tool.bash({command:"true"})` },
+    {
+      language: "js",
+      reset: true,
+      code: `await tool.write(${JSON.stringify({ ...args, content: JSON.stringify({ phase: "plan", evidenceRef: "artifact://1" }) })})`,
+    },
+    {
+      language: "js",
+      reset: true,
+      code: `await tool.write(${JSON.stringify({ path: "local://architect-review/test.md", content: "body" })})`,
+    },
+  ])
+    expect(completionCarrier(input, 131072)).toBe(false);
+});

@@ -1,70 +1,248 @@
 # Rasen Auto setup and limits
 
-`/auto start <change>` drives a **prepared, local Rasen change** through task-sized implementation turns, fresh CLI observation, and architect completion review. It is a single-driver apply loop: the main OMP model does implementation, Jev supplies a small semantic routing hint, and code owns state and limits. Existing Architect behavior remains the default when Auto is off.
+`/auto start <change> [guidance]` works toward the requested outcome for an
+existing local Rasen change. Jev selects the actual next existing Rasen skill
+from its loaded name/description, current change facts, and actual native work
+history. There is no mandatory pipeline, fixed apply/verify/review sequence, or
+requirement that tasks already be prepared. `auto-run.json` is not a prerequisite.
 
-The supported Rasen source is **dev/0.1.8 at `f0ae20d19a30c265ad3f3ffaaa5bb3cd148d12dd`**, built and locally installed before verification. Its generated `.omp/skills/rasen-apply-change/SKILL.md` and the actual CLI instruction/context artifacts are read on every boundary. Skills are not copied into this package. The supplied profile was tested privately; it is not redistributed. This first core does not implement Rasen's whole auto pipeline, planning-only or external-store modes, nor automatic propose/ship/archive.
+OMP owns execution, permissions, jobs, session history, and artifacts. Auto
+coordinates skill actions and supervises their boundaries. Each existing skill
+owns its complete internal workflow and files. In particular, `rasen-review-cycle`
+keeps its existing review/fix/delta loop, limits, escalation, and report writes;
+Auto adds no second review-cycle or outer Architect completion gate.
 
-## Setup
+## Setup and commands
 
-1. Build/install the pinned Rasen development source with `bun run prepare:rasen` (see the script's reported executable path). For a supplied YAML profile, run `rasen profile import /path/to/profile.yaml --as my-auto`, then `rasen init --tools omp --profile my-auto` in your project using that executable. The script installs into a temporary test prefix; use Rasen's upstream packaging workflow for a persistent installation. Prepare the change's proposal, design, specs, and tasks first
-2. `.omp/auto.json` is **optional**. When absent, Auto uses its bounded defaults and the `rasen` executable on PATH. To customize them, copy [examples/auto.json](../examples/auto.json) and set `rasenExecutable` if needed, then restart OMP. An explicit `"enabled": false` disables starts; malformed or invalid files fail closed. A missing file or `enabled: true` never starts a run automatically
-3. Merge [examples/auto-config.yml](../examples/auto-config.yml) to set native OMP `bash.autoBackground.enabled: false` and finish existing background jobs. Auto requires foreground execution. The regular `modelRoles` and Architect `reviews.min/max` settings in the [Architect guide](architect.md) remain authoritative
-4. Authenticate the `typesafe` provider through OMP's `/login`, or provide `TYPESAFE_API_KEY` in the OMP process environment through your normal secure setup. Auto resolves credentials through the current OMP session's `authStorage.keys.get("typesafe")` on each Jev invocation, using OMP's standard precedence; a key saved by `/login` takes precedence over the environment variable. You do not need to configure both. Credential lookup shares the decision's timeout and cancellation boundary. Never put keys in `auto.json`, this repository, task artifacts, or tool arguments. No external private connector key is imported. `jev-latest` is the fixed TypeSafe routing model; OMP generative models/efforts still use native roles
-5. Run `/auto start my-change` in interactive OMP and confirm the scoped run and evidence sharing. `/auto status` and `auto_status` show progress and budgets. `/auto stop` cancels; a fresh user start is required to reset budgets
+The verified Rasen source contract is **dev/0.1.8 at
+`f0ae20d19a30c265ad3f3ffaaa5bb3cd148d12dd`**. Current migration validation and
+historical proof limits are recorded in [verification](rasen-auto-verification.md).
 
-## Extra instructions and existing brief packs
-
-Append instructions directly, including multiline text:
+1. Install/build that Rasen version and initialize the project with
+   `rasen init --tools omp`. `bun run prepare:rasen` builds an isolated temporary
+   test installation and reports its executable path; use upstream packaging for
+   a persistent installation
+2. Create a change through Rasen, and make its existing skills available in OMP.
+   Auto reads `AgentSession.skills`, including native global, project, and packaged
+   skills and their registered names. No particular generated profile or installed
+   `rasen-auto` skill is required; the Auto skill itself is excluded as a candidate
+3. Keep normal OMP async settings and configure models with native `modelRoles`.
+   See [examples/auto-config.yml](../examples/auto-config.yml). Auto does not switch
+   the main model or disable async execution
+4. Authenticate `typesafe` through OMP's `/login`, or set `TYPESAFE_API_KEY` in
+   the OMP process environment. The running session's
+   `authStorage.keys.get("typesafe")` preserves normal OMP precedence, including
+   saved-login precedence over the environment. Never put credentials in guidance,
+   configuration files, or tool arguments. Routing uses `jev-latest`
+5. Start interactively and confirm the work and evidence disclosure:
 
 ```text
-/auto start my-change Keep the implementation small; report the result in Japanese
+/auto start my-change
+/auto start my-change Keep the implementation focused
+/auto start my-change --brief example ts -- Run focused tests first
+/auto status
+/auto stop
 ```
 
-Or reuse a pack from the user's `brief` v0.1 format without installing another `/brief` command:
+A missing `auto.json` uses defaults; enabling Auto does not start anything. Start
+requires an existing change, usable native skills, and the ordinary preflight
+checks. A change with missing planning artifacts can select a planning/continue
+skill instead of being rejected just because apply is not ready. Status reads
+never start or resume execution.
+
+## Skill selection and state ownership
+
+At a boundary, Auto observes Rasen status/artifact facts, relevant source-owned
+records, native tools/results, and its native session history. Jev receives exact
+available skill names, descriptions, and selection criteria under opaque option
+IDs. Its answer selects the next skill or a control outcome such as needing user
+input, uncertainty, or proposing completion. It does not merely approve a stage
+chosen by a host-owned pipeline.
+
+The catalog is validated and bounded separately from observation text. Oversized
+catalogs are rejected, never silently shortened to hide candidates. Global and
+packaged skill identities come from the native loader rather than a second
+filesystem discovery system. The selected skill is read completely and its
+identity/content are checked before admission. Main follows that skill and uses
+OMP's normal tools and configured worker, explorer, and reviewer roles. Skill
+bodies are not automatically sent as separate Jev fields.
+
+Planning, continue, apply, verification, review, ship, retain, and archive remain
+candidates when loaded and applicable. The requested outcome and actual evidence
+determine relevance. Selecting a skill grants no additional permission. Publishing,
+merging, deploying, deleting, archiving, and other consequential effects still
+require their usual authorization. A missing decision or denied approval holds
+the work for the user; it is neither success nor a reason to bypass the skill.
+
+There are two distinct kinds of history:
+
+- **Skill-owned records:** Rasen artifacts and records belong to their skills.
+  `rasen-review-cycle` may create or update `auto-run.json` for Rasen's UI even
+  when Auto and pipelines are not in use. Auto preserves those writes and reads
+  record content as evidence. File existence alone never establishes a pipeline,
+  native execution, or completion. Absent, valid, and malformed records are
+  distinct observations; an unfamiliar record is not a new host state machine
+- **Auto orchestration history:** Auto appends small versioned events through
+  OMP `appendEntry` and reads the active branch through `getBranch`. Events bind
+  the run, change, action, chosen skill, input/output facts, decision, and native
+  receipt/artifact references. Full evidence remains in native artifacts. There
+  is no new project filesystem runtime or second writer for skill-owned records
+
+Native history survives as session evidence; it is not executable state. Reading,
+reloading, branching, or restarting a session never implicitly resumes work. A
+fresh confirmed start re-observes facts and unfinished actions before selecting a
+next action. It must not infer success from a missing final event or repeat an
+ambiguous consequential effect. Invalid history, unavailable persistence, or
+unverifiable native work holds scheduling rather than manufacturing progress.
+
+Use `auto_step` at the selected skill's factual boundary. An action result is
+about that invocation, not overall completion. Inner review/fix rounds remain
+inside the skill. A checklist reaching `all_done`, a successful tool transport,
+an old approval, or an existing `auto-run.json` is not sufficient completion
+proof. A fresh evidence-based finish proposal still requires unchanged relevant
+facts and native settlement. Ordinary Architect plan/recovery checkpoints and
+non-Auto behavior remain available; recovery gates cannot be bypassed by advice.
+
+## Extra instructions and brief packs
+
+Guidance after the change is literal text. Only a leading `--brief` selector has
+option syntax; `--` starts literal guidance. There is no `--pipeline` option.
 
 ```text
-/auto start my-change --brief rasen-apply-change ts normal -- Run the focused tests first
+/auto start my-change Keep changes small; report the result in Japanese
+/auto start my-change -- --brief is literal guidance here
+/auto start my-change --brief rasen-apply-change ts normal -- Run focused tests first
 ```
 
-The named change supplies `{var}` and the pack's `variable:` placeholder. Packs are read from `<project>/.omp/brief/<pack>/`, then the current OMP agent directory's `brief/<pack>/`; the project pack shadows the whole global pack. Global resolution follows OMP's `getAgentDir()`, with `PI_CODING_AGENT_DIR` and then `HOME/.omp/agent` as fallbacks for hosts without that resolver. `_shared.md`, selected Markdown blocks, aliases, ordered deduplication, CRLF frontmatter, and unknown literal placeholders follow the shared brief format. No blocks means shared prose only. Existing templates and installations are left untouched.
+Brief packs use the existing v0.1 format without requiring another `/brief`
+command. Packs are read from `<project>/.omp/brief/<pack>/`, then the active OMP
+agent directory's `brief/<pack>/`; a project pack shadows the complete global
+pack. The global root uses `getAgentDir()`, then `PI_CODING_AGENT_DIR` and
+`HOME/.omp/agent` fallbacks. `_shared.md`, selected blocks, aliases, ordered
+deduplication, CRLF frontmatter, and unknown literal placeholders retain their
+format. The change supplies `{var}` and the pack's configured variable. No blocks
+means shared prose only. Existing packs and installations are not modified.
 
-`--brief` is special only as the first item after the change. With a brief, `--` separates block selectors from prose. Without a brief, optional `--` lets prose begin literally with `--brief`. Quotes are literal text, not shell syntax; indentation, internal spacing, and trailing newlines in the instruction payload are retained.
+With a brief, separate block selectors from prose using `--`. Unknown blocks are
+rejected. Quotes, indentation, internal spacing, trailing newlines, blank lines,
+and Markdown remain literal. Guidance and the rendered brief are shown in a
+scrollable confirmation and frozen for the run; display wrapping does not alter
+them. Changes require a fresh start after native drain. Guidance must fit the
+Architect request-evidence budget. Packs are capped at 64 KiB/128 entries and
+rendered text at 12,000 characters; unsafe links and invalid text are rejected.
 
-Tab completes Auto subcommands, actual local Rasen change directories, `--brief`, existing pack names and unused blocks/aliases. Explicit Tab selects; Enter submits only what was typed, including when a suggestions popup is stale. Completion does no CLI calls or network access. After prose begins, Auto contributes no further suggestions.
+Tab completes subcommands, local changes, `--brief`, packs, and unused
+blocks/aliases using bounded local reads. There are no suggestions after prose
+begins. Tab selects; Enter submits only the typed text. OMP's
+`pi.sendUserMessage()` bypasses command dispatch, so a `/brief` template beginning
+with `/auto start` does not execute Auto. Use the direct command above; optional
+standalone Brief installation is described in [installation](installation.md).
 
-The rendered brief and extra instructions are shown at confirmation and frozen for that run. Later template edits cannot change a running request; use `/auto stop` and start again to pick them up. The complete guidance is retained in each implementation continuation and in Architect request evidence. Inputs exceeding the current Architect request-evidence budget are rejected before starting, rather than silently truncated. Shorten the guidance or deliberately increase `architect.json`'s `maxEvidenceChars` and restart. The reader additionally bounds source packs to 64 KiB/128 entries and rendered text to 12,000 characters, rejecting unsafe pack/file links, invalid UTF-8 and unknown blocks.
+## Optional configuration and supervision
 
-Guidance cannot override budgets, normal tool approvals, single-driver/foreground constraints, or grant permission to publish, merge, deploy, or expand scope. Existing brief blocks requesting delegation are adapted to direct execution. Permission to run Auto is scoped to applying the named prepared change.
+Configuration is merged by explicitly specified keys in this order:
 
-OMP's `pi.sendUserMessage()` bypasses slash-command dispatch. Therefore, a `/brief` template whose output merely starts with `/auto start` **does not start Auto**. Invoke `/auto start ... --brief ...` directly. The separately optional standalone `/brief` extension uses the same text renderer; see [installation](installation.md) for opt-in setup.
+1. Builtin defaults
+2. `<active OMP agent directory>/auto.json`, normally `~/.omp/agent/auto.json`
+3. `<project>/.omp/auto.json`
 
-The extension invokes only these documented read-only Rasen capabilities, without a shell:
+Both files are optional. Native profiles and agent-directory overrides are
+honored. Reads never create configuration or change Architect/OMP settings.
+Each present file is validated independently; malformed, unreadable, or invalid
+configuration blocks starts even if a later layer would override it. Restart OMP
+after correcting configuration. See [global](../examples/auto.json) and
+[partial project](../examples/auto-project.json) examples.
 
-```bash
-rasen status --change my-change --json
-rasen instructions apply --change my-change --json
-rasen validate my-change --type change --strict --json
-```
+- Default time limits are **4 hours overall** and **10 minutes without native
+  model/tool output**. Configurable maxima are 12 hours and 30 minutes; time
+  supervision always remains finite
+- `maxSteps`, `maxToolCalls`, and `maxStalls` default to `null`, with no arbitrary
+  default action/tool-count cutoff. Optional finite `maxSteps` counts skill-action
+  admissions, not inner review/fix rounds or skill reads. `maxToolCalls` counts
+  main-session tool attempts; `maxStalls` bounds settled action boundaries without progress. Startup/status observations do not spend that budget.
+  Continuations do not reset elapsed time or counters
+- Explicit `null` clears an inherited optional count cap. It is invalid for time
+  limits. `enabled: false` blocks starts; `true` only permits an explicit confirmed
+  start and never schedules work itself
+- Low confidence, malformed output, or provider failure may use one isolated
+  no-tool architect-role fallback for that decision, within `maxFallbacks`
+  (default 2). `fallback: "stop"` disables it. Fallback receives the same sealed
+  evidence and exact catalog. Unresolved uncertainty stops explicitly
+- Each read-only Rasen CLI command defaults to a 10-second timeout; `cliTimeoutMs`
+  supports 100–30,000 ms through the same global/project configuration. Observation
+  boundaries scale with that finite limit; timeout never retries or grants completion
+- Jev defaults to an 8-second decision timeout. Fallback uses Architect's
+  `reviewTimeoutMs` (120 seconds by default). Safe diagnostics distinguish
+  authentication, expiry, malformed replies, and genuine uncertainty without
+  echoing arbitrary provider errors
 
-The main agent reads the generated skill and bounded context files, executes a task through normal OMP tools/approvals, verifies it, and updates its Rasen task checkbox. The next stop hook re-reads the CLI; assistant claims alone do not advance task progress. Skill instructions that call for delegation are explicitly adapted to direct main-session execution. Subagent spawning (including speculative/eval spawns), explicit async tools, and Bash service mode are blocked during Auto; ordinary non-Auto routing is unchanged.
+The confidence threshold is a routing heuristic, not a calibrated probability
+that the action is correct. No Laya model is installed or supported here.
 
-## Deterministic gates and semantic fallback
+## Evidence, delivery, and privacy
 
-- Jev can return only `continue`, `replan`, `needs_user`, or `uncertain`. It cannot approve a plan, grant permission, mark a task done, or declare completion
-- Low confidence, malformed output, timeout, or provider error permits at most one isolated no-tool architect-role triage fallback for that decision, within `maxFallbacks` for the run. `fallback: "stop"` disables it. Continued uncertainty stops explicitly. No provider retry loop exists
-- `replan` requires the existing Architect recovery checkpoint. Plan, recovery and explicit blocked checkpoints use the [native-file handoff](architect.md#native-file-handoff): write `local://architect-review/NAME.md`, then submit `{ phase, evidenceRef, steps? }`; inline `summary` is unsupported. A denied OMP tool approval stops Auto as `needs_user`; no confidence can override it
-- Completion belongs to Auto while a run is active. Explicit completion-tool calls defer without consuming rounds. Auto first observes all tasks done and successfully runs strict Rasen artifact validation, then snapshots the full fresh Rasen context, separately labeled assistant-authored progress claim, and actual validation result into a native session artifact for independent completion review. Its full body must fit Architect's `maxReviewBytes` (default 131072 UTF-8 bytes); oversize or invalid input is rejected before a review attempt, never truncated. The reviewer also receives the complete exact canonical plan and separately bounded host tool evidence. Unresolved plan/recovery checkpoints, review findings, or exhausted review budget cannot become success. **Rasen validation checks artifacts, not whether implementation tests passed**; the architect still needs actual test evidence
-- Task identity/order/description, schema, and local project root are frozen for a run. Scope changes require the user to review and explicitly restart. Deleted/replaced tasks and repeated checkbox toggling do not manufacture progress
-- `maxSteps` bounds main execution turns (1–8, aligned with the pinned host's continuation cap), `maxToolCalls` bounds main-session tool attempts, `maxStalls` bounds turns without new completed tasks, and `maxDurationMs` sets the run deadline. Failed attempts count. Limits never reset on hidden continuations
-- Defaults allow up to 8 semantic primary attempts and 2 semantic fallback attempts; completion/plan/recovery reviews retain the separate `3 × reviews.max` total maximum. Actual counts are usually lower. Each boundary is bounded to 24 seconds; CLI and decision operations have shorter deadlines
-- Terminal outcomes are distinct: `completed`, `needs_user`, `uncertain`, `stalled`, `budget_exhausted`, `cancelled`, and `blocked`. Only `completed` means the CLI and current architect completion gate both passed. Restart/resume/branch does not resume Auto; a new real user request cancels its ownership
+Confirmation discloses bounded change facts, native history, and tool evidence
+sent to TypeSafe Jev, together with the separately bounded catalog of exact
+available skill names, descriptions, and criteria. Observation text is bounded
+by `maxEvidenceChars` (12,000 by default); that is **not the total request cap**
+and does not include the catalog. Evidence and descriptions can contain private
+project information. Confirm only for data you may send, and include no secrets.
+The optional fallback uses the configured architect provider. HTTP redirects are
+refused, requests/responses are bounded, and raw provider errors are withheld.
 
-`auto_status` includes Architect's `lastReview`, with invocation ID, artifact reference/SHA-256, status, charged attempt and verdict. Use it to distinguish a finished provider response from rejected input, stale evidence or caller cancellation; `charged` is review-budget accounting, not a billing receipt. Terminal abort behavior remains in place, and the durable review outcome remains available for diagnosis. Normal non-Auto completion invoked inside Eval follows the separate queued, 24-second boundary contract in the [Architect guide](architect.md#completion-boundaries-and-status).
+Auto's frozen instructions use native hidden, agent-attributed custom messages,
+not fabricated user messages. The originating session's artifact is read back
+before delivery. Missing storage or changed/revoked delivery blocks scheduling.
+Full native evidence and artifact references stay available; bounded routing
+summaries do not replace that evidence or a skill's reports. These controls are
+not an OS sandbox. Shell processes launched outside native job tracking cannot
+be settled by Auto's public native-work observations.
 
-The confidence threshold is an uncalibrated routing heuristic, not a correctness probability. A future local backend such as Laya can implement the `DecisionProvider` interface, but no Laya model is installed, trained, benchmarked, or supported by this PR. Its confidence would require separate evaluation.
+## Native async ownership and stopping
 
-Auto sends only bounded task counts, a progress summary, and recent tool evidence to the fixed TypeSafe endpoint. No generated skill, full source artifact, or separate brief field is automatically included in that request, but summaries/tool evidence can still contain source, instructions, or private data: confirm only for data you may send. The separate no-tool architect completion session receives the full admitted native artifact, exact canonical plan, and bounded host evidence through your configured architect provider; frozen instructions and the rendered brief remain in its request evidence. This full-file handoff does not expand semantic triage: Jev and its fallback retain their bounded progress evidence. HTTP redirects are refused, response/request sizes are bounded, and provider errors do not echo credentials or response bodies.
+OMP retains task/Bash/Eval execution, jobs, messages, IRC, wake/revival, rereview,
+result delivery, and cancellation. Auto observes public APIs; it does not patch
+native execution or wake observers, replace async scopes, or filter late native
+results. Normal async settings remain unchanged.
 
-These are orchestration controls, not an OS sandbox: arbitrary shell code can create processes outside native job tracking, and streamed assistant claims cannot be retracted. Completion is refused with running native background jobs; wait for all background work to finish and collect fresh evidence before review. Auto still requires foreground execution. Use normal OMP approval settings and review the final evidence.
+The lifecycle is `running → draining → paused/completed`:
 
-See [verification and known coverage limits](rasen-auto-verification.md) for recorded evidence and reproduction steps. Return to the [README](../README.md).
+- `/auto stop`, new user input, denial, and other stop conditions revoke new Auto
+  scheduling. Already-admitted native work is drained rather than force-cancelled
+- Drain waits for native submissions, IRC replies, jobs, result delivery, and idle
+  settlement outside awaited Main callbacks. Late results remain normal native
+  evidence; they cannot revive scheduling or silently settle a different action
+- `paused` means verified drain without verified completion. A fresh explicit
+  start is required. An unresolved user decision remains unfinished work
+- `completed` requires an evidence-based finish proposal, fresh unchanged facts,
+  and verified native quiescence. Persistence failure or an ambiguous unfinished
+  action cannot be converted into success
+
+The public boundary includes Main and its descendants and may wait for unrelated
+same-Main jobs; those jobs are neither cancelled nor appropriated as Auto proof.
+Inspect `auto_status.nativeWork` and native job status before restarting. Native
+force cancellation is a separate explicit action. ESC/backtrack/focus retain
+normal OMP behavior; a cancelled status alone does not prove a process settled.
+
+An interrupted dispatch can lack a public handle proving settlement. Auto exposes
+`nativeWork.settlementUnverified` and stays held rather than claiming termination
+or restarting over ambiguous work. Inspect native work and use a new session if
+settlement cannot be established; do not disable async as a workaround.
+
+## Diagnosing a refused start
+
+Preflight identifies the failed boundary, such as confirmation, change snapshot,
+native skill catalog, artifact storage, or delivery. Diagnostics expose bounded
+integration-owned reasons and allowlisted OS codes, withholding arbitrary host
+errors, raw CLI output, and environment values. No provider call is needed during
+start preflight; routing begins at the first action boundary.
+
+Check that the change is readable and the intended skills are actually loaded in
+OMP. Use the executable configured by `rasenExecutable` for read-only Rasen
+status diagnostics. A missing generated `rasen-auto` skill or pipeline is not a
+repair target. `ENOENT` at the CLI boundary means to inspect PATH or configure an
+absolute executable; artifact-storage `ENOSPC` means to check the native session
+store's free space. Cancelled or superseded starts remain cancelled.
+
+See [verification and coverage limits](rasen-auto-verification.md), or return to
+the [README](../README.md).

@@ -1,3 +1,4 @@
+import { AutoPreflightError } from "./auto/diagnostics.ts";
 import { constants } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -48,7 +49,32 @@ export function reviewCarrier(input: Record<string, unknown>, limit: number): bo
   }
 }
 
-async function readComplete(file: string, limit: number, signal?: AbortSignal): Promise<string> {
+/** Auto completion may run synchronously only in an otherwise effect-free Eval carrier. */
+export function completionCarrier(input: Record<string, unknown>, limit: number): boolean {
+  if (!reviewCarrier(input, limit) || typeof input.code !== "string") return false;
+  const match =
+    /^(?:await tool\.write\((\{[\s\S]*\})\)|console\.log\(await tool\.write\((\{[\s\S]*\})\)\));?$/.exec(
+      input.code.trim(),
+    );
+  if (!match) return false;
+  try {
+    const args = JSON.parse(match[1] ?? match[2]);
+    if (args.path !== "xd://architect_checkpoint" || typeof args.content !== "string") return false;
+    const checkpoint = JSON.parse(args.content);
+    return (
+      checkpoint?.phase === "completion" &&
+      Object.keys(checkpoint).every((key) => ["phase", "evidenceRef", "steps"].includes(key))
+    );
+  } catch {
+    return false;
+  }
+}
+
+export async function readComplete(
+  file: string,
+  limit: number,
+  signal?: AbortSignal,
+): Promise<string> {
   signal?.throwIfAborted();
   const handle = await fs.open(
     file,
@@ -104,6 +130,30 @@ async function artifactPath(ctx: ExtensionContext, ref: string): Promise<string>
   )
     throw new Error("Review artifact escapes the originating session");
   return file;
+}
+
+/** Save exact bounded text through native session storage, never through project files. */
+export async function saveAutoPayload(
+  ctx: ExtensionContext,
+  content: string,
+  signal?: AbortSignal,
+): Promise<{ ref: string; sha256: string; bytes: number }> {
+  signal?.throwIfAborted();
+  // Rasen's aggregate 64 KiB evidence plus JSON escaping, guidance, and fixed policy.
+  const limit = 512 * 1024;
+  const bytes = Buffer.byteLength(content, "utf8");
+  if (!content.trim() || content.includes("\0") || bytes > limit)
+    throw new AutoPreflightError(
+      `Auto payload must be non-empty UTF-8 text within ${limit} bytes (received ${bytes} bytes)`,
+    );
+  if (!ctx.sessionManager.getArtifactsDir() || !ctx.sessionManager.getArtifactManager())
+    throw new AutoPreflightError("Native session artifact storage is unavailable for Auto");
+  const id = await ctx.sessionManager.saveArtifact(content, "auto-run");
+  if (id === undefined) throw new AutoPreflightError("OMP could not save the Auto payload");
+  const ref = `artifact://${id}`;
+  if ((await readComplete(await artifactPath(ctx, ref), limit, signal)) !== content)
+    throw new AutoPreflightError("Saved Auto payload does not match the admitted bytes");
+  return Object.freeze({ ref, sha256: digest(content), bytes });
 }
 
 /** Save through OMP, verify the persisted bytes, and retain an immutable in-process copy. */

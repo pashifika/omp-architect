@@ -998,6 +998,82 @@ describe("current invocation provenance", () => {
 });
 
 describe("tool execution provenance", () => {
+  test("diagnostic status is retained once without changing execution failure streaks", async () => {
+    const s = controller();
+    const status = JSON.stringify({ host: { phase: "apply", requiredVerification: [] } });
+    s.observe("actual-error-1", "auto_status", {}, "same execution failure", true);
+    s.diagnose("status", "auto_status", {}, status, false);
+    s.diagnose("status", "auto_status", {}, "duplicate status", false);
+    s.observe("status", "auto_status", {}, "duplicate tool envelope", true);
+    s.diagnose("status-error", "auto_status", {}, "same execution failure", true);
+    expect(s.pendingRecovery).toBe(false);
+    expect(s.observe("actual-error-2", "auto_status", {}, "same execution failure", true)).toBe(
+      true,
+    );
+    s.diagnose("pending-status", "auto_status", {}, status, false);
+    expect(s.pendingRecovery).toBe(true);
+    const records = JSON.parse(s.snapshot("recovery")).recentToolEvidence.map((entry: string) =>
+      JSON.parse(entry),
+    );
+    expect(records).toHaveLength(5);
+    expect(records[1]).toEqual({
+      tool: "auto_status",
+      toolCallId: "status",
+      input: {},
+      output: status,
+      isError: false,
+      kind: "diagnostic",
+    });
+    expect(records[2]).toMatchObject({ kind: "diagnostic", isError: true });
+    let reviewed = "";
+    await s.review("recovery", material("Use observed host status"), async ({ evidence }) => {
+      reviewed = evidence;
+      return approved;
+    });
+    expect(reviewed).toContain("requiredVerification");
+    expect(reviewed).not.toContain("duplicate");
+    expect(s.completionApproved).toBe(false);
+  });
+
+  test("diagnostic reads neither grant nor revoke completion approval", async () => {
+    const s = controller();
+    s.diagnose("before", "auto_status", {}, "Status read succeeded", false);
+    expect(s.completionApproved).toBe(false);
+    await s.review("completion", material("Review actual evidence"), async () => approved);
+    expect(s.completionApproved).toBe(true);
+    const revision = s.revision;
+    s.diagnose("after", "auto_status", {}, "Status read succeeded", false);
+    s.diagnose("after-error", "auto_status", {}, "Status is unavailable", true);
+    expect(s.completionApproved).toBe(true);
+    expect(s.revision).toBe(revision);
+    expect(s.reviewCount).toBe(1);
+  });
+
+  test.each([
+    1000, 24000,
+  ])("diagnostic evidence uses the same bounded ring at %p", (maxEvidenceChars) => {
+    const s = new Orchestrator(parseConfig({ maxEvidenceChars }));
+    s.begin("Diagnose host phase");
+    for (let i = 0; i < 20; i++)
+      s.diagnose(
+        `status-${i}`,
+        "auto_status",
+        {},
+        `STATUS_START ${'\"\\\n'.repeat(10000)} STATUS_END`,
+        false,
+      );
+    const text = s.snapshot("recovery");
+    expect(text.length).toBeLessThanOrEqual(maxEvidenceChars);
+    const snapshot = JSON.parse(text);
+    const record = JSON.parse(snapshot.recentToolEvidence.at(-1));
+    expect(record).toMatchObject({ kind: "diagnostic", isError: false });
+    expect(record.output).toContain("STATUS_START");
+    expect(record.output).toContain("STATUS_END");
+    expect(record.output).toContain("omitted");
+    expect(snapshot.omittedToolEvidence).toBe(20 - snapshot.recentToolEvidence.length);
+    expect(s.pendingRecovery).toBe(false);
+  });
+
   test("records tool call identity and host truncation facts without importing artifact text", () => {
     const s = controller();
     const hostMetadata = {
