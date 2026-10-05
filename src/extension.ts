@@ -1,4 +1,5 @@
 import { nativeAsyncHost } from "./auto/async.ts";
+import { nativeWriteTarget } from "./auto/evidence.ts";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { loadConfig, type Config } from "./config.ts";
 import {
@@ -21,10 +22,18 @@ import instructions from "./prompts/orchestration.md" with { type: "text" };
 
 // Only the documented canonical devices share their native tool identity.
 function effectiveToolName(toolName: string, input: object): string {
-  if (toolName === "write" && "path" in input) {
-    if (input.path === "xd://architect_checkpoint") return "architect_checkpoint";
-    if (input.path === "xd://auto_status") return "auto_status";
-    if (input.path === "xd://auto_step") return "auto_step";
+  if (toolName === "write") {
+    // Whole-file display selectors are native write spellings. Keep control
+    // devices bookkeeping-only even before the host registers its XD handler.
+    const path = nativeWriteTarget(input)
+      ?.trim()
+      .replace(/^xd:\/\//i, "xd://")
+      .replace(/:(?:raw|conflicts)$/, "");
+    if (path === "xd://architect_checkpoint") return "architect_checkpoint";
+    if (path === "xd://auto_status") return "auto_status";
+    // Legacy Auto bookkeeping stays identifiable, but is not a registered tool.
+    if (path === "xd://auto_record") return "auto_record";
+    if (path === "xd://auto_step") return "auto_step";
   }
   return toolName;
 }
@@ -317,8 +326,17 @@ export function extensionFactory(
         );
         return { block: true as const, reason };
       };
-      const autoGate = auto.spawnGate(event.agent, event.invocationKind);
-      if (autoGate) return deny(autoGate);
+      const autoSpawn = auto.routeSpawn(event);
+      if (autoSpawn.handled) {
+        if (autoSpawn.reason) return deny(autoSpawn.reason);
+        if (autoSpawn.model && !ctx.models.resolve(autoSpawn.model))
+          return deny(
+            "The admitted native Auto model route is no longer available; no silent substitution is permitted",
+          );
+        return autoSpawn.model
+          ? { model: autoSpawn.model, note: "OMP Auto: preserved admitted native task route" }
+          : undefined;
+      }
       const role = routeAgent(event.agent, state.config);
       if (!role) return;
       if (!ctx.models.resolve(role))
@@ -334,6 +352,7 @@ export function extensionFactory(
       // Diagnostics must remain available even after Auto or Architect stops.
       if (toolName === "auto_status" && (stopped || !auto.isRunning())) return;
       const deny = (reason: string) => {
+        auto.rejectToolCall(event.toolCallId);
         state?.deny(event.toolCallId, toolName, { ...event.input }, reason);
         return { block: true as const, reason };
       };

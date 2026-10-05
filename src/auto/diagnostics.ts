@@ -66,11 +66,16 @@ function diagnosticDetail(error: unknown): string {
     : `Operation failed (${systemErrorCode(error)}); raw error details withheld`;
 }
 
+// Keep the public diagnostic boundary labels for callers and saved diagnostics.
+// A workflow observation means native skills and current facts, not a required pipeline.
+const workflowHint =
+  "Check the existing Rasen skills loaded by this OMP session and current change/native history; inspect optional skill-owned records if present, without requiring a pipeline or auto-run.json";
+
 export function autoStepDiagnostic(stage: AutoStepStage, error: unknown): string {
   const hints: Record<AutoStepStage, string> = {
     "change snapshot":
       "Check the named local change and run rasen status --change <change> --json locally",
-    workflow: "Run rasen pipeline resume <change> --json locally and inspect the recorded pipeline",
+    workflow: workflowHint,
     "native verification":
       "Check the complete native worker artifacts and their settled task receipts",
     advice:
@@ -87,7 +92,7 @@ export function autoCompletionDiagnostic(stage: AutoCompletionStage, error: unkn
   const hints: Record<AutoCompletionStage, string> = {
     "change snapshot":
       "Check the named local change and run rasen status --change <change> --json locally",
-    workflow: "Run rasen pipeline resume <change> --json locally and inspect the recorded pipeline",
+    workflow: workflowHint,
     validation: "Run rasen validate <change> --type change --strict --json locally",
     review: "Check the native Architect review status before submitting fresh completion evidence",
   };
@@ -103,7 +108,7 @@ export function autoPreflightDiagnostic(stage: AutoPreflightStage, error: unknow
     confirmation: "Retry the confirmation dialog in an interactive OMP session",
     "change snapshot":
       "Check the named local change and run rasen status --change <change> --json locally",
-    workflow: "Run rasen pipeline resume <change> --json locally and inspect the recorded pipeline",
+    workflow: workflowHint,
     "artifact storage":
       "Use a persistent OMP session and check its artifact storage permissions and free space",
     "native delivery": "Check the native OMP session before retrying delivery",

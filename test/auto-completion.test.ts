@@ -4,20 +4,17 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   AgentRegistry,
+  SessionManager,
   type AgentSession,
   type ExtensionAPI,
   type ExtensionCommandContext,
   type ExtensionContext,
 } from "@oh-my-pi/pi-coding-agent";
 import { createAutoController } from "../src/auto/extension.ts";
-import {
-  AutoPreflightError,
-  type AutoCompletionStage,
-  type AutoStepStage,
-} from "../src/auto/diagnostics.ts";
+import { AutoPreflightError, type AutoStepStage } from "../src/auto/diagnostics.ts";
 import type { NativeAsyncHost } from "../src/auto/async.ts";
 import type { RasenSnapshot } from "../src/auto/rasen.ts";
-import type { RasenWorkflow } from "../src/auto/workflow.ts";
+import type { RasenSkill } from "../src/auto/skills.ts";
 import { Orchestrator, digest, type ReviewMaterial } from "../src/core.ts";
 import { parseConfig } from "../src/config.ts";
 
@@ -32,10 +29,9 @@ const approved = { decision: "approve" as const, summary: "Verified", issues: []
 
 // Exercise the controller directly with local artifact storage and inert native
 // adapters. No CLI, provider, model, or host loader is needed for failure injection.
-async function fixture(verify = true) {
+async function fixture() {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "auto-completion-unit-"));
-  const artifacts = path.join(cwd, "artifacts");
-  await fs.mkdir(artifacts);
+  const sessionManager = SessionManager.create(cwd, path.join(cwd, "sessions"));
   const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
   const tools = new Map<string, Parameters<ExtensionAPI["registerTool"]>[0]>();
   const handlers = new Map<string, Array<(event: never, ctx: ExtensionContext) => unknown>>();
@@ -50,6 +46,7 @@ async function fixture(verify = true) {
     on: (name: string, handler: (event: never, ctx: ExtensionContext) => unknown) =>
       handlers.set(name, [...(handlers.get(name) ?? []), handler]),
     events: { on() {} },
+    appendEntry: (type: string, data: unknown) => sessionManager.appendCustomEntry(type, data),
     sendMessage(message: { customType: string; content: string }) {
       if (message.customType !== "omp-auto") return;
       const status = JSON.parse(message.content);
@@ -58,7 +55,16 @@ async function fixture(verify = true) {
     },
     pi: { getAgentDir: () => path.join(cwd, "agent") },
     typebox: {
-      Type: { Object() {}, String() {}, Optional() {}, Literal() {}, Union() {} },
+      Type: {
+        Object() {},
+        String() {},
+        Optional() {},
+        Literal() {},
+        Union() {},
+        Boolean() {},
+        Array() {},
+        Integer() {},
+      },
     },
   } as unknown as ExtensionAPI;
   const ctx = {
@@ -70,22 +76,13 @@ async function fixture(verify = true) {
       aborts++;
     },
     ui: { custom: async () => true, notify: (message: string) => notifications.push(message) },
-    sessionManager: {
-      getSessionId: () => "fixture-session",
-      getArtifactsDir: () => artifacts,
-      getArtifactManager: () => ({}),
-      getArtifactPath: async () => path.join(artifacts, "1.txt"),
-      saveArtifact: async (content: string) => {
-        await fs.writeFile(path.join(artifacts, "1.txt"), content);
-        return "1";
-      },
-    },
+    sessionManager,
   } as unknown as ExtensionCommandContext;
   const registry = new AgentRegistry();
   const manager = { getAllJobs: () => [], waitForOwnerJobs: async () => {} };
   const session = (id: string) =>
     ({
-      sessionId: id === "main" ? "fixture-session" : `fixture-session-${id}`,
+      sessionId: id === "main" ? sessionManager.getSessionId() : `fixture-session-${id}`,
       getAgentId: () => id,
       asyncJobManager: manager,
       isStreaming: false,
@@ -114,17 +111,19 @@ async function fixture(verify = true) {
     contextFiles: [],
     fingerprint: "snapshot-1",
   };
-  const workflow: RasenWorkflow = {
-    kind: "absent",
-    change: snapshot.change,
-    reason: "No recorded pipeline",
-    fingerprint: "workflow-1",
+  const skill: RasenSkill = {
+    name: "rasen-verify-change",
+    description: "Independently inspect implementation and specification evidence",
+    baseDir: cwd,
+    filePath: path.join(cwd, "verify.md"),
+    source: "fixture",
+    reference: "skill://rasen-verify-change",
   };
   const architect = new Orchestrator(parseConfig({}));
   architect.begin("Verify the prepared fixture");
-  let failure: { stage: AutoCompletionStage | AutoStepStage; error: unknown } | undefined;
+  let failure: { stage: AutoStepStage | "validation"; error: unknown } | undefined;
   let reviews = 0;
-  const fail = (stage: AutoCompletionStage | AutoStepStage) => {
+  const fail = (stage: AutoStepStage | "validation") => {
     if (failure?.stage === stage) throw failure.error;
   };
   const controller = createAutoController(
@@ -135,7 +134,6 @@ async function fixture(verify = true) {
       instructions: () => "Fixture instructions",
       state: () => architect,
       review: async (_phase, _summary, _ctx, signal, invocationId) => {
-        fail("review");
         reviews++;
         return architect.review("completion", material, async () => approved, signal, invocationId);
       },
@@ -145,14 +143,20 @@ async function fixture(verify = true) {
         fail("change snapshot");
         return snapshot;
       },
-      workflow: async () => {
-        fail("workflow");
-        return workflow;
-      },
-      validate: async () => fail("validation"),
+      skills: () => [skill],
+      skill: async (selected) => ({
+        ...selected,
+        text: "Complete verification skill",
+        sha256: digest("Complete verification skill"),
+      }),
       decision: () => {
         fail("advice");
-        return async () => ({ choice: "continue", confidence: 0.99 });
+        return async (evidence) => ({
+          choice: Object.keys(evidence.choices!).find((key) =>
+            evidence.choices![key].includes(`existing native skill ${skill.name}:`),
+          )!,
+          confidence: 0.99,
+        });
       },
       fallback: () => async () => {
         throw new Error("Unexpected fixture fallback");
@@ -169,48 +173,10 @@ async function fixture(verify = true) {
     await commands.get("auto")!.handler("start fixture-change", ctx);
     expect(notifications).toEqual([]);
     expect(controller.isRunning()).toBe(true);
-    const step = async () => {
-      const result = await tools
-        .get("auto_step")!
-        .execute("step", { summary: "Recorded fixture stage" }, undefined, undefined, ctx);
-      expect(result.isError).toBe(false);
-      return JSON.parse((result.content[0] as { text: string }).text);
-    };
-    if (verify) {
-      expect((await step()).allowedNextPhase).toBe("verify");
-      expect(controller.toolCall("verify-task", "task", {}, ctx)).toBeUndefined();
-      registry.register({
-        id: "verify-child",
-        parentId: "main",
-        displayName: "Fixture reviewer",
-        kind: "sub",
-        session: session("verify-child"),
-        status: "idle",
-        history: { agent: "omp-reviewer" },
-      });
-      for (const handler of handlers.get("tool_result") ?? [])
-        await handler(
-          {
-            toolName: "task",
-            toolCallId: "verify-task",
-            details: {
-              results: [
-                {
-                  id: "verify-child",
-                  agent: "omp-reviewer",
-                  exitCode: 0,
-                  output: "Independent fixture inspection passed with no blocking findings",
-                },
-              ],
-            },
-          } as never,
-          ctx,
-        );
-      expect((await step()).allowedNextPhase).toBe("review");
-    }
     return {
       architect,
       controller,
+      sessionManager,
       ctx,
       statuses,
       paused: () => paused.promise,
@@ -219,7 +185,7 @@ async function fixture(verify = true) {
         tools
           .get("auto_step")!
           .execute("step", { summary: "Observe fixture stage" }, signal, undefined, ctx),
-      inject(stage: AutoCompletionStage | AutoStepStage, error: unknown) {
+      inject(stage: AutoStepStage | "validation", error: unknown) {
         failure = { stage, error };
       },
       checkpoint: (signal?: AbortSignal) =>
@@ -233,100 +199,51 @@ async function fixture(verify = true) {
   }
 }
 
-for (const stage of ["change snapshot", "workflow", "validation", "review"] as const) {
-  test(`completion ${stage} preserves trusted timeout diagnostics without review charges`, async () => {
-    const f = await fixture();
-    try {
-      const message = "rasen status --change fixture-change --json timed out after 5000 ms";
-      f.inject(stage, new AutoPreflightError(message));
-      const verdict = await f.checkpoint();
-      expect(verdict.decision).toBe("blocked");
-      expect(verdict.summary).toContain(`[${stage}]`);
-      expect(verdict.summary).toContain(message);
-      expect(verdict.summary).toContain("No completion approval is available");
-      expect(f.architect.completionApproved).toBe(false);
-      expect(f.architect.phaseReviews.completion).toBe(0);
-      expect(f.architect.lastReview).toMatchObject({ status: "input_rejected", charged: false });
-      expect(f.reviews()).toBe(0);
-    } finally {
-      await f.close();
-    }
-  });
-
-  test(`completion ${stage} withholds arbitrary exception contents`, async () => {
-    const f = await fixture();
-    try {
-      f.inject(stage, Object.assign(new Error("PRIVATE PROVIDER TOKEN"), { code: "EACCES" }));
-      const verdict = await f.checkpoint();
-      expect(verdict.decision).toBe("blocked");
-      expect(verdict.summary).toContain(`[${stage}]`);
-      expect(verdict.summary).toContain("EACCES");
-      expect(verdict.summary).toContain("raw error details withheld");
-      expect(JSON.stringify(verdict)).not.toContain("PRIVATE PROVIDER TOKEN");
-      expect(JSON.stringify(f.architect.lastReview)).not.toContain("PRIVATE PROVIDER TOKEN");
-      expect(f.architect.completionApproved).toBe(false);
-      expect(f.architect.phaseReviews.completion).toBe(0);
-      expect(f.reviews()).toBe(0);
-      expect(f.aborts()).toBe(0);
-    } finally {
-      await f.close();
-    }
-  });
-}
-
-test("successful completion still admits exactly one semantic review", async () => {
+test("Auto completion checkpoint redirects to the selected skill without an outer semantic review", async () => {
   const f = await fixture();
   try {
-    expect((await f.checkpoint()).decision).toBe("approve");
-    expect(f.architect.completionApproved).toBe(true);
-    expect(f.architect.phaseReviews.completion).toBe(1);
-    expect(f.architect.lastReview).toMatchObject({ charged: true, attempt: 1 });
-    expect(f.reviews()).toBe(1);
-  } finally {
-    await f.close();
-  }
-});
-
-test("failed completion revokes earlier approval without resetting or charging its budget", async () => {
-  const f = await fixture();
-  try {
-    await f.architect.review("completion", material, async () => approved);
-    expect(f.architect.completionApproved).toBe(true);
-    expect(f.architect.phaseReviews.completion).toBe(1);
-    f.inject("validation", new AutoPreflightError("Rasen validation did not pass"));
-    expect((await f.checkpoint()).decision).toBe("blocked");
-    expect(f.architect.completionApproved).toBe(false);
-    expect(f.architect.phaseReviews.completion).toBe(1);
-    expect(f.architect.lastReview).toMatchObject({ charged: false, attempt: 1 });
-    expect(f.reviews()).toBe(0);
-  } finally {
-    await f.close();
-  }
-});
-
-test("completion cancellation withholds arbitrary abort reasons and never charges review", async () => {
-  const f = await fixture();
-  try {
-    const abort = new AbortController();
-    abort.abort(new Error("PRIVATE CANCELLATION CONTENT"));
-    f.inject("workflow", abort.signal.reason);
-    const verdict = await f.checkpoint(abort.signal);
+    const verdict = await f.checkpoint();
     expect(verdict.decision).toBe("blocked");
-    expect(verdict.summary).toContain("[workflow]");
-    expect(verdict.summary).toContain("cancelled or superseded");
-    expect(verdict.summary).not.toContain("PRIVATE CANCELLATION CONTENT");
+    expect(verdict.summary).toContain("auto_step");
+    expect(verdict.summary).toContain("no outer Architect completion loop");
     expect(f.architect.completionApproved).toBe(false);
     expect(f.architect.phaseReviews.completion).toBe(0);
-    expect(f.architect.lastReview).toMatchObject({ status: "caller_cancelled", charged: false });
+    expect(f.reviews()).toBe(0);
+    expect(f.controller.isRunning()).toBe(true);
+  } finally {
+    await f.close();
+  }
+});
+
+test("first Auto boundary asks Jev before admitting an action in native history", async () => {
+  const f = await fixture();
+  try {
+    const result = await f.step();
+    expect(result.isError).toBe(false);
+    const body = JSON.parse((result.content[0] as { text: string }).text);
+    expect(body).toMatchObject({
+      decision: { choice: "skill_0", criterion: expect.stringContaining("rasen-verify-change") },
+      action: {
+        skill: { name: "rasen-verify-change" },
+        admission: { allowedRoles: ["omp-worker", "omp-reviewer", "omp-explorer"] },
+      },
+    });
+    expect(body.instruction).toContain(`Auto action: ${body.action.actionId}`);
+    expect(
+      f.sessionManager
+        .getBranch()
+        .filter((entry) => entry.type === "custom")
+        .map((entry) => (entry as { data?: { kind: string } }).data?.kind),
+    ).toEqual(["run-start", "action-selected", "action-admitted"]);
     expect(f.reviews()).toBe(0);
   } finally {
     await f.close();
   }
 });
 
-for (const stage of ["change snapshot", "workflow", "advice"] as const) {
+for (const stage of ["change snapshot", "advice"] as const) {
   test(`auto_step ${stage} preserves trusted failures and stops without review`, async () => {
-    const f = await fixture(false);
+    const f = await fixture();
     try {
       const message = "Rasen process timed out after 5000 ms";
       f.inject(stage, new AutoPreflightError(message));
@@ -347,7 +264,7 @@ for (const stage of ["change snapshot", "workflow", "advice"] as const) {
   });
 
   test(`auto_step ${stage} withholds arbitrary provider and host exceptions`, async () => {
-    const f = await fixture(false);
+    const f = await fixture();
     try {
       f.inject(stage, new Error("PRIVATE AUTO_STEP PROVIDER TOKEN"));
       const result = await f.step();
@@ -369,7 +286,7 @@ for (const stage of ["change snapshot", "workflow", "advice"] as const) {
 }
 
 test("paused Auto preserves native result and IRC context without physically aborting execution", async () => {
-  const f = await fixture(false);
+  const f = await fixture();
   try {
     f.inject("advice", new AutoPreflightError("Stage advice unavailable"));
     await f.step();

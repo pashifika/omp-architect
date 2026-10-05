@@ -65,6 +65,63 @@ test("real SDK semantic fallback uses the native architect role with zero tools"
   }
 });
 
+test("real SDK fallback chooses only supplied native skills and preserves the sealed catalog", async () => {
+  const fixture = await fallbackFixture(10);
+  const choices: Record<string, string> = {
+    skill_0: 'Skill "rasen-continue": Continue generating the next change artifact.',
+    skill_1: 'Skill "rasen-apply": Implement the change tasks.',
+    skill_2: 'Skill "rasen-verify": Verify against the change artifacts.',
+    finish: "Propose finishing only with supporting evidence; the controller validates it.",
+    needs_user: "Essential user input or permission is missing.",
+    uncertain: "The evidence does not support a next choice.",
+  };
+  try {
+    const fallback = createDecisionFallback(
+      fixture.pi,
+      fixture.ctx,
+      parseConfig({}),
+      parseAutoConfig({}),
+    );
+    fixture.setResponse('{"choice":"skill_1","confidence":0.95}');
+    const pending = fallback({ ...evidence, choices }, new AbortController().signal);
+    await fixture.requestStarted;
+    delete choices.skill_1;
+    choices.skill_99 = "Added after request";
+    expect(await pending).toEqual({ choice: "skill_1", confidence: 0.95 });
+    expect(fixture.observed.input).toContain("Implement the change tasks");
+    expect(fixture.observed.input).toContain("Verify against the change artifacts");
+    expect(fixture.observed.systemPrompt).toContain(
+      "do not assume a fixed phase order or require a pipeline",
+    );
+    expect(fixture.observed.systemPrompt).toContain(
+      "When finish is supplied, choose it when its supplied criterion is met",
+    );
+    expect(fixture.observed.toolCount).toBe(0);
+    expect(fixture.observed.requests).toBe(1);
+    for (const choice of ["replan", "skill_1", "approved"]) {
+      fixture.setResponse(JSON.stringify({ choice, confidence: 1 }));
+      await expect(
+        fallback({ ...evidence, choices }, new AbortController().signal),
+      ).rejects.toMatchObject({ code: "FALLBACK_INVALID_RESPONSE" });
+    }
+    expect(fixture.observed.requests).toBe(4);
+    await expect(
+      fallback(
+        { ...evidence, choices: { skill_0: "x".repeat(65537) } },
+        new AbortController().signal,
+      ),
+    ).rejects.toMatchObject({ code: "JEV_CATALOG_TOO_LARGE" });
+    expect(fixture.observed.requests).toBe(4);
+    fixture.setResponse('{"choice":"finish","confidence":0.95}');
+    expect(await fallback({ ...evidence, choices }, new AbortController().signal)).toEqual({
+      choice: "finish",
+      confidence: 0.95,
+    });
+  } finally {
+    await fixture.close();
+  }
+});
+
 test("real SDK fallback can finish after the Jev timeout within the Architect deadline", async () => {
   const fixture = await fallbackFixture(250);
   const controller = new AbortController();
@@ -139,6 +196,8 @@ async function fallbackFixture(responseDelayMs = 0) {
     aborted: 0,
     activeStreams: 0,
     toolCount: -1,
+    input: "",
+    systemPrompt: "",
     reasoning: undefined as unknown,
     providerSignal: undefined as AbortSignal | undefined,
   };
@@ -153,6 +212,8 @@ async function fallbackFixture(responseDelayMs = 0) {
         observed.requests++;
         observed.activeStreams++;
         observed.toolCount = context.tools?.length ?? 0;
+        observed.input = JSON.stringify(context.messages);
+        observed.systemPrompt = (context.systemPrompt ?? []).join("\n");
         observed.reasoning = options?.reasoning;
         observed.providerSignal = options?.signal;
         const stream = createAssistantMessageEventStream();

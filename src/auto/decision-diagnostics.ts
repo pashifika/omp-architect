@@ -17,6 +17,7 @@ export class DecisionFailure extends Error {
 const safeCodes = new Set([
   "JEV_INVALID_CONFIG",
   "JEV_INVALID_EVIDENCE",
+  "JEV_CATALOG_TOO_LARGE",
   "JEV_MISSING_API_KEY",
   "JEV_INVALID_API_KEY",
   "JEV_ABORTED",
@@ -43,7 +44,7 @@ export function decisionFailureCode(error: unknown): string {
 export interface DecisionAttempt {
   provider: "jev" | "architect";
   outcome: "accepted" | "uncertain" | "low_confidence" | "invalid_response" | "error";
-  choice?: "continue" | "replan" | "needs_user" | "uncertain";
+  choice?: string;
   confidence?: number;
   errorCode?: string;
   elapsedMs: number;

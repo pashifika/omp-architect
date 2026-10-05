@@ -1,5 +1,10 @@
 import type { AutoConfig } from "./config.ts";
-import type { Decision, DecisionProvider, DecisionEvidence } from "./decision.ts";
+import {
+  sealDecisionEvidence,
+  type Decision,
+  type DecisionProvider,
+  type DecisionEvidence,
+} from "./decision.ts";
 import {
   DecisionFailure,
   decisionFailureCode,
@@ -24,7 +29,7 @@ export class AutoRun {
   status: AutoStatus = "running";
   reason = "";
   outcome: Exclude<AutoStatus, "running" | "draining" | "paused"> | undefined;
-  steps = 1;
+  steps = 0;
   toolCalls = 0;
   decisions = 0;
   fallbacks = 0;
@@ -38,8 +43,8 @@ export class AutoRun {
   readonly id = crypto.randomUUID();
   snapshot: RasenSnapshot;
   #completed: Set<string>;
-  #taskIds: Set<string>;
-  #scope: string;
+  #progressToken = "";
+  #actionAdvanced = false;
   #identity: string;
   #seenTools = new Set<string>();
   #deciding = false;
@@ -54,11 +59,7 @@ export class AutoRun {
     this.observedAt = this.startedAt;
     this.lastActivityAt = this.startedAt;
     this.snapshot = snapshot;
-    this.#taskIds = new Set(snapshot.tasks.map((task) => task.id));
     this.#identity = `${snapshot.change}\0${snapshot.root}\0${snapshot.schema}`;
-    this.#scope = JSON.stringify(
-      snapshot.tasks.map(({ id, description }) => ({ id, description })),
-    );
     this.#completed = new Set(snapshot.tasks.filter((task) => task.done).map((task) => task.id));
   }
 
@@ -110,24 +111,26 @@ export class AutoRun {
   }
 
   private sameScope(snapshot: RasenSnapshot): boolean {
-    // The run's scope is fixed. Removing/replacing tasks cannot manufacture progress.
-    const ids = new Set(snapshot.tasks.map((task) => task.id));
-    if (
-      `${snapshot.change}\0${snapshot.root}\0${snapshot.schema}` !== this.#identity ||
-      ids.size !== this.#taskIds.size ||
-      [...ids].some((id) => !this.#taskIds.has(id)) ||
-      JSON.stringify(snapshot.tasks.map(({ id, description }) => ({ id, description }))) !==
-        this.#scope
-    ) {
-      return false;
+    // Planning skills own their task list. Only the selected change/root/schema
+    // identity is fixed; changing a legitimate plan is not a new Auto run.
+    return `${snapshot.change}\0${snapshot.root}\0${snapshot.schema}` === this.#identity;
+  }
+
+  /** Observe a native action boundary, independently of apply checkboxes. */
+  actionProgress(token: string): void {
+    if (this.status !== "running") return;
+    if (token !== this.#progressToken) {
+      this.#progressToken = token;
+      this.#actionAdvanced = true;
+      this.stalls = 0;
     }
-    return true;
   }
 
   /** Fresh read-only facts may change after execution stops. Never resume or approve here. */
   reconcile(snapshot: RasenSnapshot): boolean {
     if (!this.sameScope(snapshot)) {
-      this.observationError = "Rasen task scope changed; current progress cannot be reconciled";
+      this.observationError =
+        "Rasen change identity changed; current progress cannot be reconciled";
       return false;
     }
     this.snapshot = snapshot;
@@ -136,28 +139,28 @@ export class AutoRun {
     return true;
   }
 
-  observe(snapshot: RasenSnapshot): void {
+  observe(snapshot: RasenSnapshot, countStall = true): void {
     if (!this.checkTime()) return;
     if (!this.sameScope(snapshot)) {
-      this.stop("needs_user", "Rasen task scope changed; review it and explicitly start a new run");
+      this.stop("needs_user", "Rasen change identity changed; explicitly start a new run");
       return;
     }
     const completed = new Set(snapshot.tasks.filter((task) => task.done).map((task) => task.id));
     const progress = [...completed].some((id) => !this.#completed.has(id));
-    this.stalls = progress || snapshot.state === "all_done" ? 0 : this.stalls + 1;
+    this.stalls = progress || this.#actionAdvanced ? 0 : this.stalls + (countStall ? 1 : 0);
+    this.#actionAdvanced = false;
     for (const id of completed) this.#completed.add(id);
     this.reconcile(snapshot);
-    if (snapshot.state === "blocked") this.stop("blocked", "Rasen prerequisites are blocked");
   }
 
   continue(): boolean {
     if (!this.checkTime()) return false;
     if (this.config.maxSteps !== null && this.steps >= this.config.maxSteps) {
-      this.stop("budget_exhausted", "Turn budget reached");
+      this.stop("budget_exhausted", "Action-admission budget reached");
       return false;
     }
     if (this.config.maxStalls !== null && this.stalls >= this.config.maxStalls) {
-      this.stop("stalled", "No completed-task progress within the stall budget");
+      this.stop("stalled", "No native action or completed-task progress within the stall budget");
       return false;
     }
     this.steps++;
@@ -178,9 +181,12 @@ export class AutoRun {
     }
     this.#deciding = true;
     let decision: Decision | undefined;
+    let state: DecisionEvidence;
+    let choices: Record<string, string>;
     const acceptable = (value: Decision | undefined): value is Decision =>
       !!value &&
-      ["continue", "replan", "needs_user", "uncertain"].includes(value.choice) &&
+      typeof value.choice === "string" &&
+      Object.hasOwn(choices, value.choice) &&
       Number.isFinite(value.confidence) &&
       value.confidence >= this.config.minConfidence &&
       value.confidence <= 1 &&
@@ -189,10 +195,11 @@ export class AutoRun {
       const started = this.now();
       const timeoutMs = name === "architect" ? fallbackTimeoutMs : this.config.decisionTimeoutMs;
       try {
-        const value = await this.bounded(provider, evidence, signal, timeoutMs);
+        const value = await this.bounded(provider, state, signal, timeoutMs);
         const valid =
           !!value &&
-          ["continue", "replan", "needs_user", "uncertain"].includes(value.choice) &&
+          typeof value.choice === "string" &&
+          Object.hasOwn(choices, value.choice) &&
           Number.isFinite(value.confidence) &&
           value.confidence >= 0 &&
           value.confidence <= 1;
@@ -225,6 +232,27 @@ export class AutoRun {
     try {
       this.decisions++;
       this.#decisionAttempts = [];
+      try {
+        if (signal.aborted) throw new DecisionFailure("DECISION_CANCELLED");
+        state = sealDecisionEvidence(evidence, this.config.maxEvidenceChars);
+        choices = state.choices!;
+      } catch (error) {
+        const errorCode = decisionFailureCode(error);
+        this.#decisionAttempts.push({
+          provider: "jev",
+          timeoutMs: this.config.decisionTimeoutMs,
+          outcome: "error",
+          errorCode,
+          elapsedMs: 0,
+        });
+        this.stop(
+          signal.aborted ? "cancelled" : "uncertain",
+          signal.aborted
+            ? "Decision cancelled or timed out"
+            : `Decision evidence or catalog rejected (${errorCode}); inspect decisionDiagnostics before explicitly restarting`,
+        );
+        return;
+      }
       decision = await attempt(primary, "jev");
       if (signal.aborted) {
         this.stop("cancelled", "Decision cancelled or timed out");

@@ -4,6 +4,7 @@ import {
   type AutoPreflightStage,
   autoCompletionDiagnostic,
   autoPreflightDiagnostic,
+  autoStepDiagnostic,
   diagnosticPath,
   WorkspaceEvidenceError,
 } from "../src/auto/diagnostics.ts";
@@ -67,3 +68,29 @@ test("supported admission diagnostics do not require a generated Auto workflow s
     expect(message).not.toContain("undefined");
   }
 });
+
+for (const [boundary, diagnostic] of [
+  ["preflight", autoPreflightDiagnostic],
+  ["step", autoStepDiagnostic],
+  ["completion", autoCompletionDiagnostic],
+] as const) {
+  test(`${boundary} workflow diagnostics observe native skills without a pipeline prerequisite`, () => {
+    const message = diagnostic(
+      "workflow",
+      new AutoPreflightError("No existing non-Auto Rasen skills are loaded by this OMP session"),
+    );
+    expect(message).toContain("[workflow]");
+    expect(message).toContain("No existing non-Auto Rasen skills are loaded");
+    expect(message).toContain("existing Rasen skills loaded by this OMP session");
+    expect(message).toContain("current change/native history");
+    expect(message).toContain("optional skill-owned records if present");
+    expect(message).toContain("without requiring a pipeline or auto-run.json");
+    expect(message).not.toContain("pipeline resume");
+    expect(message).not.toContain("recorded pipeline");
+    expect(message).not.toContain("rasen-auto/SKILL.md");
+    const secret = "PRIVATE NATIVE CATALOG EXCEPTION";
+    expect(diagnostic("workflow", new Error(secret))).not.toContain(secret);
+    expect(diagnostic("workflow", { code: "EACCES", message: secret })).toContain("EACCES");
+    expect(diagnostic("workflow", new Error(secret))).toContain("raw error details withheld");
+  });
+}

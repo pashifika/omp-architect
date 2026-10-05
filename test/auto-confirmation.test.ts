@@ -108,6 +108,23 @@ if (process.env[childFlag] !== "1") {
       `\n\nAdditional guidance (frozen for this run):\n${guidance}`,
     );
     expect(autoConfirmationMessage("sample", "")).not.toContain("Additional guidance");
+    const disclosure = autoConfirmationMessage("sample", "");
+    expect(disclosure).toContain("requested outcome for change sample");
+    expect(disclosure).toContain("bounded change facts, native work history, and tool evidence");
+    expect(disclosure).toContain("TypeSafe Jev");
+    expect(disclosure).toContain("separately bounded catalog");
+    expect(disclosure).toContain(
+      "exact available skill names, descriptions, and selection criteria",
+    );
+    expect(disclosure).toContain("Jev selects the actual next skill or control outcome");
+    expect(disclosure).toContain(
+      "optional architect-role fallback receives the same evidence and catalog",
+    );
+    expect(disclosure).toContain("No configured pipeline or auto-run.json is required");
+    expect(disclosure).toContain(
+      "does not grant publishing, merging, deployment, deletion, archive, or expanded permissions",
+    );
+    expect(disclosure).not.toContain("small-feature");
     expect(guidance).toContain("\n\n\n```");
   });
 

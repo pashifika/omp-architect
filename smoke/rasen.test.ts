@@ -98,13 +98,21 @@ afterAll(async () => {
   if (temp) await fs.rm(temp, { recursive: true, force: true });
 });
 
-test("pinned Rasen dev/0.1.8 init, generated OMP skill, blocked/ready/all_done and strict validation", async () => {
+test("pinned Rasen dev/0.1.8 change facts, blocked/ready/all_done and strict validation without a pipeline", async () => {
   const options = { executable };
   const blocked = await readRasenSnapshot(cwd, change, options);
   expect(blocked.state).toBe("blocked");
   expect(blocked.tasks).toEqual([]);
-  expect(blocked.skill).toContain("name: rasen-apply-change");
-  expect(blocked.skill).toContain('generatedBy: "0.1.8"');
+  expect(blocked.skill).toBe("");
+  expect(blocked.skillRecord?.kind).toBe("absent");
+  expect(blocked.isComplete).toBe(false);
+  expect(blocked.artifacts?.some((artifact) => artifact.status === "ready")).toBe(true);
+  expect(blocked.applyNextWorkflows).toBeArray();
+  // Init still produces a native OMP skill, but observing a change does not
+  // depend on discovering or loading that skill body.
+  const generated = await fs.readFile(skillPath, "utf8");
+  expect(generated).toContain("name: rasen-apply-change");
+  expect(generated).toContain('generatedBy: "0.1.8"');
 
   await fs.writeFile(
     path.join(changeDir, "proposal.md"),
@@ -137,6 +145,10 @@ Smoke fixture only.
 
   const ready = await readRasenSnapshot(cwd, change, options);
   expect(ready.state).toBe("ready");
+  expect(ready.artifacts).toEqual(rawStatus.artifacts as typeof ready.artifacts);
+  expect(ready.nextWorkflows).toBeArray();
+  expect(ready.ephemeraDir).toBe(rawStatus.ephemeraDir as string);
+  expect(ready.skillRecord?.kind).toBe("absent");
   expect(ready.progress).toEqual({ total: 2, complete: 0, remaining: 2 });
   expect(ready.tasks.map((task) => task.id)).toEqual(["1", "2"]);
   expect(ready.contextFiles).toHaveLength(4);
@@ -157,6 +169,9 @@ Smoke fixture only.
   const done = await readRasenSnapshot(cwd, change, options);
   expect(done.state).toBe("all_done");
   expect(done.progress.remaining).toBe(0);
+  expect(done.isComplete).toBe(true);
+  expect(done.applyNextWorkflows).toBeArray();
+  expect(done.skillRecord?.kind).toBe("absent");
   expect(done.fingerprint).not.toBe(ready.fingerprint);
   await fs.writeFile(path.join(changeDir, "tasks.md"), pendingTasks);
 }, 30_000);
@@ -224,36 +239,86 @@ test("Rasen process output, timeout, cancellation and error messages stay bounde
   ).rejects.toThrow();
 });
 
-test("Rasen adapter refuses missing or oversized generated skills and external symlink artifacts", async () => {
+test("Rasen observation is independent of missing, oversized or globally linked generated skills", async () => {
   const original = await fs.readFile(skillPath, "utf8");
+  const before = await readRasenSnapshot(cwd, change, { executable });
   try {
     await fs.rm(skillPath);
-    await expect(readRasenSnapshot(cwd, change, { executable })).rejects.toThrow(
-      ".omp/skills/rasen-apply-change/SKILL.md (ENOENT)",
+    expect((await readRasenSnapshot(cwd, change, { executable })).fingerprint).toBe(
+      before.fingerprint,
     );
-    await fs.writeFile(skillPath, "x".repeat(64 * 1024 + 1));
-    await expect(readRasenSnapshot(cwd, change, { executable })).rejects.toThrow(
-      "limit is 65536 bytes",
+    await fs.writeFile(skillPath, "x".repeat(256 * 1024 + 1));
+    expect((await readRasenSnapshot(cwd, change, { executable })).fingerprint).toBe(
+      before.fingerprint,
     );
     const outside = path.join(temp, "outside-skill.md");
     await fs.writeFile(outside, original);
     await fs.rm(skillPath);
     await fs.symlink(outside, skillPath);
-    await expect(readRasenSnapshot(cwd, change, { executable })).rejects.toThrow(
-      "resolves outside this project",
+    expect((await readRasenSnapshot(cwd, change, { executable })).fingerprint).toBe(
+      before.fingerprint,
     );
-    await fs.rm(skillPath);
   } finally {
+    await fs.rm(skillPath, { force: true });
     await fs.writeFile(skillPath, original);
   }
+});
+
+test("Rasen still refuses external symlink change artifacts before observation or validation", async () => {
+  const outside = path.join(temp, "outside-artifact.md");
+  await fs.writeFile(outside, "External content must not be read");
   const link = path.join(changeDir, "outside.md");
-  await fs.symlink(path.join(temp, "outside-skill.md"), link);
+  await fs.symlink(outside, link);
   try {
     await expect(readRasenSnapshot(cwd, change, { executable })).rejects.toThrow("symlinks");
     await expect(validateRasenChange(cwd, change, { executable })).rejects.toThrow("symlinks");
   } finally {
     await fs.rm(link);
   }
+});
+
+test("real Rasen status locates shared review-cycle output without a pipeline and never initializes or rewrites it", async () => {
+  const before = await readRasenSnapshot(cwd, change, { executable });
+  expect(before.skillRecord?.kind).toBe("absent");
+  expect(before.ephemeraDir).toBe(rawStatus.ephemeraDir as string);
+  const ephemeraDir = before.ephemeraDir!;
+  expect(path.isAbsolute(ephemeraDir)).toBe(true);
+  const file = path.join(ephemeraDir, "auto-run.json");
+  const legacy = path.join(changeDir, "auto-run.json");
+  const content = JSON.stringify({
+    rounds: 2,
+    openFindings: [{ severity: "minor", summary: "Clarify empty input" }],
+    stages: { review: { status: "done", worker: { runtime: "omp", agentId: "review-2" } } },
+  });
+  await fs.mkdir(ephemeraDir, { recursive: true });
+  try {
+    await fs.writeFile(file, content);
+    const observed = await readRasenSnapshot(cwd, change, { executable });
+    expect(observed.skillRecord).toMatchObject({
+      kind: "valid",
+      path: file,
+      content: JSON.parse(content),
+    });
+    expect(observed.fingerprint).not.toBe(before.fingerprint);
+    expect(observed.state).toBe("ready");
+    expect(await fs.readFile(file, "utf8")).toBe(content);
+    await expect(fs.access(legacy)).rejects.toThrow();
+
+    // A malformed first source is still an observation; it must not be hidden
+    // by falling back to a stale legacy file or by seeding a synthetic record.
+    await fs.writeFile(legacy, '{"rounds":1}');
+    await fs.writeFile(file, "{malformed PRIVATE_RECORD");
+    const malformed = await readRasenSnapshot(cwd, change, { executable });
+    expect(malformed.skillRecord).toMatchObject({ kind: "malformed", path: file });
+    expect(JSON.stringify(malformed.skillRecord)).not.toContain("PRIVATE_RECORD");
+    expect(malformed.state).toBe("ready");
+    expect(await fs.readFile(file, "utf8")).toBe("{malformed PRIVATE_RECORD");
+    expect(await fs.readFile(legacy, "utf8")).toBe('{"rounds":1}');
+  } finally {
+    await fs.rm(file, { force: true });
+    await fs.rm(legacy, { force: true });
+  }
+  expect((await readRasenSnapshot(cwd, change, { executable })).skillRecord?.kind).toBe("absent");
 });
 
 test("Rasen strict validation requires a successful report for exactly this change", async () => {

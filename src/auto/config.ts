@@ -19,14 +19,14 @@ export interface AutoConfig {
 export const autoDefaults: AutoConfig = {
   // Allows an explicit, confirmed /auto start; never starts or resumes a run itself.
   enabled: true,
-  // The generated workflow owns task/stage iteration. Counts are diagnostic by default.
+  // Existing skills own their internal iteration. Counts are diagnostic by default.
   // Explicit legacy caps remain honored; time supervision is always finite.
   maxSteps: null,
   maxToolCalls: null,
   maxStalls: null,
   maxDurationMs: 4 * 60 * 60 * 1000,
   noOutputTimeoutMs: 10 * 60 * 1000,
-  cliTimeoutMs: 5000,
+  cliTimeoutMs: 10000,
   decisionTimeoutMs: 8000,
   maxEvidenceChars: 12000,
   minConfidence: 0.8,
@@ -53,7 +53,7 @@ export function parseAutoConfig(value: unknown, defaults: AutoConfig = autoDefau
     maxStalls: [1, 10000],
     maxDurationMs: [1000, 12 * 60 * 60 * 1000],
     noOutputTimeoutMs: [1000, 30 * 60 * 1000],
-    cliTimeoutMs: [100, 5000],
+    cliTimeoutMs: [100, 30000],
     decisionTimeoutMs: [100, 8000],
     maxEvidenceChars: [1000, 24000],
     maxFallbacks: [0, 8],

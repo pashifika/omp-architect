@@ -66,6 +66,39 @@ test.each([
   expect(() => parseAutoStart(input)).toThrow();
 });
 
+test("brief comma selectors stay compatible and missing prose delimiter fails explicitly", async () => {
+  expect(parseAutoStart("start my-change --brief example,TS,rs -- Keep prose")).toEqual({
+    change: "my-change",
+    brief: { pack: "example", blocks: ["ts", "rs"] },
+    instructions: "Keep prose",
+  });
+  const { cwd, global } = await fixture();
+  const parsed = parseAutoStart("start my-change --brief example write prose");
+  await expect(renderBrief(cwd, global, parsed.brief!, parsed.change)).rejects.toThrow();
+});
+
+test("only a leading brief selector has syntax; option-looking prose remains literal", () => {
+  for (const instructions of [
+    "Use --brief example for guidance",
+    "--pipeline full-feature",
+    "--pipeline ../literal is ordinary guidance",
+    "Explain --pipeline full-feature and --brief example",
+  ])
+    expect(parseAutoStart(`start my-change ${instructions}`)).toEqual({
+      change: "my-change",
+      instructions,
+    });
+  expect(parseAutoStart("start my-change -- --brief literal")).toEqual({
+    change: "my-change",
+    instructions: "--brief literal",
+  });
+  expect(parseAutoStart("start my-change --brief example ts -- --pipeline literal")).toEqual({
+    change: "my-change",
+    brief: { pack: "example", blocks: ["ts"] },
+    instructions: "--pipeline literal",
+  });
+});
+
 test("brief v0.1 rendering matches CRLF, variables, alias order, dedupe, indentation and unknown placeholders", async () => {
   const { cwd, global } = await fixture();
   expect(
@@ -190,4 +223,18 @@ test("native argument completions replace full prefix, discover actual changes a
   expect(complete("start my-change write prose ")).toBeNull();
   expect(complete("start my-change\n--brief example ")).toBeNull();
   expect(complete("status ")).toBeNull();
+});
+
+test("completion never introduces a pipeline selector or treats guidance as options", async () => {
+  const { cwd, global } = await fixture();
+  await Bun.write(
+    path.join(cwd, ".rasen/pipelines/local-flow/pipeline.yaml"),
+    "name: local-flow\n",
+  );
+  const complete = (text: string) => completeAuto(text, cwd, global);
+  expect(complete("start my-change --p")).toBeNull();
+  expect(complete("start my-change --pipeline ")).toBeNull();
+  expect(complete("start my-change --pipeline local-flow --brief ")).toBeNull();
+  expect(complete("start my-change Explain --brief ")).toBeNull();
+  expect(complete("start my-change --brief example -- --brief ")).toBeNull();
 });

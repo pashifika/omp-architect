@@ -15,7 +15,8 @@ import {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import type { RasenSnapshot } from "../src/auto/rasen.ts";
-import type { ReviewRequest } from "../src/core.ts";
+import { digest, type ReviewRequest } from "../src/core.ts";
+import type { RasenSkill } from "../src/auto/skills.ts";
 import { extensionFactory } from "../src/extension.ts";
 import { withAgentDir } from "./isolated-host.ts";
 
@@ -36,15 +37,29 @@ async function fixture() {
     contextFiles: [],
     fingerprint: "pending-change",
   };
+  const skill: RasenSkill = {
+    name: "rasen-apply-change",
+    description: "Implement the existing change tasks",
+    baseDir: cwd,
+    filePath: path.join(cwd, "SKILL.md"),
+    source: "fixture",
+    reference: "skill://rasen-apply-change",
+  };
   const registry = new AgentRegistry();
   const session = {
     asyncJobManager: new AsyncJobManager({}),
     getAgentId: () => "main",
     sessionId: sessionManager.getSessionId(),
     hasPendingAsyncWork: () => false,
+    waitForAdmittedSubmissions: async () => {},
+    waitForIrcReplies: async () => {},
+    settleAsyncWork: async () => {},
+    waitForIdle: async () => {},
   } as unknown as AgentSession;
   registry.register({ id: "main", displayName: "Main", kind: "main", session });
   const runtime = new ExtensionRuntime();
+  runtime.appendEntry = ((type: string, data: unknown) =>
+    sessionManager.appendCustomEntry(type, data)) as unknown as typeof runtime.appendEntry;
   let bootstrap = "";
   runtime.sendMessage = (...args: unknown[]) => {
     const message = args[0] as { customType: string; content: unknown };
@@ -60,13 +75,18 @@ async function fixture() {
         },
         {
           snapshot: async () => snapshot,
-          workflow: async () => ({
-            kind: "absent",
-            change: snapshot.change,
-            reason: "No recorded pipeline",
-            fingerprint: "no-workflow",
+          skills: () => [skill],
+          skill: async (selected) => ({
+            ...selected,
+            text: "Complete apply guidance",
+            sha256: digest("Complete apply guidance"),
           }),
-          decision: () => async () => ({ choice: "continue", confidence: 0.99 }),
+          decision: () => async (facts) => ({
+            choice: Object.entries(facts.choices!).find(([, value]) =>
+              value.startsWith(`Execute existing native skill ${skill.name}:`),
+            )![0],
+            confidence: 0.99,
+          }),
           nativeHost: () => ({ session, registry }),
         },
       ),
@@ -111,12 +131,16 @@ async function fixture() {
         .get("auto_step")!
         .definition.execute(
           "initial-step",
-          { summary: "Initial apply phase" },
+          { summary: "Admit the Jev-selected apply action" },
           undefined,
           undefined,
           ctx,
         );
       expect(result.isError).not.toBe(true);
+      expect((await status()).value).toMatchObject({
+        status: "running",
+        selectedAction: { skill: { name: "rasen-apply-change" } },
+      });
     },
     async result(toolCallId: string, toolName: string, input: object, result: object) {
       for (const handler of extension.handlers.get("tool_result") ?? [])
@@ -140,6 +164,7 @@ async function fixture() {
     },
     async close() {
       await extension.handlers.get("session_shutdown")![0]({ type: "session_shutdown" }, ctx);
+      session.asyncJobManager!.dispose();
       await fs.rm(cwd, { recursive: true, force: true });
     },
   };
@@ -161,7 +186,10 @@ test("Auto recovery sees native spawn refusals and both status transports withou
         },
         f.ctx,
       );
-      expect(denied).toMatchObject({ block: true, reason: expect.stringMatching(/verif/) });
+      expect(denied).toMatchObject({
+        block: true,
+        reason: expect.stringContaining("No matching admitted native Auto task"),
+      });
       reason = (denied as { reason: string }).reason;
     }
     expect((await f.status()).value.architect.pendingRecovery).toBe(false);
@@ -187,7 +215,7 @@ test("Auto recovery sees native spawn refusals and both status transports withou
     expect((await f.status()).value.architect.pendingRecovery).toBe(false);
     await f.result("task-error-2", "task", { agent: "omp-reviewer" }, failure);
     expect((await f.status()).value).toMatchObject({
-      hostWorkflow: { phase: "apply", requiredVerification: ["verify"] },
+      selectedAction: { skill: { name: "rasen-apply-change" } },
       completionVerified: false,
       architect: { pendingRecovery: true, completionApproved: false },
     });
@@ -215,7 +243,7 @@ test("Auto recovery sees native spawn refusals and both status transports withou
     for (const record of diagnostics) {
       expect(record).toMatchObject({ tool: "auto_status", isError: false });
       expect(JSON.parse(record.output)).toMatchObject({
-        hostWorkflow: { phase: "apply", requiredVerification: ["verify"] },
+        selectedAction: { skill: { name: "rasen-apply-change" } },
         completionVerified: false,
       });
     }

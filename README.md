@@ -9,7 +9,7 @@ while a separate reviewer checks plans, recovery approaches, and completion evid
 - **Role-based agents:** Send coding tasks to `omp-worker` and read-only research to `omp-explorer`.
 - **Independent reviews:** Hand a complete native OMP file to an architect model at meaningful checkpoints.
 - **Bounded review rounds:** Set minimum and maximum rounds; unresolved findings stop the workflow.
-- **Optional Rasen Auto:** Run the extension-owned apply, verification, and review flow for a prepared [Rasen](https://github.com/DumoeDss/rasen) change. No generated `rasen-auto` skill or full profile is required. The main LEAD uses native implementation/research/reviewer leaves, with Jev stage-boundary advice, time supervision, and the existing synchronous native-file Architect checkpoint as its sole bounded completion-review loop.
+- **Optional Rasen Auto:** Start from an existing [Rasen](https://github.com/DumoeDss/rasen) change with `/auto start <change>`. Jev chooses the next existing skill from OMP’s loaded names/descriptions, current change facts, and native work history. No configured pipeline, prepared task list, or `auto-run.json` is required. Skills own their complete workflows; Auto uses native OMP state and execution without adding an outer completion-review loop.
 
 ## Install
 
@@ -62,24 +62,33 @@ See the [native-file handoff examples](docs/architect.md#native-file-handoff) fo
 direct and `xd://` calls. Restricted Eval carriers require `language: "js"` and
 `reset: true` on each outer Eval call, which discards previous Eval variables.
 
-Use `/architect` or `auto_status` to inspect blocked work and review status.
-Outside Auto, completion requested inside Eval is queued without approval and
-reviewed once at the turn boundary after outer results arrive. Auto instead uses
-the native completion checkpoint synchronously in the LEAD turn, with fresh Rasen
-evidence and the full configured review timeout. Its Eval route requires a
-dedicated JavaScript `reset: true` single-call checkpoint carrier;
-general or batched carriers are rejected without spending a review. Auto preserves
-native async settings, execution, messages, IRC, and result delivery. Its stop hook
-only validates fresh facts against the approval; it does not run the reviewer.
-Await native work and submit fresh evidence before review. `/auto stop` revokes new
-Auto work and drains already-admitted children, preserving their normal results;
-it does not force-cancel them. Native cancellation is a separate explicit action.
-Auto moves from `running` through `draining` to `paused` or freshly verified
-`completed`; conservative quiescence checks may wait for unrelated work under
-the same Main owner. See [stopping and settlement](docs/rasen-auto.md#native-async-ownership-and-stopping). The
-extension does not silently switch your active main model. Reviews send the full
-admitted file and bounded host evidence to your configured provider; do not include secrets. These checks
-do not replace tool approvals or prove that assistant-authored claims occurred.
+Use `/architect` to inspect Architect review status and `/auto status` or
+`auto_status` for current change facts, selected skill action, and supervision.
+Architect's native checkpoints remain available for plan/recovery work and
+ordinary non-Auto use. A selected `rasen-review-cycle` keeps its own review/fix
+loop, limits, and reports. See [Rasen Auto setup and limits](docs/rasen-auto.md).
+
+```console
+/auto start my-change
+/auto start my-change Keep changes focused
+/auto start my-change --brief example ts -- Run focused tests first
+```
+
+Auto preserves native OMP async settings, execution, messages, IRC, and result
+delivery. `/auto stop` or new user input revokes new Auto work and drains
+already-admitted children, preserving their normal results; it does not
+force-cancel them. Native cancellation is a separate explicit action. Auto moves
+from `running` through `draining` to `paused` or freshly verified `completed`;
+conservative settlement checks may wait for unrelated work under the same Main
+owner. See [stopping and settlement](docs/rasen-auto.md#native-async-ownership-and-stopping).
+The extension does not silently switch your active main model.
+
+Ship, retain, and archive skills remain available when applicable to your
+requested outcome. Selecting a skill does not authorize its consequential actions;
+normal OMP permissions and required approvals still apply. Confirmation discloses
+bounded change/native evidence and the separately bounded catalog of exact skill
+names, descriptions, and selection criteria sent to TypeSafe Jev. Do not include
+secrets or data you may not send.
 
 ## Configuration and guides
 
@@ -88,7 +97,7 @@ do not replace tool approvals or prove that assistant-authored claims occurred.
 | Install, preview, update, or remove the local plugin | [Installation guide](docs/installation.md) |
 | Choose models and reasoning effort | Native OMP `modelRoles`; [model-role guide](docs/architect.md#one-source-of-truth-for-models-and-reasoning) |
 | Set review rounds, role names, and thresholds | Project `.omp/architect.json`; [review guide](docs/architect.md#bounded-review-rounds) and [sample settings](examples/architect.json) |
-| Apply, verify, and review a prepared Rasen change, with extra instructions or existing brief packs | [Rasen Auto setup and limits](docs/rasen-auto.md); initialize pinned Rasen with `rasen init --tools omp` and prepare the local change and apply skill; the extension owns Auto orchestration. Global `~/.omp/agent/auto.json` defaults and project `.omp/auto.json` overrides are both optional (the active OMP profile determines the global path); TypeSafe authentication through OMP `/login` or `TYPESAFE_API_KEY` is required |
+| Work on an existing Rasen change with extra instructions or brief packs | [Rasen Auto setup and limits](docs/rasen-auto.md); initialize pinned Rasen with `rasen init --tools omp` and make its existing Rasen skills available through OMP’s native loader. Global `~/.omp/agent/auto.json` defaults and project `.omp/auto.json` overrides are both optional (the active OMP profile determines the global path); TypeSafe authentication through OMP `/login` or `TYPESAFE_API_KEY` is required |
 | Add the standalone `/brief` command with Tab completion | [Optional brief installation](docs/installation.md); use `bun run dev:install -- --with-brief` only when another `/brief` is not installed |
 | Understand tested behavior and reproduce verification | [Verification record](docs/rasen-auto-verification.md) |
 | Develop, run local checks, or submit a pull request | [Contributing](CONTRIBUTING.md) |

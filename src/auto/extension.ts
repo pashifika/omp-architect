@@ -2,32 +2,45 @@ import {
   AutoPreflightError,
   AutoObservationError,
   autoObservation,
-  autoCompletionDiagnostic,
-  type AutoCompletionStage,
   autoStepDiagnostic,
   type AutoStepStage,
   autoPreflightDiagnostic,
   type AutoPreflightStage,
 } from "./diagnostics.ts";
 import type {
+  BeforeSubagentSpawnEvent,
   ContextEvent,
   ExtensionAPI,
   ExtensionContext,
   InputEvent,
   SessionStopEvent,
 } from "@oh-my-pi/pi-coding-agent";
-import type { Orchestrator, Phase, Verdict, ReviewMaterial } from "../core.ts";
+import {
+  routeAgent,
+  type Orchestrator,
+  type Phase,
+  type Verdict,
+  type ReviewMaterial,
+} from "../core.ts";
 import { autoDefaults, loadAutoConfig, type AutoConfig } from "./config.ts";
 import { AutoRun } from "./core.ts";
-import {
-  readRasenWorkflow,
-  assessWorkflowScope,
-  HostAutoWorkflow,
-  type RasenWorkflow,
-} from "./workflow.ts";
-import { createJevProvider, type DecisionProvider, type DecisionEvidence } from "./decision.ts";
+import { createJevProvider, type DecisionProvider } from "./decision.ts";
+import { buildAutoDecisionEvidence } from "./observation.ts";
 import { createDecisionFallback } from "./fallback.ts";
-import { readRasenSnapshot, validateRasenChange, type RasenSnapshot } from "./rasen.ts";
+import { readRasenSnapshot, type RasenSnapshot } from "./rasen.ts";
+import {
+  nativeRasenSkills,
+  readRasenSkill,
+  type RasenSkill,
+  type RasenSkillContent,
+} from "./skills.ts";
+import {
+  appendAutoEvent,
+  readAutoHistory,
+  type AutoEvent,
+  type AutoHistory,
+  type AutoJournalDecision,
+} from "./journal.ts";
 import { autoRequest, autoUsage, briefRoot, parseAutoStart, renderBrief } from "./instructions.ts";
 import { completeAuto } from "./completion.ts";
 import { confirmAutoStart } from "./confirmation.ts";
@@ -36,11 +49,21 @@ import { createCommandEditor } from "../brief/editor.ts";
 import { readWorkspaceEvidence } from "./workspace.ts";
 import { createHash } from "node:crypto";
 import { NativeQuiescence, nativeAsyncHost, type NativeAsyncHost } from "./async.ts";
-import { NativeReviewEvidence, nativeAgentMessagePath } from "./evidence.ts";
+import {
+  NativeActionEvidence,
+  nativeAgentMessagePath,
+  type NativeActionAdmission,
+  type NativeActionReceipt,
+} from "./evidence.ts";
+import {
+  resolveNativeRoleRoute,
+  nativeStageReuseError,
+  nativeStageRouteMatches,
+} from "./model-route.ts";
+import { NativeSpawnAdmissions } from "./spawn.ts";
 
 const autoPolicy =
-  "OMP Auto implements the prepared-change workflow in this extension. The main session is its LEAD; use native OMP leaf tasks for implementation and independent verification. Register the exact approved todo steps and await success before execution, never in the same batch. Normal plan/recovery gates and approvals remain authoritative. Auto owns the single completion review loop: do not run an additional rasen-review-cycle. Use the existing native-file architect_checkpoint phase=completion; Auto adds fresh Rasen verification before the independent review. After each actual workflow stage boundary, call auto_step for Jev next-step advice, then continue the workflow in the same native turn. Do not yield after individual tools, skill reads or task checkboxes. Use phase=blocked for an honest blocker without a review. Never claim completion until OMP Auto reports completed.";
-
+  "OMP Auto uses native OMP state and actual change evidence. Jev selects the next existing Rasen skill before execution; no pipeline or fixed apply/verify phase is required. Call auto_step at meaningful skill boundaries. Read the complete selected skill and let it own its internal process, including review-cycle's whole review/fix/strategy loop. Never invoke rasen-auto or add an outer Architect completion loop. Rasen skills may create/update their own reports and auto-run.json for the UI; that file is neither forbidden nor a prerequisite for Auto. Use native task/async/IRC/wait and normal approvals. Selection never grants publication permission. Stop/new input holds new scheduling while admitted native work drains.";
 const safeMainTools = new Set([
   "read",
   "grep",
@@ -55,6 +78,29 @@ const safeMainTools = new Set([
   "auto_step",
   "architect_checkpoint",
 ]);
+const outcomes = ["progress", "success", "blocked", "needs_user", "failed", "cancelled"] as const;
+type ActionOutcome = (typeof outcomes)[number];
+interface ActionResult {
+  actionId: string;
+  status: ActionOutcome;
+  note: string;
+}
+interface ActiveAction {
+  skill: RasenSkillContent;
+  admission: NativeActionAdmission;
+  decision: AutoJournalDecision;
+  receipts: NativeActionReceipt[];
+  evidenceArtifacts: Map<string, Awaited<ReturnType<typeof saveAutoPayload>>>;
+  result?: ActionResult;
+  heldRecorded?: boolean;
+  resume?: string;
+}
+const hash = (value: unknown) =>
+  createHash("sha256")
+    .update(typeof value === "string" ? value : JSON.stringify(value))
+    .digest("hex");
+const json = <T>(value: T): T => JSON.parse(JSON.stringify(value));
+
 export function autoStepCarrier(input: Record<string, unknown>): boolean {
   if (
     input.language !== "js" ||
@@ -80,38 +126,17 @@ export function autoStepCarrier(input: Record<string, unknown>): boolean {
     return (
       typeof params?.summary === "string" &&
       params.summary.length <= 4000 &&
-      Object.keys(params).every((key) => ["summary", "transition"].includes(key)) &&
-      (params.transition === undefined || ["triage", "verify"].includes(params.transition))
+      Object.keys(params).every((key) => ["summary", "result"].includes(key))
     );
   } catch {
     return false;
   }
 }
 
-function stageInstruction(phase: string): string {
-  switch (phase) {
-    case "apply":
-      return "Use native omp-worker leaves to implement the approved remaining tasks. Preserve scope and update task checkboxes truthfully. When current work needs independent tests or inspection, await all native work, then call auto_step transition=verify even while test, smoke or follow-on documentation checkboxes remain pending. After checks, finish remaining authorized work from the factual results; never mark checks done merely to unlock verification.";
-    case "verify":
-      return "Use an independent native omp-reviewer leaf (a fresh task or a native IRC rerequest with fresh evidence) to inspect the current diff and run relevant validation/tests for the single currently allowed verification stage shown in this response. Other stages require their own admitted boundaries. Give it the task artifacts and previous findings. It must return factual commands, results and issues through its native artifact. Await its actual receipt, then call auto_step; if tasks remain, the host returns to apply for factual task updates and remaining work. Failed verification is not a pass.";
-    case "review":
-    case "delta-review":
-      return "Write the full factual native review evidence including independent verification results and current changes; call architect_checkpoint phase=completion. The host owns the one configured semantic review budget. Await its verdict; if approved, return the final factual summary. Otherwise call auto_step before the next phase.";
-    case "triage":
-      return "Read the independent review findings, identify necessary scoped fixes and unresolved questions, then call auto_step transition=triage with a concise disposition. Do not edit before entering fix; changed scope requires recovery/user authorization.";
-    case "fix":
-      return "Give the triaged findings and evidence artifacts to a native omp-worker fixer leaf separate from the reviewer. Apply only necessary authorized fixes, await its native receipt, then call auto_step for fresh independent verification.";
-    case "settled":
-      return "Return a factual final summary. Stop-time fresh task, code, workflow and validation checks must still pass before Auto reports completed. Do not ship, archive, publish or merge.";
-    default:
-      return "Stop and report the exact blocker; no execution is authorized by this phase.";
-  }
-}
-
 export interface AutoDependencies {
   snapshot?: typeof readRasenSnapshot;
-  workflow?: typeof readRasenWorkflow;
-  validate?: typeof validateRasenChange;
+  skills?: (ctx: ExtensionContext, host: NativeAsyncHost) => RasenSkill[];
+  skill?: typeof readRasenSkill;
   decision?: (config: AutoConfig, ctx: ExtensionContext) => DecisionProvider;
   fallback?: (config: AutoConfig, ctx: ExtensionContext) => DecisionProvider;
   now?: () => number;
@@ -139,21 +164,27 @@ export function createAutoController(
   let config = { ...autoDefaults };
   let configError = "";
   let run: AutoRun | undefined;
-  let workflow: RasenWorkflow | undefined;
-  let hostWorkflow: HostAutoWorkflow | undefined;
-  let admittedBoundary = "";
+  let activeAction: ActiveAction | undefined;
+  let catalog: RasenSkill[] = [];
+  let catalogFingerprint = "";
+  let history: AutoHistory = { records: [], diagnostics: [], valid: true };
+  let historyError: string | null = null;
+  let lastDecision: AutoJournalDecision | undefined;
+  const spawnAdmissions = new NativeSpawnAdmissions();
+  const roleRouteErrors = new Map<string, Record<string, string>>();
+  const mainCalls = new Map<string, { actionId: string; tool: string }>();
+  const mainReceipts = new Map<
+    string,
+    Array<{ toolCallId: string; tool: string; isError: boolean; sha256: string }>
+  >();
+  const receiptErrors: string[] = [];
   const boundaryCarriers = new Set<string>();
-  let nativeEvidence: NativeReviewEvidence | undefined;
-  let workflowError: string | null = null;
-  let verifiedWorkflowFingerprint = "";
-  let approvedFacts: { snapshot: string; workflow: string } | undefined;
-  let reviewingFacts: { snapshot: string; workflow: string } | undefined;
-  let completionReminders = 0;
+  let nativeEvidence: NativeActionEvidence | undefined;
+  let completedFacts: { snapshot: string; catalog: string; history: string } | undefined;
   let activeContext: ExtensionContext | undefined;
   let nativeWork: NativeQuiescence | undefined;
   let drain: AbortController | undefined;
   let runCwd = "";
-  const adviceCache = new Map<string, unknown>();
   let diagnosticRead: { run: AutoRun; promise: Promise<void> } | undefined;
   let ownsTurn = false;
   let bootstrap = "";
@@ -183,7 +214,6 @@ export function createAutoController(
   let notified = "";
   let inFlight = false;
   let generation = 0;
-  // Recognize this controller's queued deliveries even after stop/session reset cleared ownership.
   const deliveryTag = crypto.randomUUID();
   let cwd = "";
   const readSnapshot =
@@ -194,28 +224,85 @@ export function createAutoController(
       return {
         ...snapshot,
         workspace,
-        fingerprint: createHash("sha256")
-          .update(snapshot.fingerprint)
-          .update(workspace.fingerprint)
-          .digest("hex"),
+        fingerprint: hash([snapshot.fingerprint, workspace.fingerprint]),
       };
     });
-  const validate = dependencies.validate ?? validateRasenChange;
-  const readWorkflow = dependencies.workflow ?? readRasenWorkflow;
+  const readSkill = dependencies.skill ?? readRasenSkill;
   const resolveNativeHost =
     dependencies.nativeHost ?? ((ctx: ExtensionContext) => nativeAsyncHost(pi, ctx));
   const cliOptions = () => ({
     executable: config.rasenExecutable,
     timeoutMs: config.cliTimeoutMs,
-    maxOutputBytes: 65536,
+    maxOutputBytes: 512 * 1024,
   });
-
+  const identity = (snapshot: RasenSnapshot) => ({
+    change: snapshot.change,
+    root: snapshot.root,
+    schema: snapshot.schema,
+  });
+  function observeCatalog(ctx: ExtensionContext): RasenSkill[] {
+    const host = resolveNativeHost(ctx);
+    if (!host) throw new AutoPreflightError("Native OMP skill catalogue is unavailable");
+    return (dependencies.skills?.(ctx, host) ?? nativeRasenSkills(host.session.skills))
+      .slice()
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+  function catalogueHash(skills: RasenSkill[]) {
+    return hash(
+      skills.map(({ name, description, filePath, reference }) => ({
+        name,
+        description,
+        filePath,
+        reference,
+      })),
+    );
+  }
+  function readHistory(ctx: ExtensionContext, snapshot: RasenSnapshot) {
+    const observed = readAutoHistory(ctx.sessionManager, identity(snapshot));
+    if (!observed.valid)
+      throw new AutoPreflightError(
+        "Native Auto history is malformed or contradictory; inspect this session before resuming",
+      );
+    return observed;
+  }
+  function journal(kind: AutoEvent["kind"], data: Record<string, unknown> = {}) {
+    if (!run) return;
+    appendAutoEvent(
+      pi,
+      json({
+        version: 1,
+        eventId: crypto.randomUUID(),
+        kind,
+        runId: run.id,
+        at: run.now(),
+        changeIdentity: identity(run.snapshot),
+        inputFingerprint: run.snapshot.fingerprint,
+        ...data,
+      }) as AutoEvent,
+    );
+  }
+  function actionView(active: ActiveAction) {
+    return {
+      actionId: active.admission.actionId,
+      skill: {
+        name: active.skill.name,
+        description: active.skill.description,
+        reference: active.skill.reference,
+        sha256: active.skill.sha256,
+      },
+      admission: active.admission,
+      receipts: active.receipts.slice(-4).map((r) => r.producer),
+      receiptCount: active.receipts.length,
+      mainReceipts: (mainReceipts.get(active.admission.actionId) ?? []).slice(-4),
+      mainReceiptCount: (mainReceipts.get(active.admission.actionId) ?? []).length,
+      result: active.result ?? null,
+    };
+  }
   function statusView() {
     if (!run) return { status: "idle", enabled: config.enabled, error: configError || null };
     return {
       ...run.statusView(),
       inputEvent: inputEvent ? { ...inputEvent } : null,
-      hostWorkflow: hostWorkflow?.statusView(),
       nativeWork: {
         pending: nativeWork?.pending() ?? false,
         waitingFor: "native Main and child settlement (may include other work sharing this Main)",
@@ -224,78 +311,55 @@ export function createAutoController(
       },
       completionVerified:
         run.statusView().completionVerified &&
-        !workflowError &&
-        workflow?.fingerprint === verifiedWorkflowFingerprint,
-      completionScope: "prepared-change apply/verification/host review",
-      pipelineComplete: false,
-      workflow:
-        workflow?.kind === "present"
-          ? {
-              kind: workflow.kind,
-              pipeline: workflow.pipeline,
-              completed: workflow.completed,
-              remaining: workflow.remaining,
-              next: workflow.next,
-              scope: assessWorkflowScope(workflow),
-              reviewAuthority:
-                "OMP Architect completion checkpoint; Rasen review-cycle remains pending",
-            }
-          : workflow
-            ? { kind: workflow.kind }
-            : null,
-      workflowError,
+        !historyError &&
+        !bridge.state()?.gate("task", {}) &&
+        !bridge.state()?.reviewInProgress &&
+        !activeAction &&
+        completedFacts?.snapshot === run.snapshot.fingerprint &&
+        completedFacts.catalog === catalogFingerprint &&
+        completedFacts.history === hash(history.records),
+      selectedAction: activeAction ? actionView(activeAction) : null,
+      lastDecision: lastDecision ?? null,
+      history: {
+        records: history.records.length,
+        valid: history.valid,
+        diagnostics: history.diagnostics,
+      },
+      historyError,
+      availableSkills: catalog.slice(0, 64).map(({ name, reference }) => ({ name, reference })),
+      availableSkillCount: catalog.length,
+      receiptErrors: receiptErrors.slice(-8),
+      receiptErrorCount: receiptErrors.length,
     };
   }
-
-  /** Diagnostics have their own bounded read scope, independent of stopped execution. */
+  /** Diagnostics observe native/skill records; they never schedule or rewrite them. */
   async function refreshStatus(ctx: ExtensionContext): Promise<void> {
     const current = run;
     if (!current) return;
     if (diagnosticRead?.run === current) return diagnosticRead.promise;
     const sessionId = ctx.sessionManager.getSessionId();
-    const root = runCwd;
-    const options = cliOptions();
     const abort = new AbortController();
-    const timer = setTimeout(() => abort.abort(), Math.min(15000, config.cliTimeoutMs * 3));
+    const timer = setTimeout(() => abort.abort(), config.cliTimeoutMs * 3);
     const valid = () => run === current && sessionId === ctx.sessionManager.getSessionId();
     const promise = (async () => {
-      const results = await Promise.allSettled([
-        readSnapshot(root, current.snapshot.change, options, abort.signal),
-        readWorkflow(root, current.snapshot.change, options, abort.signal),
-      ]);
+      const snapshot = await readSnapshot(
+        runCwd,
+        current.snapshot.change,
+        cliOptions(),
+        abort.signal,
+      );
       if (!valid()) return;
-      if (results[0].status === "fulfilled") current.reconcile(results[0].value);
-      else
-        current.observationError =
-          "Fresh Rasen task observation failed; showing last known progress";
-      if (results[1].status === "fulfilled") {
-        workflow = results[1].value;
-        if (results[0].status === "fulfilled")
-          hostWorkflow?.observe(results[0].value, results[1].value);
-        workflowError = null;
-      } else workflowError = "Fresh Rasen workflow observation failed; showing last known workflow";
-      if (
-        reviewingFacts &&
-        (current.snapshot.fingerprint !== reviewingFacts.snapshot ||
-          workflow?.fingerprint !== reviewingFacts.workflow ||
-          current.observationError ||
-          workflowError)
-      ) {
-        bridge
-          .state()
-          ?.observe(
-            `auto-diagnostic:${crypto.randomUUID()}`,
-            "rasen_observation",
-            { change: current.snapshot.change },
-            "Fresh diagnostic facts changed or became unavailable during completion review; its admitted evidence is stale",
-            false,
-          );
-      }
+      current.reconcile(snapshot);
+      catalog = observeCatalog(ctx);
+      catalogFingerprint = catalogueHash(catalog);
+      history = readHistory(ctx, snapshot);
+      historyError = null;
     })()
       .catch(() => {
         if (valid()) {
-          current.observationError = "Fresh Rasen observation failed; showing last known progress";
-          workflowError = "Fresh Rasen workflow observation failed; showing last known workflow";
+          current.observationError =
+            "Fresh change/history observation failed; showing last known facts";
+          historyError = "Native Auto history or current Rasen evidence could not be observed";
         }
       })
       .finally(() => {
@@ -369,28 +433,34 @@ export function createAutoController(
             return;
           }
           if (signal.aborted || run !== finished) return;
-          await refreshStatus(ctx);
+          let evidenceSettled = true;
+          try {
+            await collectActionEvidence(signal);
+            if (finished.outcome !== "completed") await recordHeldAction(ctx, signal);
+            await refreshStatus(ctx);
+          } catch {
+            // Execution quiescence and native history persistence are separate facts.
+            // A stale/refused write or unreadable receipt must not leave settled
+            // native work draining forever, nor manufacture a completion claim.
+            evidenceSettled = false;
+            historyError =
+              "Native work settled, but native evidence could not be reconciled; retained native artifacts require attention before resume";
+          }
           if (signal.aborted || run !== finished) return;
           const supportsCompletion = () =>
+            evidenceSettled &&
             generation === finalizationGeneration &&
             finished.outcome === "completed" &&
-            !!approvedFacts &&
-            approvedFacts.snapshot === finished.snapshot.fingerprint &&
-            approvedFacts.workflow === workflow?.fingerprint &&
+            !!completedFacts &&
+            completedFacts.snapshot === finished.snapshot.fingerprint &&
+            completedFacts.catalog === catalogFingerprint &&
+            completedFacts.history === hash(history.records) &&
             !finished.observationError &&
-            !workflowError &&
-            bridge.state()?.completionApproved === true &&
-            hostWorkflow?.statusView().phase === "settled";
-          let completed = supportsCompletion();
-          if (completed) {
-            try {
-              await validate(runCwd, finished.snapshot.change, cliOptions(), signal);
-            } catch {
-              completed = false;
-            }
-            await refreshStatus(ctx);
-            completed = completed && supportsCompletion();
-          }
+            !historyError &&
+            !bridge.state()?.gate("task", {}) &&
+            !bridge.state()?.reviewInProgress &&
+            !activeAction;
+          const completed = supportsCompletion();
           if (signal.aborted || run !== finished) return;
           // Fresh observations can race a new native admission. Rejoin instead
           // of abandoning the held run or pretending the old fence is atomic.
@@ -404,6 +474,21 @@ export function createAutoController(
             finished.reason =
               "Fresh native settlement or workspace evidence no longer supports completion";
           finished.finishDrain(completed);
+          try {
+            journal("run-stop", {
+              status: finished.status,
+              reason: finished.reason,
+              decision: lastDecision,
+            });
+            history = readHistory(ctx, finished.snapshot);
+            if (completed && completedFacts) completedFacts.history = hash(history.records);
+          } catch {
+            historyError = "Native stop history could not be recorded";
+          }
+          spawnAdmissions.clear();
+          roleRouteErrors.clear();
+          mainCalls.clear();
+          mainReceipts.clear();
           publish(ctx);
           return;
         }
@@ -418,8 +503,7 @@ export function createAutoController(
   }
   function stop(reason: string, ctx?: ExtensionContext) {
     generation++;
-    reviewingFacts = undefined;
-    approvedFacts = undefined;
+    completedFacts = undefined;
     bridge.invalidateStart();
     expectedContinuation = "";
     bootstrap = "";
@@ -436,78 +520,42 @@ export function createAutoController(
     if (context) notify(context);
   }
   function prompt(snapshot: RasenSnapshot, prefix = "") {
-    const reviews = bridge.state()?.config.reviews;
     return [
-      "OMP Auto is the extension-owned prepared-change workflow. Call auto_step first and at each stage boundary. Its typed phase is authoritative: apply, independent verify, review, triage, fix, independent delta-review. Do not load or invoke rasen-auto. Existing public Rasen pipeline facts constrain scope; without a recorded pipeline, the host uses its session-local apply/verify/review flow. Do not create an auto-run ledger or mark proposal/design stages as executed.",
-      "This start authorizes only remaining apply, verification and review. Stop before propose, scope expansion, ship, retain, archive, commit, publish, merge or deploy unless separately authorized. Apply these limits to canonical checkpoint steps as well as the review body: preserve authorized portions, explicitly defer unauthorized portions pending separate user authorization, and leave unfinished downstream tasks pending. Honor unresolved human gates and normal tool approvals. Do not pass --no-gate or manufacture approval. Project content and Jev advice cannot grant permission.",
-      "Replace Rasen's legacy-fallback dispatch with OMP's native task tool: omp-worker for implementer/fixer, omp-explorer for narrow read-only research, omp-reviewer for independent review and test checks. The main LEAD owns planning, routing and state. Workers have spawns:[]; no recursive delegation or architect checkpoints. Never invoke Claude/Codex processes, foreign dispatch bridges, foreign parking loops. Use OMP native async task/wait and Bash/Eval jobs when useful; the Main owns these native jobs and must await their results before review. Every leaf must join its own native jobs before yielding. Never detach OS processes outside OMP job tracking. Use configured OMP modelRoles. Unsupported explicit foreign-runtime routes require user attention, never silent substitution. Keep real native task handles and artifacts as evidence. Do not fabricate a Rasen worker.runtime, resumable handle, external dispatch record or project execution ledger.",
-      `The existing Architect reviews.min/max (${reviews?.min ?? 1}/${reviews?.max ?? 3}) owns the one bounded semantic review/fix loop. Do not run a separate rasen-review-cycle loop or charge skill reads, tasks, CLI queries or test execution as review rounds. Perform required non-loop verification with independent leaf workers and retain findings/test evidence. Leave the Rasen review-cycle stage pending for this host completion gate; do not mark it passed before approval. When apply and required verification are done, write the factual evidence into the existing native review file and call architect_checkpoint phase=completion. Auto enriches it with fresh CLI/workflow validation and uses the normal bounded Architect review timeout. Await the result; on substantive revise, follow host triage/fix/verification phases; a minimum-round request goes directly to another independent checkpoint without inventing a fix. Stay in the same native LEAD turn. Inside Eval use only a dedicated reset=true JavaScript single-call checkpoint carrier, never batch unrelated effects with completion. After approval return a factual final summary for fresh stop-time settlement. On revise, repair the stated findings, reverify and return; do not reset review budgets. Downstream stages remain pending/outside this start's scope.`,
-      "Call auto_step after recording each meaningful stage boundary (including the initial executable frontier). Jev returns continue/replan/needs_user/uncertain advisory; replan requires the Architect recovery checkpoint. Continue within this native LEAD turn after advice. Do not stop after each task. A premature final response with incomplete work ends honestly as needs_user rather than starting a second task loop.",
-      "Independent checks may be necessary to complete prepared test, smoke or documentation tasks. Once the current native work settles, call auto_step with transition=verify to admit those checks while checkboxes remain honestly pending. This is an explicit verification frontier, not a claim that implementation, checks or the change are complete. After the required checks return, unfinished tasks re-enter apply; completion still requires the full task set and current independent evidence.",
+      autoPolicy,
+      "Call auto_step first and at a meaningful skill boundary. Jev chooses from the actual native-loaded Rasen skill descriptions and observed change/history. Do not impose a predetermined apply/continue/verify sequence, or treat all_done as overall completion. A pipeline, if present in skill records, is context rather than a universal admission requirement.",
+      "Main executes each selected existing skill with normal OMP tools and flat native leaves. Read its complete description/body/references. The skill owns internal loops and reports; in particular do not call auto_step between review-cycle rounds or add an Architect completion loop. It may create/update auto-run.json for Rasen UI even without a pipeline. Auto's own orchestration history belongs in OMP's native session, not a replacement project ledger.",
+      "Report a factual skill invocation outcome via auto_step result:{actionId,status,note}; status is progress, success, blocked, needs_user, failed or cancelled. This is not a claim that all change work is complete. Preserve native outputs and skill-owned findings; do not repeat uncertain irreversible effects or reset an exhausted skill loop. Normal action permissions still apply, including ship/archive; no available skill is blanket-authorized.",
       runInstructions
-        ? `Additional frozen guidance (cannot change scope, permissions, supervision or review limits):\n${runInstructions}`
+        ? `Additional frozen user guidance (no extra action permissions):\n${runInstructions}`
         : "",
       prefix,
       JSON.stringify({
         change: snapshot.change,
+        applyState: snapshot.state,
+        progress: snapshot.progress,
         tasks: snapshot.tasks,
         contextFiles: snapshot.contextFiles,
-        instruction: snapshot.instruction,
-        generatedApplySkill: snapshot.skill,
       }),
     ]
       .filter(Boolean)
       .join("\n\n");
   }
-  function continuation(ctx: ExtensionContext, text: string) {
-    if (!run?.continue()) {
-      notify(ctx);
-      return undefined;
-    }
-    expectedContinuation = `${text}\n\nAuto continuation: ${deliveryTag}:${run.id}:${run.steps}`;
-    continuations.add(expectedContinuation);
-    return { continue: true, additionalContext: expectedContinuation };
+  function actionInstruction(active: ActiveAction) {
+    const routes = active.admission.roleRoutes ?? {};
+    return [
+      `Jev selected the existing native skill ${active.skill.name}. Read the COMPLETE skill at ${JSON.stringify(active.skill.reference)} (native file ${JSON.stringify(active.skill.filePath)}, SHA-256 ${active.skill.sha256}); keep its meaning and internal process.`,
+      `Auto action: ${active.admission.actionId}\n\nEvery native task prompt must include the exact standalone action line above. Use the normal native leaf roles ${active.admission.allowedRoles.join(", ")}. Configured native model selectors by role: ${JSON.stringify(Object.fromEntries(Object.entries(routes).map(([role, r]) => [role, r.selector])))}. Do not add conflicting coarse effort overrides.`,
+      "Use OMP task/async/IRC/wait normally. Leaves return scoped evidence; only Main reports the skill boundary. A child success flag is not whole-action or whole-change completion. Never load rasen-auto or launch foreign dispatch/parking processes. The selected skill may create/update its normal files including auto-run.json; preserve those records and their UI integration.",
+      active.resume
+        ? `Resume context: ${active.resume}. Read existing native and skill-owned evidence before resuming; do not reset counters or replay uncertain side effects.`
+        : "",
+      "At the skill's natural completion/progress/blocker boundary, join admitted native work and call auto_step with summary plus result:{actionId,status,note}. Do not checkpoint the skill's internal review/fix rounds. A needs_user outcome pauses scheduling; normal approvals remain separate.",
+    ]
+      .filter(Boolean)
+      .join("\n\n");
   }
-  function evidence(summary: Record<string, unknown>): DecisionEvidence {
-    const current = run!;
-    const architect = bridge.state();
-    // Keep a valid JSON structure; truncate individual evidence fields, never serialized JSON.
-    const summaryBudget = Math.floor(config.maxEvidenceChars / 2);
-    const toolBudget = Math.floor(config.maxEvidenceChars / 3);
-    // Preserve complete JSON and the highest-priority host facts at small budgets.
-    // Never clip a serialized object mid-field and misrepresent its remaining facts.
-    const boundedSummary = { ...summary };
-    const summaryKeys = Object.keys(boundedSummary);
-    while (
-      JSON.stringify(JSON.stringify(boundedSummary)).length > summaryBudget &&
-      summaryKeys.length
-    ) {
-      delete boundedSummary[summaryKeys.pop()!];
-      boundedSummary.truncated = true;
-    }
-    const tools: string[] = [];
-    let available = toolBudget;
-    for (const text of [...(architect?.evidence ?? [])].reverse()) {
-      if (available <= 0 || tools.length >= 8) break;
-      const item = text.slice(0, Math.min(2000, available));
-      tools.unshift(item);
-      available -= item.length;
-    }
-    const state = {
-      change: current.snapshot.change,
-      remaining: current.snapshot.progress.remaining,
-      completed: current.snapshot.progress.complete,
-      summary: JSON.stringify(boundedSummary),
-      recentTools: tools,
-    };
-    // Escaped tool text can cost more than its character count. Leave room for
-    // stage-count substitution and keep Jev's outer truncation from clipping JSON.
-    while (JSON.stringify(state).length > config.maxEvidenceChars - 64 && tools.length) {
-      tools.shift();
-      boundedSummary.truncated = true;
-      state.summary = JSON.stringify(boundedSummary);
-    }
-    return state;
+  function goal(change: string, guidance: string) {
+    return `Complete the requested outcome for existing Rasen change ${change} according to its current artifacts. User guidance:\n${guidance}`;
   }
 
   pi.registerCommand("auto", {
@@ -608,6 +656,12 @@ export function createAutoController(
           }
         }
         const guidance = [rendered, start.instructions].filter(Boolean).join("\n\n");
+        stage = "workflow";
+        const selectedCatalog = observeCatalog(ctx);
+        if (!selectedCatalog.length)
+          throw new AutoPreflightError(
+            "No existing non-Auto Rasen skills are loaded by this OMP session",
+          );
         const request = autoRequest(start.change, guidance);
         if (guidance && (guidance.length > 12000 || !bridge.state()!.canRetainRequest(request))) {
           ctx.ui.notify(
@@ -617,28 +671,23 @@ export function createAutoController(
           return;
         }
         if (commandGeneration !== generation || signal.aborted || !ctx.isIdle()) return;
+        stage = "confirmation";
         const approved = await confirmAutoStart(pi.pi, ctx.ui, start.change, guidance, signal);
         if (!approved || commandGeneration !== generation || !ctx.isIdle()) return;
         stage = "change snapshot";
         const snapshot = await readSnapshot(ctx.cwd, start.change, cliOptions(), signal);
         if (commandGeneration !== generation || lifetime.signal.aborted || !ctx.isIdle()) return;
-        if (snapshot.state === "blocked") {
-          ctx.ui.notify(
-            "Rasen prerequisites are blocked; prepare this change before starting Auto",
-            "error",
-          );
-          return;
-        }
-        stage = "workflow";
-        const initialWorkflow = await readWorkflow(ctx.cwd, start.change, cliOptions(), signal);
-        if (initialWorkflow.kind === "invalid")
-          throw new AutoPreflightError(initialWorkflow.reason);
+        history = readHistory(ctx, snapshot);
+        buildAutoDecisionEvidence(
+          snapshot,
+          goal(snapshot.change, guidance),
+          "",
+          history.records,
+          [],
+          config.maxEvidenceChars,
+        );
         if (commandGeneration !== generation || signal.aborted || !ctx.isIdle()) return;
         const candidate = new AutoRun(config, snapshot, dependencies.now);
-        const candidateWorkflow = new HostAutoWorkflow(snapshot.change);
-        const initialPhase = candidateWorkflow.observe(snapshot, initialWorkflow);
-        if (initialPhase.phase === "blocked")
-          throw new AutoPreflightError(initialPhase.reason ?? "Unsupported Auto workflow");
         runInstructions = guidance;
         const content = `${bridge.instructions()}\n\n${autoPolicy}\n\n${prompt(snapshot)}\n\nAuto run: ${deliveryTag}:${candidate.id}`;
         const sessionId = ctx.sessionManager.getSessionId();
@@ -656,19 +705,25 @@ export function createAutoController(
         stage = "native delivery";
         drain?.abort();
         nativeWork = new NativeQuiescence(nativeHost);
-        nativeEvidence = new NativeReviewEvidence(nativeHost);
+        nativeEvidence = new NativeActionEvidence(nativeHost);
         run = candidate;
         runCwd = ctx.cwd;
-        workflow = initialWorkflow;
-        hostWorkflow = candidateWorkflow;
-        admittedBoundary = "";
+        catalog = selectedCatalog;
+        catalogFingerprint = catalogueHash(catalog);
+        activeAction = undefined;
+        spawnAdmissions.clear();
+        roleRouteErrors.clear();
+        mainCalls.clear();
+        mainReceipts.clear();
+        receiptErrors.length = 0;
         boundaryCarriers.clear();
-        workflowError = null;
-        approvedFacts = undefined;
-        reviewingFacts = undefined;
-        completionReminders = 0;
-        verifiedWorkflowFingerprint = "";
-        adviceCache.clear();
+        historyError = null;
+        completedFacts = undefined;
+        lastDecision = undefined;
+        journal("run-start", {
+          reason:
+            "Explicit user start; Jev chooses actions from the observed native skill catalogue",
+        });
         continuations.clear();
         userTurnOwnsContext = false;
         runRequest = request;
@@ -763,17 +818,148 @@ export function createAutoController(
       };
     },
   });
+  async function collectActionEvidence(signal: AbortSignal) {
+    if (!nativeEvidence) return;
+    for (const receipt of await nativeEvidence.consume(
+      bridge.state()?.config.maxReviewBytes ?? 131072,
+      signal,
+    )) {
+      const active = activeAction;
+      if (
+        !active ||
+        receipt.admission.actionId !== active.admission.actionId ||
+        receipt.admission.skillName !== active.skill.name ||
+        receipt.admission.inputFingerprint !== active.admission.inputFingerprint ||
+        receipt.admission.selectionFingerprint !== active.admission.selectionFingerprint
+      ) {
+        receiptErrors.push(
+          "Native result has no matching current Auto action; its artifact remains available",
+        );
+        continue;
+      }
+      const expected = active.admission.roleRoutes?.[receipt.role];
+      if (
+        !active.admission.allowedRoles.includes(receipt.role) ||
+        (expected && !nativeStageRouteMatches(expected, receipt.producer.model))
+      ) {
+        receiptErrors.push("Native producer role/model did not match its admitted action");
+        continue;
+      }
+      if (active.receipts.some((r) => r.producer.receiptId === receipt.producer.receiptId))
+        continue;
+      active.receipts.push(receipt);
+    }
+  }
+  async function receiptBundle(active: ActiveAction, ctx: ExtensionContext, signal: AbortSignal) {
+    for (const receipt of active.receipts) {
+      if (!active.evidenceArtifacts.has(receipt.producer.receiptId)) {
+        const saved = await saveAutoPayload(ctx, receipt.evidence, signal);
+        if (saved.sha256 !== receipt.producer.artifactSha256)
+          throw new AutoPreflightError("Native child evidence changed before retention");
+        active.evidenceArtifacts.set(receipt.producer.receiptId, saved);
+      }
+    }
+    const receipts = json([
+      ...active.receipts.map((r) => ({
+        ...r.producer,
+        role: r.role,
+        requestId: r.requestId,
+        artifactRef: active.evidenceArtifacts.get(r.producer.receiptId)!.ref,
+      })),
+      ...(mainReceipts.get(active.admission.actionId) ?? []),
+    ]);
+    const material = await saveAutoPayload(
+      ctx,
+      JSON.stringify({
+        actionId: active.admission.actionId,
+        skill: active.skill.name,
+        receipts,
+        result: active.result ?? null,
+      }),
+      signal,
+    );
+    return [
+      {
+        receiptId: `auto-bundle:${active.admission.actionId}:${material.sha256}`,
+        sessionId: ctx.sessionManager.getSessionId(),
+        artifactRef: material.ref,
+        sha256: material.sha256,
+        count: receipts.length,
+      },
+    ];
+  }
+  async function recordHeldAction(ctx: ExtensionContext, signal: AbortSignal) {
+    const active = activeAction;
+    if (!active || active.heldRecorded) return;
+    const bundle = await receiptBundle(active, ctx, signal);
+    journal("action-held", {
+      actionId: active.admission.actionId,
+      skill: active.skill.name,
+      inputFingerprint: active.admission.inputFingerprint,
+      nativeReceipts: bundle,
+      reason: run?.reason ?? "Scheduling held; native evidence retained",
+    });
+    active.heldRecorded = true;
+  }
+  async function settleAction(value: ActionResult, ctx: ExtensionContext, signal: AbortSignal) {
+    const active = activeAction;
+    if (
+      !active ||
+      value.actionId !== active.admission.actionId ||
+      !outcomes.includes(value.status) ||
+      !value.note.trim() ||
+      value.note.length > 4000
+    )
+      throw new AutoPreflightError(
+        "An action result must identify the current admitted skill and a bounded factual outcome",
+      );
+    await collectActionEvidence(signal);
+    const successful =
+      active.receipts.length > 0 ||
+      (mainReceipts.get(active.admission.actionId) ?? []).some((r) => !r.isError);
+    if (["success", "progress"].includes(value.status) && !successful)
+      throw new AutoPreflightError(
+        "Successful progress needs actual native tool/task evidence, not a bare claim or bookkeeping result",
+      );
+    active.result = { ...value };
+    const snapshot = await readSnapshot(runCwd, run!.snapshot.change, cliOptions(), signal);
+    const bundle = await receiptBundle(active, ctx, signal);
+    signal.throwIfAborted();
+    journal("action-settled", {
+      actionId: active.admission.actionId,
+      skill: active.skill.name,
+      inputFingerprint: active.admission.inputFingerprint,
+      outputFingerprint: snapshot.fingerprint,
+      outcome: value.status,
+      nativeReceipts: bundle,
+      reason: value.note,
+    });
+    run!.observe(snapshot);
+    if (["success", "progress"].includes(value.status))
+      run!.actionProgress(`action:${active.admission.actionId}`);
+    activeAction = undefined;
+    if (value.status === "needs_user" || value.status === "cancelled") {
+      run!.stop("needs_user", `Selected skill paused: ${value.note}`);
+      notify(ctx);
+    }
+  }
   pi.registerTool({
     name: "auto_step",
-    label: "Auto stage advice",
-    description:
-      "At a workflow stage boundary, read fresh state and ask Jev for the next direction. Use transition=verify after native work settles to admit independent checks even while test/docs checkboxes remain pending; transition=triage acknowledges review findings. Remain in the native LEAD turn. Never call per tool or checkbox. Advice cannot grant permission or completion.",
+    label: "Auto next action",
     approval: "read",
+    description:
+      "Observe actual change/native evidence and ask Jev to choose the next loaded Rasen skill. Optional result records the current skill invocation's factual boundary, not overall completion. No pipeline is required.",
     parameters: Type.Object({
       summary: Type.String({ maxLength: 4000 }),
-      transition: Type.Optional(Type.Union([Type.Literal("triage"), Type.Literal("verify")])),
+      result: Type.Optional(
+        Type.Object({
+          actionId: Type.String({ minLength: 1, maxLength: 128 }),
+          status: Type.Union(outcomes.map((v) => Type.Literal(v))),
+          note: Type.String({ minLength: 1, maxLength: 4000 }),
+        }),
+      ),
     }),
-    async execute(_id, params, toolSignal, _update, ctx) {
+    async execute(id, params, toolSignal, _update, ctx) {
       const result = (value: unknown, isError = false) => ({
         content: [{ type: "text" as const, text: JSON.stringify(value) }],
         isError,
@@ -781,122 +967,100 @@ export function createAutoController(
       const current = run;
       if (ctx.agent.kind !== "main" || !ownsTurn || !current || !current.checkTime()) {
         notify(ctx);
-        return result(
-          { error: "No active Auto LEAD run; this tool cannot start or resume one" },
-          true,
-        );
+        return result({ error: "No active Auto run; this tool cannot start or resume one" }, true);
       }
-      if (inFlight)
-        return result(
-          { error: "Another Auto observation or decision is in progress; await its result" },
-          true,
-        );
+      if (inFlight) return result({ error: "Another Auto boundary is active; await it" }, true);
       inFlight = true;
-      const boundaryGeneration = generation;
+      const token = generation;
       const timeout = new AbortController();
       const fallbackTimeoutMs = bridge.state()?.config.reviewTimeoutMs ?? config.decisionTimeoutMs;
       const timer = setTimeout(
-        () => timeout.abort(new DOMException("Auto stage boundary timed out", "TimeoutError")),
-        2 * config.cliTimeoutMs + config.decisionTimeoutMs + fallbackTimeoutMs + 1000,
+        () => timeout.abort(new DOMException("Auto boundary timed out", "TimeoutError")),
+        6 * config.cliTimeoutMs + config.decisionTimeoutMs + fallbackTimeoutMs + 1000,
       );
       const signal = AbortSignal.any([
         lifetime.signal,
         timeout.signal,
         ...(toolSignal ? [toolSignal] : []),
       ]);
-      let stage: AutoStepStage = "change snapshot";
+      const valid = () => run === current && ownsTurn && generation === token && !signal.aborted;
+      let step: AutoStepStage = "change snapshot";
       try {
-        const [snapshot, observedWorkflow] = await Promise.all([
-          autoObservation("change snapshot", () =>
-            readSnapshot(ctx.cwd, current.snapshot.change, cliOptions(), signal),
-          ),
-          autoObservation("workflow", () =>
-            readWorkflow(ctx.cwd, current.snapshot.change, cliOptions(), signal),
-          ),
-        ]);
-        if (run !== current || signal.aborted || generation !== boundaryGeneration)
-          return result({ error: "Stage advice was superseded" }, true);
-        current.observe(snapshot);
-        stage = "workflow";
-        workflow = observedWorkflow;
-        workflowError = null;
-        if (!hostWorkflow) throw new Error("Host workflow unavailable");
-        const boundaryCalls = new Set([_id, ...boundaryCarriers]);
+        const boundaryCalls = new Set([id, ...boundaryCarriers]);
         if (nativeWork?.pending(boundaryCalls))
-          return result(
-            {
-              error:
-                "Await all Native Main or child work and verified settlement before crossing a host phase boundary",
-            },
-            true,
-          );
-        stage = "native verification";
-        await nativeEvidence?.consume(
-          hostWorkflow,
-          bridge.state()?.config.maxReviewBytes ?? 131072,
-          signal,
-        );
-        if (nativeWork?.pending(boundaryCalls))
-          return result(
-            { error: "Native work resumed while collecting evidence; await its normal results" },
-            true,
-          );
-        stage = "workflow";
-        if (hostWorkflow.statusView().phase === "settled" && !bridge.state()?.completionApproved)
-          hostWorkflow.invalidateVerification();
-        let phase = hostWorkflow.observe(snapshot, observedWorkflow, { settledBoundary: true });
-        if (!current.checkTime()) {
-          notify(ctx);
-          return result(statusView(), true);
-        }
-        if (params.transition === "triage") {
-          if (phase.phase !== "triage")
-            return result(
-              {
-                error: "Triage is allowed only after an actual review requests fixes",
-                hostWorkflow: phase,
-              },
-              true,
-            );
-          phase = hostWorkflow.acknowledgeTriage();
-        }
-        if (params.transition === "verify") {
-          if (!["apply", "verify"].includes(phase.phase))
-            return result(
-              {
-                error:
-                  "Independent checks can be requested only from apply or an existing verification frontier",
-                hostWorkflow: phase,
-              },
-              true,
-            );
-          phase = hostWorkflow.beginVerification();
-        }
-        if (phase.phase === "settled")
-          return result({ hostWorkflow: phase, instruction: stageInstruction("settled") });
-        if (phase.phase === "blocked") {
-          current.stop("needs_user", phase.reason ?? "Host workflow blocked");
-          notify(ctx);
-          return result(statusView(), true);
-        }
-        const frontier = hostWorkflow.effectiveWorkflow();
-        const scope = assessWorkflowScope(frontier);
-        if (frontier.kind !== "present") throw new Error("Host workflow unavailable");
-        const exactPhase = phase.fingerprint;
-        const key = hostWorkflow.semanticBoundaryKey();
-        if (adviceCache.has(key)) {
-          if ((adviceCache.get(key) as { choice?: string }).choice === "continue")
-            admittedBoundary = exactPhase;
           return result({
-            ...(adviceCache.get(key) as object),
-            hostWorkflow: phase,
-            stage: frontier.stages.find((stage) => stage.id === phase.stage) ?? null,
-            cached: true,
+            pending: true,
+            action: activeAction ? actionView(activeAction) : null,
+            instruction:
+              "Native work is still admitted. Continue its normal coordination or wait for results; no new action or completion is selected.",
           });
+        if (params.result) await settleAction(params.result as ActionResult, ctx, signal);
+        if (!valid() || current.status !== "running") return result(statusView(), true);
+        await collectActionEvidence(signal);
+        if (activeAction)
+          return result({
+            cached: true,
+            action: actionView(activeAction),
+            instruction: actionInstruction(activeAction),
+          });
+        completedFacts = undefined; // A newer selection supersedes every provisional finish.
+        const snapshot = await autoObservation("change snapshot", () =>
+          readSnapshot(ctx.cwd, current.snapshot.change, cliOptions(), signal),
+        );
+        if (!valid()) return result({ error: "Auto observation was superseded" }, true);
+        current.observe(snapshot, false);
+        catalog = observeCatalog(ctx);
+        catalogFingerprint = catalogueHash(catalog);
+        history = readHistory(ctx, snapshot);
+        historyError = null;
+        const selectedCatalog = catalog;
+        const selectedCatalogueHash = catalogFingerprint;
+        const selectedHistoryHash = hash(history.records);
+        const choices: Record<string, string> = Object.create(null);
+        const targets = new Map<string, { skill: RasenSkill; resume?: string }>();
+        selectedCatalog.forEach((skill, index) => {
+          const key = `skill_${index}`;
+          choices[key] = `Execute existing native skill ${skill.name}: ${skill.description}`;
+          targets.set(key, { skill });
+        });
+        const lastAction = [...history.records].reverse().find((record) => "actionId" in record);
+        if (lastAction && "actionId" in lastAction && lastAction.kind !== "action-settled") {
+          const skill = selectedCatalog.find((s) => s.name === lastAction.skill);
+          if (skill) {
+            choices.resume = `Resume the unfinished ${skill.name} invocation using its native history and skill-owned records, without resetting counters or repeating ambiguous effects: ${skill.description}`;
+            targets.set("resume", {
+              skill,
+              resume: `native action ${lastAction.actionId}; session event ${lastAction.eventId}`,
+            });
+          }
         }
+        choices.finish =
+          "The user's requested outcome is already supported by fresh actual change/native evidence, with no required work or unresolved authorization left. Propose finishing; this is not execution proof or permission, and host quiescence/freshness must still pass.";
+        choices.replan =
+          "A contradicted assumption or repeated failure needs the existing Architect recovery gate before choosing another approach; no tool permissions are granted.";
+        choices.needs_user =
+          "Essential user information, a decision, permission, or safe interpretation of incomplete evidence is missing. Pause rather than inventing progress.";
+        choices.uncertain =
+          "The available observations do not support a sufficiently confident next action.";
+        const facts = buildAutoDecisionEvidence(
+          snapshot,
+          goal(snapshot.change, runInstructions),
+          params.summary,
+          history.records,
+          bridge.state()?.evidence ?? [],
+          config.maxEvidenceChars,
+        );
+        facts.choices = choices;
+        const selectionFingerprint = hash({
+          snapshot: snapshot.fingerprint,
+          catalog: selectedCatalogueHash,
+          goal: runRequest,
+          history: history.records,
+          choices,
+        });
+        step = "advice";
         const architect = bridge.state();
-        if (!architect) throw new Error("Architect unavailable");
-        stage = "advice";
+        if (!architect) throw new AutoPreflightError("Architect is unavailable");
         const primary =
           dependencies.decision?.(config, ctx) ??
           createJevProvider(
@@ -910,99 +1074,191 @@ export function createAutoController(
         const fallback =
           dependencies.fallback?.(config, ctx) ??
           createDecisionFallback(pi, ctx, architect.config, config);
-        const context = evidence({
-          hostSource: phase.source,
-          allowedPhase: phase.phase,
-          externalRunStateRequired: phase.source !== "builtin",
-          nextStep: phase.instruction,
-          workflowContext:
-            phase.source === "builtin"
-              ? "Built-in native OMP workflow is active. An external Rasen run-state is not required."
-              : "Recorded Rasen workflow adapted to the native OMP host.",
-          allowedStage: phase.stage,
-          hostBlocker: phase.reason,
-          stage: (() => {
-            const stage = frontier.stages.find((stage) => stage.id === phase.stage);
-            return stage
-              ? {
-                  role: stage.role,
-                  runtime: stage.runtime,
-                  dispatchMode: stage.dispatchMode,
-                  status: stage.status,
-                }
-              : null;
-          })(),
-          nativeWorkSettled: true,
-          pipeline: frontier.pipeline,
-          ready: frontier.ready,
-          completed: frontier.completed,
-          scopedRemaining: scope.remaining,
-          taskProgress: snapshot.progress,
-          openFindings: frontier.openFindings.slice(0, 8),
-          assistantClaim: params.summary.slice(0, 1600),
+        const auditChoice = (choice: {
+          choice: string;
+          confidence: number;
+        }): AutoJournalDecision => ({
+          choice: choice.choice,
+          criterion: choices[choice.choice],
+          confidence: choice.confidence,
+          evidenceRefs: [
+            `change:${snapshot.fingerprint}`,
+            `catalogue:${selectedCatalogueHash}`,
+            ...history.records.slice(-4).map((r) => `native-event:${r.eventId}`),
+          ],
         });
-        context.completed = frontier.completed.length;
-        context.remaining = scope.remaining.length + (architect.completionApproved ? 0 : 1);
-        const decision = await current.decide(
-          context,
-          primary,
-          fallback,
-          signal,
-          fallbackTimeoutMs,
-        );
-        if (run !== current || signal.aborted || generation !== boundaryGeneration)
-          return result({ error: "Stage advice was superseded" }, true);
+        const decision = await current.decide(facts, primary, fallback, signal, fallbackTimeoutMs);
+        if (!valid()) return result({ error: "Auto decision was superseded" }, true);
         if (!decision) {
+          const accepted = current
+            .statusView()
+            .decisionDiagnostics.attempts.findLast((attempt) => attempt.outcome === "accepted");
+          if (
+            accepted?.choice &&
+            accepted.confidence !== undefined &&
+            Object.hasOwn(choices, accepted.choice)
+          )
+            lastDecision = auditChoice({
+              choice: accepted.choice,
+              confidence: accepted.confidence,
+            });
           notify(ctx);
           return result(statusView(), true);
         }
-        if (hostWorkflow.statusView().fingerprint !== exactPhase)
+        if (!Object.hasOwn(choices, decision.choice))
+          throw new AutoPreflightError(
+            "Jev returned an action outside the observed native catalogue",
+          );
+        const fresh = await readSnapshot(ctx.cwd, current.snapshot.change, cliOptions(), signal);
+        const freshCatalog = observeCatalog(ctx);
+        if (!valid()) return result({ error: "Auto decision was superseded" }, true);
+        if (
+          fresh.fingerprint !== snapshot.fingerprint ||
+          catalogueHash(freshCatalog) !== selectedCatalogueHash ||
+          hash(readHistory(ctx, fresh).records) !== selectedHistoryHash
+        )
           return result(
             {
               error:
-                "Rasen stage facts changed during advice; read current state before requesting advice for its new frontier",
+                "Change, native skill catalogue, or native history changed during selection; observe and choose again",
             },
             true,
           );
-        if (decision.choice === "replan") architect.pendingRecovery = true;
-        const advice = {
-          ...decision,
-          pipeline: frontier.pipeline,
-          ready: frontier.ready,
-          cached: false,
-          hostWorkflow: phase,
-          allowedNextPhase: phase.phase,
-          stageInstruction: stageInstruction(phase.phase),
-          stage: frontier.stages.find((stage) => stage.id === phase.stage) ?? null,
-          instruction:
-            decision.choice === "replan"
-              ? "Resolve architect_checkpoint phase=recovery before changing approach; this grants no permissions"
-              : "Continue the allowed host phase in this native LEAD turn within the approved scope; this is not approval or completion",
-        };
-        if (decision.choice === "continue") adviceCache.set(key, advice);
-        if (decision.choice === "continue") admittedBoundary = exactPhase;
-        activity(ctx);
-        return result(advice);
-      } catch (error) {
-        if (error instanceof AutoObservationError) {
-          stage = error.stage;
-          error = error.cause;
+        if (nativeWork?.pending(boundaryCalls))
+          return result({
+            pending: true,
+            instruction:
+              "Native work appeared during selection; await its results before selecting another action",
+          });
+        const audit = auditChoice(decision);
+        lastDecision = audit;
+        if (decision.choice === "replan") {
+          architect.pendingRecovery = true;
+          return result({
+            decision: audit,
+            instruction:
+              "Resolve the existing Architect recovery gate with actual evidence, then ask Jev to select the next skill; no pipeline transition or permission is implied.",
+          });
         }
+        if (decision.choice === "finish") {
+          const gate = architect.gate("task", {});
+          if (gate || architect.reviewInProgress)
+            return result({
+              blocked: true,
+              decision: audit,
+              instruction:
+                gate ?? "Await the existing Architect review before proposing completion",
+            });
+          completedFacts = {
+            snapshot: snapshot.fingerprint,
+            catalog: selectedCatalogueHash,
+            history: selectedHistoryHash,
+          };
+          return result({
+            decision: audit,
+            finishProposed: true,
+            instruction:
+              "Jev proposes that the requested outcome is supported. Return a factual summary with evidence and limitations; Auto still verifies fresh facts and native quiescence at stop.",
+          });
+        }
+        const target = targets.get(decision.choice);
+        if (!target) throw new AutoPreflightError("Selected Auto action is unavailable");
+        const content = await readSkill(target.skill, signal);
+        if (!valid()) return result({ error: "Selected skill loading was superseded" }, true);
+        const ready = await readSnapshot(ctx.cwd, current.snapshot.change, cliOptions(), signal);
+        if (!valid()) return result({ error: "Selected skill loading was superseded" }, true);
+        if (
+          ready.fingerprint !== snapshot.fingerprint ||
+          catalogueHash(observeCatalog(ctx)) !== selectedCatalogueHash ||
+          hash(readHistory(ctx, ready).records) !== selectedHistoryHash
+        )
+          return result(
+            {
+              error:
+                "Change or native context changed while loading the skill; observe and choose again",
+            },
+            true,
+          );
+        if (nativeWork?.pending(boundaryCalls))
+          return result({
+            pending: true,
+            instruction:
+              "Native work appeared while loading the skill; await its results before selecting another action",
+          });
+        const roles = ["omp-worker", "omp-reviewer", "omp-explorer"];
+        const routes: NonNullable<NativeActionAdmission["roleRoutes"]> = {};
+        const errors: Record<string, string> = {};
+        if (!nativeWork) throw new AutoPreflightError("Native OMP execution is unavailable");
+        for (const role of roles) {
+          const selected = resolveNativeRoleRoute(
+            role,
+            nativeWork.host,
+            ctx.models,
+            routeAgent(role, architect.config),
+          );
+          if (selected.error) errors[role] = selected.error;
+          else if (selected.route) routes[role] = selected.route;
+        }
+        const admission: NativeActionAdmission = {
+          actionId: crypto.randomUUID(),
+          skillName: content.name,
+          inputFingerprint: snapshot.fingerprint,
+          selectionFingerprint,
+          allowedRoles: roles,
+          roleRoutes: routes,
+        };
+        if (!current.continue()) {
+          notify(ctx);
+          return result(statusView(), true);
+        }
+        journal("action-selected", {
+          inputFingerprint: admission.inputFingerprint,
+          actionId: admission.actionId,
+          skill: content.name,
+          decision: audit,
+        });
+        journal("action-admitted", {
+          inputFingerprint: admission.inputFingerprint,
+          actionId: admission.actionId,
+          skill: content.name,
+          decision: audit,
+        });
+        activeAction = {
+          skill: content,
+          admission,
+          decision: audit,
+          receipts: [],
+          evidenceArtifacts: new Map(),
+          ...(target.resume ? { resume: target.resume } : {}),
+        };
+        roleRouteErrors.set(admission.actionId, errors);
+        completedFacts = undefined;
+        activity(ctx);
+        return result({
+          decision: audit,
+          action: actionView(activeAction),
+          instruction: actionInstruction(activeAction),
+        });
+      } catch (error) {
         if (signal.aborted)
           error = new AutoPreflightError(
             timeout.signal.aborted
-              ? "Auto stage boundary timed out"
-              : "Auto stage boundary was cancelled or superseded",
+              ? "Auto action boundary timed out"
+              : "Auto action boundary was superseded",
           );
-        const diagnostic = autoStepDiagnostic(stage, error);
-        if (run === current && generation === boundaryGeneration) {
+        if (error instanceof AutoObservationError) {
+          step = error.stage;
+          error = error.cause;
+        }
+        const diagnostic = autoStepDiagnostic(step, error);
+        if (run === current && generation === token) {
           current.stop(signal.aborted ? "cancelled" : "blocked", diagnostic);
           notify(ctx);
         }
         return result({ error: diagnostic }, true);
       } finally {
         clearTimeout(timer);
-        if (generation === boundaryGeneration) inFlight = false;
+        if (generation === token) inFlight = false;
       }
     },
   });
@@ -1027,6 +1283,19 @@ export function createAutoController(
   });
   pi.on("tool_result", (event, ctx) => {
     if (ctx.agent.kind !== "main") return;
+    const call = mainCalls.get(event.toolCallId);
+    if (call) {
+      const list = mainReceipts.get(call.actionId) ?? [];
+      list.push({
+        toolCallId: event.toolCallId,
+        tool: call.tool,
+        isError: event.isError === true,
+        sha256: createHash("sha256").update(JSON.stringify(event.content)).digest("hex"),
+      });
+      mainReceipts.set(call.actionId, list.slice(-128));
+      mainCalls.delete(event.toolCallId);
+    }
+
     nativeWork?.callEnded(
       event.toolCallId,
       (event.details as { __interrupted?: boolean } | undefined)?.__interrupted === true,
@@ -1121,16 +1390,19 @@ export function createAutoController(
       drain?.abort();
       nativeWork = undefined;
       nativeEvidence = undefined;
-      workflow = undefined;
-      hostWorkflow = undefined;
-      admittedBoundary = "";
+      activeAction = undefined;
+      catalog = [];
+      catalogFingerprint = "";
+      history = { records: [], diagnostics: [], valid: true };
+      historyError = null;
+      lastDecision = undefined;
+      spawnAdmissions.clear();
+      roleRouteErrors.clear();
+      mainCalls.clear();
+      mainReceipts.clear();
+      receiptErrors.length = 0;
       boundaryCarriers.clear();
-      workflowError = null;
-      approvedFacts = undefined;
-      reviewingFacts = undefined;
-      completionReminders = 0;
-      verifiedWorkflowFingerprint = "";
-      adviceCache.clear();
+      completedFacts = undefined;
       diagnosticRead = undefined;
       delivery = undefined;
       continuations.clear();
@@ -1310,229 +1582,150 @@ export function createAutoController(
       userTurnOwnsContext = true;
       return "new";
     },
-    spawnGate(agent: string, _invocationKind: string) {
-      if (ownsTurn && run?.status !== "running") return "OMP Auto stopped; no new leaf may start";
-      if (ownsTurn && hostWorkflow && run?.status === "running") {
-        const phase = hostWorkflow.statusView();
-        if (admittedBoundary !== phase.fingerprint)
-          return "Call auto_step for the current host phase and await its Jev direction before starting a leaf";
-        if (agent === "omp-worker" && !["apply", "fix"].includes(phase.phase))
-          return `Host phase ${phase.phase} does not allow implementation/fixer workers`;
-        if (agent === "omp-reviewer" && phase.phase !== "verify")
-          return phase.phase === "apply"
-            ? "Await native work, then call auto_step transition=verify to admit independent checks; keep unfinished test/docs checkboxes pending"
-            : `Host phase ${phase.phase} does not allow a verification leaf; use the independent Architect checkpoint for review`;
-      }
-      if (ownsTurn && bridge.state()?.gate("task", {})) return bridge.state()!.gate("task", {});
-      return ownsTurn && !["omp-worker", "omp-explorer", "omp-reviewer"].includes(agent)
-        ? "OMP Auto permits only native omp-worker, omp-explorer and omp-reviewer leaf roles"
-        : undefined;
+    routeSpawn(event: BeforeSubagentSpawnEvent): {
+      handled: boolean;
+      reason?: string;
+      model?: string;
+    } {
+      const admitted = spawnAdmissions.resolve(event);
+      if (admitted) return { handled: true as const, ...admitted };
+      if (!ownsTurn) return { handled: false as const };
+      return {
+        handled: true as const,
+        reason:
+          "No matching admitted native Auto task owns this spawn; call auto_step and submit its scoped task first",
+      };
+    },
+    rejectToolCall(id: string) {
+      spawnAdmissions.reject(id);
     },
     toolCall(id: string, tool: string, input: Record<string, unknown>, ctx: ExtensionContext) {
       if (!ownsTurn || !run) return;
       if (run.status !== "running") {
         if (["read", "grep", "glob", "find", "ls", "wait", "auto_status"].includes(tool)) return;
-        return "Auto scheduling is held. Await native results or send a new user request; no late Auto execution or review is admitted";
+        return "Auto scheduling is held. Await admitted native results or send a new request; no late execution is admitted";
       }
       if (!run.toolCall(id)) {
         notify(ctx);
         return `OMP Auto ${run.status}: ${run.reason}`;
       }
+      if (inFlight && !["auto_status", "wait"].includes(tool))
+        return "An Auto action boundary is being recorded; await it before admitting more execution";
       const carrier = tool === "eval" && autoStepCarrier(input);
       const messaging =
         tool === "send" ||
         tool === "irc" ||
         (tool === "write" && nativeAgentMessagePath(input) !== undefined);
-      if (hostWorkflow) {
-        const phase = hostWorkflow.statusView();
-        const reviewOnly =
-          (tool === "write" &&
-            reviewWrite(input, bridge.state()?.config.maxReviewBytes ?? 131072)) ||
-          (tool === "eval" &&
-            reviewCarrier(input, bridge.state()?.config.maxReviewBytes ?? 131072));
-        if (!safeMainTools.has(tool) && !reviewOnly && !carrier && !messaging) {
-          if (admittedBoundary !== phase.fingerprint)
-            return "Call auto_step and await the current phase direction before execution";
-          if (tool !== "task" && !["apply", "fix"].includes(phase.phase))
-            return `Host phase ${phase.phase} permits read-only Main tools, native leaf tasks and review handoff only; implementation belongs to admitted apply/fix phases`;
+      const active = activeAction;
+      if (carrier) boundaryCarriers.add(id);
+      if (
+        active &&
+        ![
+          "auto_step",
+          "auto_record",
+          "eval",
+          "auto_status",
+          "architect_checkpoint",
+          "todo",
+          "wait",
+          "task",
+          "send",
+          "irc",
+        ].includes(tool) &&
+        !carrier &&
+        !messaging
+      )
+        mainCalls.set(id, { actionId: active.admission.actionId, tool });
+      if (safeMainTools.has(tool) || carrier) return;
+      const reviewOnly =
+        (tool === "write" && reviewWrite(input, bridge.state()?.config.maxReviewBytes ?? 131072)) ||
+        (tool === "eval" && reviewCarrier(input, bridge.state()?.config.maxReviewBytes ?? 131072));
+      if (reviewOnly) return;
+      if (!active)
+        return "Call auto_step and await admission of an Jev-selected Rasen skill before execution";
+      if (tool === "task") {
+        const tasks = Array.isArray(input.tasks) ? input.tasks : [input];
+        for (const item of tasks) {
+          if (!item || typeof item !== "object")
+            return "Native action task must use an explicit Auto action admission";
+          const task = item as Record<string, unknown>;
+          if (
+            typeof task.task !== "string" ||
+            !task.task
+              .split(/\r?\n/)
+              .some((line) => line.trim() === `Auto action: ${active.admission.actionId}`)
+          )
+            return `Native task prompts must include the exact line Auto action: ${active.admission.actionId}`;
+          if (!active.admission.allowedRoles.includes(String(task.agent)))
+            return `Action ${active.admission.actionId} does not admit this native role`;
+          const role = String(task.agent);
+          const routeError = roleRouteErrors.get(active.admission.actionId)?.[role];
+          if (routeError) return routeError;
+          const route = active.admission.roleRoutes?.[role];
+          if (route && (task.model !== route.selector || task.effort !== undefined))
+            return `Preserve the configured native route for ${role} through native task model=${route.selector} without a conflicting coarse effort override`;
         }
       }
-      if (carrier) boundaryCarriers.add(id);
-
-      if (hostWorkflow) nativeEvidence?.admit(id, tool, input, hostWorkflow.statusView());
+      if (messaging && nativeWork && Object.keys(active.admission.roleRoutes ?? {}).length) {
+        const recipient =
+          tool === "write"
+            ? nativeAgentMessagePath(input)
+                ?.replace(/^agent:\/\//i, "")
+                .split(/[/?#]/)[0]
+            : typeof input.to === "string"
+              ? input.to
+              : undefined;
+        const verified = recipient ? nativeEvidence?.recipient(recipient) : undefined;
+        const role = verified?.role;
+        if (!role)
+          return "The native recipient's role/model route is unverified; use a fresh scoped native task";
+        const routeError = roleRouteErrors.get(active.admission.actionId)?.[role];
+        if (routeError) return routeError;
+        const error = nativeStageReuseError(
+          nativeWork.host,
+          recipient,
+          active.admission.roleRoutes?.[role],
+          verified?.provenance,
+        );
+        if (error) return error;
+      }
+      if (tool === "task") {
+        const gate = bridge.state()?.gate("task", input);
+        if (gate) return gate;
+        const tasks = (Array.isArray(input.tasks) ? input.tasks : [input]) as Array<
+          Record<string, unknown>
+        >;
+        spawnAdmissions.admit(
+          id,
+          active.admission.actionId,
+          tasks.map((task) => ({
+            agent: String(task.agent),
+            ...(typeof task.name === "string" ? { name: task.name } : {}),
+            model:
+              active.admission.roleRoutes?.[String(task.agent)]?.selector ??
+              (bridge.state() ? routeAgent(String(task.agent), bridge.state()!.config) : undefined),
+            constrained: active.admission.roleRoutes?.[String(task.agent)] !== undefined,
+          })),
+        );
+      }
+      nativeEvidence?.admit(id, tool, input, active.admission);
     },
     pendingAsync(exceptCalls: ReadonlySet<string> = new Set()) {
       return nativeWork?.pending(exceptCalls) ?? false;
     },
     async complete(
-      material: ReviewMaterial,
-      ctx: ExtensionContext,
-      toolSignal: AbortSignal | undefined,
-      invocationId: string,
-      completionCalls: ReadonlySet<string> = new Set(),
+      _material: ReviewMaterial,
+      _ctx: ExtensionContext,
+      _toolSignal: AbortSignal | undefined,
+      _invocationId: string,
+      _completionCalls: ReadonlySet<string> = new Set(),
     ): Promise<Verdict> {
-      const current = run;
-      const architect = bridge.state();
-      const reject = (message: string): Verdict =>
-        architect?.rejectReview(
-          "completion",
-          invocationId,
-          message,
-          toolSignal?.aborted ? "caller_cancelled" : "input_rejected",
-        ) ?? { decision: "blocked", summary: message, issues: [] };
-      if (!ownsTurn || !current || !architect || !current.checkTime())
-        return reject("No active Auto run can accept completion evidence");
-      if (inFlight)
-        return reject("Another Auto boundary is active; await it before submitting completion");
-      inFlight = true;
-      const boundaryGeneration = generation;
-      const timeout = new AbortController();
-      const timer = setTimeout(
-        () => timeout.abort(new DOMException("Auto completion timed out", "TimeoutError")),
-        3 * config.cliTimeoutMs + architect.config.reviewTimeoutMs + 1000,
-      );
-      const signal = AbortSignal.any([
-        lifetime.signal,
-        timeout.signal,
-        ...(toolSignal ? [toolSignal] : []),
-      ]);
-      const valid = () =>
-        run === current && ownsTurn && generation === boundaryGeneration && !signal.aborted;
-      approvedFacts = undefined;
-      let stage: AutoCompletionStage = "change snapshot";
-      try {
-        const [snapshot, observedWorkflow] = await Promise.all([
-          autoObservation("change snapshot", () =>
-            readSnapshot(ctx.cwd, current.snapshot.change, cliOptions(), signal),
-          ),
-          autoObservation("workflow", () =>
-            readWorkflow(ctx.cwd, current.snapshot.change, cliOptions(), signal),
-          ),
-        ]);
-        if (!valid()) return reject("Auto completion was cancelled or superseded before review");
-        current.observe(snapshot);
-        stage = "workflow";
-        workflow = observedWorkflow;
-        workflowError = null;
-        const phase = hostWorkflow?.observe(snapshot, observedWorkflow);
-        const effectiveWorkflow = hostWorkflow?.effectiveWorkflow() ?? observedWorkflow;
-        const scope = assessWorkflowScope(effectiveWorkflow);
-        if (!current.checkTime()) {
-          notify(ctx);
-          return reject("Auto stopped before completion review");
-        }
-        if (!phase?.readyForReview || admittedBoundary !== phase.fingerprint)
-          return reject(
-            "The host workflow requires its allowed independent verification and auto_step boundary before completion review",
-          );
-        if (snapshot.state !== "all_done" || !scope.ready || !scope.reviewLoopReady)
-          return reject(
-            `Rasen implementation/verification is not ready for host review: ${scope.reason ?? "remaining tasks"}`,
-          );
-        if (nativeWork?.pending(completionCalls))
-          return reject(
-            "Native Main or child work is active or its termination is unverified; resolve it before completion review",
-          );
-        stage = "validation";
-        await validate(ctx.cwd, snapshot.change, cliOptions(), signal);
-        if (!valid()) return reject("Auto completion verification was cancelled or superseded");
-        const facts = { snapshot: snapshot.fingerprint, workflow: observedWorkflow.fingerprint };
-        reviewingFacts = facts;
-        architect.observe(
-          `rasen:${facts.snapshot}:${facts.workflow}`,
-          "rasen_validate",
-          { change: snapshot.change },
-          `Strict CLI artifact validation passed; tasks ${JSON.stringify(snapshot.tasks)}; progress ${JSON.stringify(snapshot.progress)}; workflow ${JSON.stringify(scope)}; fingerprints ${JSON.stringify(facts)}`,
-          false,
-        );
-        stage = "review";
-        const verdict = await bridge.review(
-          "completion",
-          JSON.stringify({
-            authoredEvidence: {
-              source: "assistant-authored native artifact, not independent proof",
-              ref: material.ref,
-              sha256: material.sha256,
-              content: material.content,
-            },
-            rasen: { source: "fresh host-read context", ...snapshot },
-            nativeVerification: {
-              source:
-                "Host-observed independent OMP task receipts and complete native artifacts; task success is not a test pass",
-              tasks: hostWorkflow?.verificationEvidence(),
-            },
-            workflow: {
-              source: "fresh source observations and host-owned phase evidence",
-              ...effectiveWorkflow,
-              host: phase,
-            },
-            completionScope:
-              "apply and verification complete; this Architect gate owns the sole review cycle; downstream delivery remains pending",
-            validation: {
-              source: "host-executed strict CLI artifact validation",
-              passed: true,
-              ...facts,
-            },
-          }),
-          ctx,
-          signal,
-          invocationId,
-        );
-        if (!valid())
-          return {
-            decision: "blocked",
-            summary: "Auto completion was cancelled or superseded",
-            issues: [],
-          };
-        if (
-          current.snapshot.fingerprint !== facts.snapshot ||
-          workflow?.fingerprint !== facts.workflow ||
-          current.observationError ||
-          workflowError
-        ) {
-          architect.revokeApproval("completion");
-          return {
-            decision: "blocked",
-            summary: "Rasen evidence changed during review; submit fresh completion evidence",
-            issues: ["The reviewed facts are stale"],
-          };
-        }
-        if (nativeWork?.pending(completionCalls)) {
-          architect.revokeApproval("completion");
-          return reject(
-            "Native Main or child work became active or unverified during review; resolve it and submit fresh evidence",
-          );
-        }
-        if (
-          architect.lastReview?.invocationId === invocationId &&
-          (architect.lastReview.charged || architect.lastReview.status === "cache_hit")
-        )
-          hostWorkflow?.recordReview(verdict, {
-            approved: architect.completionApproved,
-            exhausted: architect.phaseReviews.completion >= architect.config.reviews.max,
-          });
-        if (verdict.decision === "approve" && architect.completionApproved) approvedFacts = facts;
-        activity(ctx);
-        return verdict;
-      } catch (error) {
-        if (error instanceof AutoObservationError) {
-          stage = error.stage;
-          error = error.cause;
-        }
-        if (signal.aborted)
-          error = new AutoPreflightError(
-            timeout.signal.aborted
-              ? "Auto completion boundary timed out"
-              : "Auto completion was cancelled or superseded",
-          );
-        return reject(autoCompletionDiagnostic(stage, error));
-      } finally {
-        clearTimeout(timer);
-        if (generation === boundaryGeneration) {
-          inFlight = false;
-          reviewingFacts = undefined;
-        }
-      }
+      return {
+        decision: "blocked",
+        summary:
+          "Auto uses actual skill outcomes and Jev's next-action selection. Call auto_step at the selected skill's boundary; no outer Architect completion loop is added.",
+        issues: [],
+      };
     },
     async onStop(
       event: SessionStopEvent,
@@ -1540,9 +1733,7 @@ export function createAutoController(
     ): Promise<{ handled: boolean; result?: { continue: boolean; additionalContext: string } }> {
       if (!ownsTurn || !run) return { handled: false };
       const current = run;
-      if (event.signal.aborted) {
-        current.stop("cancelled", "Run cancelled");
-      }
+      if (event.signal.aborted) current.stop("cancelled", "Run cancelled");
       if (!current.checkTime()) {
         notify(ctx);
         return { handled: true };
@@ -1553,106 +1744,51 @@ export function createAutoController(
         return { handled: true };
       }
       inFlight = true;
-      const boundaryGeneration = generation;
+      const token = generation;
       const timeout = new AbortController();
-      const timer = setTimeout(
-        () => timeout.abort(new DOMException("Auto boundary timed out", "TimeoutError")),
-        24000,
-      );
+      const timer = setTimeout(() => timeout.abort(), Math.max(24000, config.cliTimeoutMs * 3));
       const signal = AbortSignal.any([event.signal, lifetime.signal, timeout.signal]);
       try {
-        const [snapshot, observedWorkflow] = await Promise.all([
-          readSnapshot(ctx.cwd, current.snapshot.change, cliOptions(), signal),
-          readWorkflow(ctx.cwd, current.snapshot.change, cliOptions(), signal),
-        ]);
+        const snapshot = await readSnapshot(ctx.cwd, current.snapshot.change, cliOptions(), signal);
         if (run !== current || !ownsTurn || signal.aborted) return { handled: true };
-        current.observe(snapshot);
-        workflow = observedWorkflow;
-        workflowError = null;
-        if (run !== current || !ownsTurn || signal.aborted) return { handled: true };
+        current.observe(snapshot, false);
+        catalog = observeCatalog(ctx);
+        catalogFingerprint = catalogueHash(catalog);
+        history = readHistory(ctx, snapshot);
+        historyError = null;
         if (!current.checkTime()) {
           notify(ctx);
           return { handled: true };
         }
-        if (nativeWork?.pending()) {
-          // Let OMP deliver pending results and resume its ordinary native turn.
-          // Auto neither manufactures a retry turn nor cancels the children.
-          return { handled: true };
-        }
-        const architect = bridge.state();
-        if (!architect) {
-          current.stop("blocked", "Architect is unavailable");
-          notify(ctx);
-          return { handled: true };
-        }
-        const last = event.last_assistant_message;
-        const summary =
-          last && "content" in last && Array.isArray(last.content)
-            ? last.content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n")
-            : "";
-        if (!summary.trim()) {
+        if (nativeWork?.pending()) return { handled: true };
+        await collectActionEvidence(signal);
+        if (run !== current || !ownsTurn || signal.aborted) return { handled: true };
+        if (
+          !activeAction &&
+          completedFacts?.snapshot === snapshot.fingerprint &&
+          completedFacts.catalog === catalogFingerprint &&
+          completedFacts.history === hash(history.records) &&
+          !current.observationError &&
+          !historyError &&
+          !bridge.state()?.gate("task", {}) &&
+          !bridge.state()?.reviewInProgress
+        )
+          current.stop(
+            "completed",
+            "Requested outcome selected from fresh evidence; admitted native work is settled",
+          );
+        else
           current.stop(
             "needs_user",
-            "The Rasen LEAD stopped without a final evidence summary; completion is unverified",
+            "Native Main stopped without a current evidence-based finish decision; retain skill/native progress and explicitly resume when ready",
           );
-          notify(ctx);
-          return { handled: true };
-        }
-        const hostPhase = hostWorkflow?.observe(snapshot, observedWorkflow);
-        const scope = assessWorkflowScope(hostWorkflow?.effectiveWorkflow() ?? workflow);
-        if (snapshot.state === "all_done" && scope.ready && scope.reviewLoopReady) {
-          await validate(ctx.cwd, snapshot.change, cliOptions(), signal);
-          if (run !== current || !ownsTurn || signal.aborted) return { handled: true };
-          if (
-            approvedFacts?.snapshot === snapshot.fingerprint &&
-            approvedFacts.workflow === observedWorkflow.fingerprint &&
-            current.snapshot.fingerprint === snapshot.fingerprint &&
-            workflow?.fingerprint === observedWorkflow.fingerprint &&
-            !current.observationError &&
-            !workflowError &&
-            architect.completionApproved &&
-            hostPhase?.phase === "settled"
-          ) {
-            verifiedWorkflowFingerprint = observedWorkflow.fingerprint;
-            current.stop(
-              "completed",
-              "Scoped Rasen implementation and verification are complete, strict validation passed, and the sole Architect review loop is approved; downstream pipeline delivery remains pending",
-            );
-          } else if (
-            architect.phaseReviews.completion >= architect.config.reviews.max ||
-            completionReminders >= architect.config.reviews.max
-          ) {
-            current.stop(
-              "blocked",
-              "Architect completion review remains unresolved within its bounded review/reminder limit",
-            );
-          } else {
-            completionReminders++;
-            return {
-              handled: true,
-              result: continuation(
-                ctx,
-                prompt(
-                  snapshot,
-                  "Completion is unverified. Write the full native evidence file and call architect_checkpoint phase=completion. Await its verdict and any required independent rounds in this same native turn; do not merely return another summary.",
-                ),
-              ),
-            };
-          }
-          notify(ctx);
-          return { handled: true };
-        }
-        current.stop(
-          "needs_user",
-          "The Rasen LEAD stopped before the scoped workflow completed; inspect fresh progress and explicitly resume when ready",
-        );
         notify(ctx);
         return { handled: true };
       } catch {
         if (run === current && ownsTurn) {
           current.stop(
             event.signal.aborted ? "cancelled" : "blocked",
-            "Auto snapshot, validation, or boundary failed; completion is unverified",
+            "Auto observation or native boundary failed; completion is unverified",
           );
           notify(ctx);
         }
@@ -1666,7 +1802,7 @@ export function createAutoController(
           notify(ctx);
         }
         clearTimeout(timer);
-        if (boundaryGeneration === generation) inFlight = false;
+        if (token === generation) inFlight = false;
       }
     },
   };

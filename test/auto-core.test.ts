@@ -48,12 +48,21 @@ test("Auto allows explicit starts by default; strict config rejects unknown keys
   expect(parseAutoConfig({ enabled: true, fallback: "stop", maxFallbacks: 0 }).enabled).toBe(true);
 });
 
+test("CLI supervision remains finite and supports slower real Rasen startup", () => {
+  expect(parseAutoConfig({}).cliTimeoutMs).toBe(10000);
+  for (const cliTimeoutMs of [100, 5000, 10000, 30000])
+    expect(parseAutoConfig({ cliTimeoutMs }).cliTimeoutMs).toBe(cliTimeoutMs);
+  for (const cliTimeoutMs of [0, 99, 30001, Infinity, null])
+    expect(() => parseAutoConfig({ cliTimeoutMs })).toThrow();
+});
+
 test("hard turn and tool caps count attempts; repeated delivery cannot reset budget", () => {
   const run = new AutoRun(parseAutoConfig({ maxSteps: 2, maxToolCalls: 2 }), snapshot());
   expect(run.toolCall("a")).toBe(true);
   expect(run.toolCall("a")).toBe(true);
   expect(run.toolCall("b")).toBe(true);
   expect(run.toolCalls).toBe(2);
+  expect(run.continue()).toBe(true);
   expect(run.continue()).toBe(true);
   expect(run.continue()).toBe(false);
   expect(run.status).toBe("budget_exhausted");
@@ -98,17 +107,17 @@ test("stall budget uses new completed task IDs, not instruction/fingerprint chur
   expect(run.status).toBe("stalled");
 });
 
-test("changing scope or removing tasks requires a new user start; all_done never self-approves", () => {
+test("planning may change tasks while fixed change identity remains guarded", () => {
   const run = new AutoRun(parseAutoConfig({}), snapshot());
   const changed = snapshot();
   changed.tasks.pop();
   run.observe(changed);
-  expect(run.status).toBe("needs_user");
+  expect(run.status).toBe("running");
   const renamed = new AutoRun(parseAutoConfig({}), snapshot());
   const changedText = snapshot();
   changedText.tasks[0].description = "Different objective";
   renamed.observe(changedText);
-  expect(renamed.status).toBe("needs_user");
+  expect(renamed.status).toBe("running");
   for (const changedIdentity of [{ root: "/other" }, { schema: "other-schema" }]) {
     const identity = new AutoRun(parseAutoConfig({}), snapshot());
     identity.observe({ ...snapshot(), ...changedIdentity });
@@ -446,4 +455,181 @@ test("initial stop evidence survives drainage and status callers cannot mutate i
     outcome: "stalled",
     initialStop: { at: 100000, status: "stalled", reason: "No native output" },
   });
+});
+
+test("native action progress resets stall supervision without claiming change completion", () => {
+  const run = new AutoRun(parseAutoConfig({ maxStalls: 2 }), snapshot());
+  run.observe(snapshot());
+  expect(run.stalls).toBe(1);
+  run.actionProgress("propose:done");
+  expect(run.stalls).toBe(0);
+  run.observe({ ...snapshot(), state: "blocked" });
+  expect(run.status).toBe("running");
+  run.actionProgress("apply:done");
+  expect(run.stalls).toBe(0);
+  expect(run.statusView().completionVerified).toBe(false);
+});
+
+test("a completed native action does not immediately spend a one-observation stall budget", () => {
+  const run = new AutoRun(parseAutoConfig({ maxStalls: 1 }), snapshot());
+  run.actionProgress("propose:done");
+  run.observe(snapshot());
+  expect(run.stalls).toBe(0);
+  expect(run.continue()).toBe(true);
+  run.actionProgress("propose:done");
+  run.observe(snapshot());
+  expect(run.stalls).toBe(1);
+  expect(run.continue()).toBe(false);
+});
+
+const dynamicChoices = {
+  skill_0: 'Skill "continue": Create the next missing artifact.',
+  skill_1: 'Skill "apply": Implement ready change tasks.',
+  skill_2: 'Skill "verify": Verify work against the change.',
+  finish:
+    "Propose finishing only with supporting change/history evidence; requires controller validation.",
+  needs_user: "Missing user input or permission.",
+  uncertain: "No sufficiently supported next option.",
+};
+
+test("dynamic skills and finish are routing proposals, never automatic completion", async () => {
+  for (const choice of ["skill_0", "skill_1", "skill_2", "finish"]) {
+    const run = new AutoRun(parseAutoConfig({}), snapshot());
+    const result = await run.decide(
+      { ...evidence, choices: dynamicChoices },
+      async () => ({ choice, confidence: 0.95 }),
+      undefined,
+      signal(),
+    );
+    expect(result).toEqual({ choice, confidence: 0.95 });
+    expect(run.status).toBe("running");
+    expect(run.statusView().completionVerified).toBe(false);
+    expect(run.statusView().decisionDiagnostics.attempts).toMatchObject([
+      { provider: "jev", outcome: "accepted", choice, confidence: 0.95 },
+    ]);
+  }
+});
+
+test("dynamic candidates retain confidence, exact-set fallback validation, and no retries", async () => {
+  for (const primaryChoice of ["continue", "replan", "skill_99", "uncertain", "skill_0"]) {
+    const run = new AutoRun(parseAutoConfig({}), snapshot());
+    let primaryCalls = 0;
+    let fallbackCalls = 0;
+    const result = await run.decide(
+      { ...evidence, choices: dynamicChoices },
+      async () => {
+        primaryCalls++;
+        return { choice: primaryChoice, confidence: primaryChoice === "skill_0" ? 0.5 : 0.95 };
+      },
+      async (input) => {
+        fallbackCalls++;
+        expect(input.choices).toEqual(dynamicChoices);
+        return { choice: "skill_2", confidence: 0.95 };
+      },
+      signal(),
+    );
+    expect(result?.choice).toBe("skill_2");
+    expect(primaryCalls).toBe(1);
+    expect(fallbackCalls).toBe(1);
+    expect(run.decisions).toBe(1);
+    expect(run.fallbacks).toBe(1);
+  }
+  const invalidFallback = new AutoRun(parseAutoConfig({}), snapshot());
+  await invalidFallback.decide(
+    { ...evidence, choices: dynamicChoices },
+    async () => ({ choice: "uncertain", confidence: 1 }),
+    async () => ({ choice: "replan", confidence: 1 }),
+    signal(),
+  );
+  expect(invalidFallback.status).toBe("uncertain");
+  expect(invalidFallback.statusView().decisionDiagnostics.attempts[1].outcome).toBe(
+    "invalid_response",
+  );
+});
+
+test("dynamic needs_user still stops admission and exact catalogs survive caller mutation", async () => {
+  const run = new AutoRun(parseAutoConfig({}), snapshot());
+  const choices: Record<string, string> = { ...dynamicChoices };
+  const selected = await run.decide(
+    { ...evidence, choices },
+    async (input) => {
+      delete choices.skill_1;
+      choices.skill_99 = "Added after decision began";
+      expect(Object.isFrozen(input.choices)).toBe(true);
+      return { choice: "skill_1", confidence: 0.95 };
+    },
+    undefined,
+    signal(),
+  );
+  expect(selected?.choice).toBe("skill_1");
+  await run.decide(
+    { ...evidence, choices: dynamicChoices },
+    async () => ({ choice: "needs_user", confidence: 1 }),
+    undefined,
+    signal(),
+  );
+  expect(run.status).toBe("needs_user");
+  expect(run.continue()).toBe(false);
+  expect(run.toolCall("mutation")).toBe(false);
+});
+
+test("invalid and oversized catalogs stop before either provider, without partial catalogs", async () => {
+  for (const [choices, code] of [
+    [{}, "JEV_INVALID_EVIDENCE"],
+    [{ skill_0: "x".repeat(65537) }, "JEV_CATALOG_TOO_LARGE"],
+  ] as const) {
+    const run = new AutoRun(parseAutoConfig({}), snapshot());
+    let calls = 0;
+    const provider: DecisionProvider = async () => {
+      calls++;
+      return { choice: "skill_0", confidence: 1 };
+    };
+    expect(
+      await run.decide({ ...evidence, choices }, provider, provider, signal()),
+    ).toBeUndefined();
+    expect(run.status).toBe("uncertain");
+    expect(calls).toBe(0);
+    expect(run.fallbacks).toBe(0);
+    expect(run.statusView().decisionDiagnostics.attempts).toMatchObject([
+      { outcome: "error", errorCode: code },
+    ]);
+  }
+});
+
+test("primary and fallback see the same bounded immutable history and complete catalog", async () => {
+  const run = new AutoRun(parseAutoConfig({ maxEvidenceChars: 1000 }), snapshot());
+  let first: DecisionEvidence | undefined;
+  const result = await run.decide(
+    { ...evidence, summary: "x".repeat(3000), choices: dynamicChoices },
+    async (input) => {
+      first = input;
+      expect(input.summary).toContain("[Evidence truncated]");
+      expect(input.summary.length).toBeLessThan(1000);
+      expect(input.choices).toEqual(dynamicChoices);
+      return { choice: "uncertain", confidence: 1 };
+    },
+    async (input) => {
+      expect(input).toBe(first!);
+      expect(Object.isFrozen(input)).toBe(true);
+      expect(input.choices).toEqual(dynamicChoices);
+      return { choice: "skill_2", confidence: 0.99 };
+    },
+    signal(),
+  );
+  expect(result?.choice).toBe("skill_2");
+});
+
+test("caller cancellation wins over an invalid candidate catalog", async () => {
+  const run = new AutoRun(parseAutoConfig({}), snapshot());
+  const caller = new AbortController();
+  caller.abort();
+  let calls = 0;
+  const provider: DecisionProvider = async () => {
+    calls++;
+    return { choice: "skill_0", confidence: 1 };
+  };
+  await run.decide({ ...evidence, choices: {} }, provider, provider, caller.signal);
+  expect(run.status).toBe("cancelled");
+  expect(calls).toBe(0);
+  expect(run.statusView().decisionDiagnostics.attempts[0].errorCode).toBe("DECISION_CANCELLED");
 });

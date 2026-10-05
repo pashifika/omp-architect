@@ -19,7 +19,9 @@ import { MemorySessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-
 import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { extensionFactory } from "../src/extension.ts";
 import type { RasenSnapshot } from "../src/auto/rasen.ts";
-import { fallbackWorkflow } from "../src/auto/workflow.ts";
+import { loadSkillsFromDir } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
+import { readAutoHistory, type AutoEvent } from "../src/auto/journal.ts";
+import type { NativeActionAdmission } from "../src/auto/evidence.ts";
 import { withAgentDir } from "./isolated-host.ts";
 
 type Mode =
@@ -130,6 +132,7 @@ async function nativeFixture(
   const mainContexts: string[] = [];
   const mainEnds: Array<{ isTerminal?: boolean; awaitingAsyncWork?: boolean }> = [];
   const mainTools: string[] = [];
+  const mainToolResults: unknown[] = [];
   const leafResult = `Synthetic native leaf result ${id}`;
   let releaseChild: (() => void) | undefined;
   let releaseMain: (() => void) | undefined;
@@ -142,6 +145,10 @@ async function nativeFixture(
   let childRequests = 0;
   let childAborted = false;
   let reviews = 0;
+  let action:
+    | { actionId: string; skill: { name: string }; admission: NativeActionAdmission }
+    | undefined;
+  const decisions: Array<{ summary: string; skill: string }> = [];
   let childStarted!: () => void;
   const started = new Promise<void>((resolve) => {
     childStarted = resolve;
@@ -182,8 +189,8 @@ async function nativeFixture(
         main && request === 1
           ? [
               call("auto_step", {
-                summary: "Admit the extension-owned implementation boundary",
-                ...(pendingVerification ? { transition: "verify" } : {}),
+                summary:
+                  "Choose the existing fixture skill using actual native catalogue and change facts",
               }),
             ]
           : main && request === 2
@@ -191,7 +198,8 @@ async function nativeFixture(
                 call("task", {
                   name: id,
                   agent,
-                  task: "Execute the local fake-provider test assignment once",
+                  task: `Auto action: ${action!.actionId}\nExecute the local fake-provider test assignment once`,
+                  model: action!.admission.roleRoutes?.[agent]?.selector,
                   solutionSpace: "Only the fixture action and one terminal yield",
                 }),
               ]
@@ -205,6 +213,11 @@ async function nativeFixture(
                 ? [
                     call("auto_step", {
                       summary: "Consume only the newly settled native verification receipt",
+                      result: {
+                        actionId: action!.actionId,
+                        status: "success",
+                        note: leafResult,
+                      },
                     }),
                   ]
                 : main &&
@@ -213,7 +226,7 @@ async function nativeFixture(
                   ? [
                       call("write", {
                         path: `agent://${id}`,
-                        content: "Recheck the native fixture and yield a fresh result",
+                        content: `Auto action: ${action!.actionId}\nRecheck the native fixture and yield a fresh result`,
                       }),
                     ]
                   : main && detached && mainMode === "wait" && request === 3
@@ -248,7 +261,18 @@ async function nativeFixture(
                                   "yield",
                                   mode === "child-abort"
                                     ? { error: "Synthetic child cancellation" }
-                                    : { data: leafResult },
+                                    : {
+                                        data: JSON.stringify({
+                                          fixtureResult: {
+                                            skill: action!.skill.name,
+                                            status:
+                                              mode === "prompt" || mode === "deny"
+                                                ? "needs_user"
+                                                : "success",
+                                            note: leafResult,
+                                          },
+                                        }),
+                                      },
                                 ),
                               ]
                             : [];
@@ -354,20 +378,24 @@ async function nativeFixture(
     snapshot.progress = { total: 1, complete: 1, remaining: 0 };
     snapshot.tasks[0]!.done = true;
   }
-  const verificationWorkflow = fallbackWorkflow(snapshot);
-  verificationWorkflow.fingerprint = "two-sequential-checks";
-  if (!activeSteering && !pendingVerification)
-    verificationWorkflow.stages.push({
-      id: "security",
-      kind: "standard",
-      skill: "rasen-verify-change",
-      role: "research",
-      runtime: "omp",
-      dispatchMode: "native",
-      requires: ["verify"],
-      status: "pending",
-    });
-  if (!activeSteering && !pendingVerification) verificationWorkflow.remaining.push("security");
+  // These are genuine native-loaded fixture skills, not a private stageContext.
+  // The built-Rasen suite separately exercises upstream-generated bodies.
+  for (const [name, description] of [
+    ["rasen-apply", "Implement the local native transport fixture"],
+    ["rasen-verify", "Review the local fixture even when implementation checkboxes remain"],
+    ["rasen-security", "Perform an independent follow-up check using a fresh native receipt"],
+    ["rasen-ship", "Ship only after separate user approval"],
+  ]) {
+    await Bun.write(
+      path.join(cwd, ".omp", "skills", name!, "SKILL.md"),
+      `---\nname: ${name}\ndescription: ${description}\n---\n\nExecute only the scoped native fixture. Keep approvals and return factual evidence.\n`,
+    );
+  }
+  const loaded = await loadSkillsFromDir({
+    dir: path.join(cwd, ".omp", "skills"),
+    source: "fixture:project",
+  });
+  expect(loaded.warnings).toEqual([]);
   const sessionManager = SessionManager.inMemory(cwd);
   sessionManager.adoptArtifactManager(new ArtifactManager(path.join(cwd, ".test-artifacts")));
   const created = await createAgentSession({
@@ -389,17 +417,29 @@ async function nativeFixture(
           },
           {
             snapshot: async () => snapshot,
-            workflow: async () =>
-              verification
-                ? verificationWorkflow
-                : {
-                    kind: "absent",
-                    change: "fixture-change",
-                    reason: "Synthetic pipeline not yet recorded",
-                    fingerprint: "absent",
-                  },
-            validate: async () => {},
-            decision: () => async () => ({ choice: "continue", confidence: 0.99 }),
+            decision: () => async (evidence) => {
+              const facts = JSON.parse(evidence.summary);
+              const settled = facts.nativeHistory.filter(
+                (record: { kind: string }) => record.kind === "action-settled",
+              );
+              const name =
+                settled.length === 0
+                  ? verification
+                    ? "rasen-verify"
+                    : "rasen-apply"
+                  : verification && !activeSteering && !pendingVerification && settled.length === 1
+                    ? "rasen-security"
+                    : "rasen-ship";
+              const selected = Object.entries(evidence.choices ?? {}).find(([, criterion]) =>
+                criterion.startsWith(`Execute existing native skill ${name}: `),
+              );
+              expect(selected).toBeDefined();
+              expect(evidence.choices![selected![0]]).toContain(
+                loaded.skills.find((skill) => skill.name === name)!.description,
+              );
+              decisions.push({ summary: evidence.summary, skill: name });
+              return { choice: selected![0], confidence: 0.99 };
+            },
           },
         ),
         path.join(cwd, "isolated-agent"),
@@ -416,6 +456,11 @@ async function nativeFixture(
           if (ctx.agent.kind === "main") mainTools.push(event.toolName);
         });
         pi.on("tool_result", (event, ctx) => {
+          if (ctx.agent.kind === "main" && event.toolName === "auto_step") {
+            const text = event.content.find((part) => part.type === "text");
+            const boundary = JSON.parse(text?.type === "text" ? text.text : "null");
+            if (boundary?.action) action = boundary.action;
+          }
           if (ctx.agent.kind === "main" && event.toolName === "task")
             taskResults.push({ isError: event.isError, details: event.details });
           if (ctx.agent.kind === "main" && event.toolName === "write")
@@ -424,7 +469,7 @@ async function nativeFixture(
       },
     ],
     disableExtensionDiscovery: true,
-    skills: [],
+    skills: loaded.skills,
     rules: [],
     contextFiles: [],
     promptTemplates: [],
@@ -448,6 +493,7 @@ async function nativeFixture(
   // notifications expose willContinue but deliberately omit that native marker.
   const unsubscribe = session.subscribe((event) => {
     if (event.type === "agent_end") mainEnds.push(event);
+    if (event.type === "tool_execution_end") mainToolResults.push(event);
   });
   await initializeExtensions(session, {
     reportSendError: (_action, error) => {
@@ -474,6 +520,7 @@ async function nativeFixture(
     id,
     session,
     nativeExecutors,
+    nativeModel: `${provider}/leaf`,
     started,
     start,
     lifecycles,
@@ -482,7 +529,27 @@ async function nativeFixture(
     mainContexts,
     mainEnds,
     mainTools,
+    mainToolResults,
     leafResult,
+    decisions,
+    journal() {
+      const history = readAutoHistory(sessionManager, {
+        change: snapshot.change,
+        root: cwd,
+        schema: snapshot.schema,
+      });
+      expect(history.valid).toBe(true);
+      expect(history.diagnostics).toEqual([]);
+      return history.records;
+    },
+    async receiptBundle(event: AutoEvent) {
+      const receipt = event.nativeReceipts![0]!;
+      const file = await sessionManager.getArtifactPath(
+        String(receipt.artifactRef).replace(/^artifact:\/\//, ""),
+      );
+      if (!file) throw new Error("Native receipt artifact is missing");
+      return JSON.parse(await fs.readFile(file, "utf8"));
+    },
     releaseChild() {
       if (!releaseChild) throw new Error("Native child stream has not reached its fixture gate");
       releaseChild();
@@ -537,15 +604,26 @@ test("actual native reviewer runs before pending verification checkboxes are mar
     expect(fixture.taskResults[0]).toMatchObject({
       isError: false,
       details: {
-        results: [expect.objectContaining({ exitCode: 0, aborted: false, modelRole: "architect" })],
+        results: [
+          expect.objectContaining({
+            exitCode: 0,
+            aborted: false,
+            agent: "omp-reviewer",
+            resolvedModelIdentity: fixture.nativeModel,
+          }),
+        ],
       },
     });
     expect(await pausedStatus(fixture)).toMatchObject({
       status: "paused",
       completionVerified: false,
       progress: { complete: 0, remaining: 1 },
-      hostWorkflow: { phase: "apply", verifiedStages: ["verify"], readyForReview: false },
+      selectedAction: { skill: { name: "rasen-ship" } },
     });
+    expect(fixture.journal().filter((record) => record.kind === "action-settled")).toMatchObject([
+      { skill: "rasen-verify", outcome: "success", nativeReceipts: [{ count: 1 }] },
+    ]);
+    expect(fixture.decisions.map((entry) => entry.skill)).toEqual(["rasen-verify", "rasen-ship"]);
     expect(fixture.counts()).toMatchObject({ childRequests: 1, childAborted: false, reviews: 0 });
     for (const [name, execute] of fixture.nativeExecutors)
       expect(fixture.session.getToolByName(name)?.execute).toBe(execute);
@@ -575,7 +653,8 @@ for (const mode of ["success", "prompt", "deny", "child-abort", "recursion"] as 
         expect(result.results[0]).toMatchObject({
           exitCode: 0,
           aborted: false,
-          modelRole: "implementation",
+          agent: "omp-worker",
+          resolvedModelIdentity: fixture.nativeModel,
         });
         expect(fixture.counts().childRequests).toBe(mode === "recursion" ? 2 : 1);
         if (mode === "recursion") {
@@ -590,7 +669,7 @@ for (const mode of ["success", "prompt", "deny", "child-abort", "recursion"] as 
       } else {
         expect(status.status).toBe("paused");
         expect(status.outcome).toBe("needs_user");
-        expect(status.reason).toMatch(/native|worker|authoriz|cancel|scoped workflow/i);
+        expect(status.reason).toMatch(/native|worker|authoriz|cancel|skill|boundary/i);
         if (mode === "prompt" || mode === "deny") {
           const refusal = fixture.childEvents.find(
             ({ event }) =>
@@ -678,7 +757,19 @@ async function detachedJob(fixture: NativeFixture, mainMode: "pause" | "wait" | 
   expect(
     fixture.lifecycles.filter((event) => event.status === "started" && event.detached === true),
   ).toHaveLength(1);
-  expect(await fixture.status()).toMatchObject({ status: "running", completionVerified: false });
+  const admitted = await fixture.status();
+  expect(admitted).toMatchObject({ status: "running", completionVerified: false });
+  expect(admitted.selectedAction).toMatchObject({
+    actionId: expect.any(String),
+    admission: { actionId: admitted.selectedAction.actionId },
+    receipts: [],
+  });
+  const records = fixture.journal();
+  expect(records.filter((record) => record.kind === "action-admitted")).toMatchObject([
+    { actionId: admitted.selectedAction.actionId, skill: admitted.selectedAction.skill.name },
+  ]);
+  expect(records.filter((record) => record.kind === "action-settled")).toEqual([]);
+  expect(fixture.decisions).toHaveLength(1);
   const row = fixture.session
     .getAsyncJobSnapshot()
     ?.running.find((job) => job.agentId === fixture.id);
@@ -752,10 +843,10 @@ for (const [mode, mainMode] of [
         expect(refusal).toBeDefined();
         expect(JSON.stringify(refusal)).toMatch(/requires approval|blocked by user policy/);
         expect(fixture.counts().childRequests).toBe(2);
-        expect(status.reason).toMatch(/authoriz|denied|policy|scoped workflow/i);
+        expect(status.reason).toMatch(/authoriz|denied|policy|skill|boundary/i);
       } else {
         expect(fixture.lifecycles.some((event) => event.status === "aborted")).toBe(true);
-        expect(status.reason).toMatch(/native|worker|cancel|scoped workflow/i);
+        expect(status.reason).toMatch(/native|worker|cancel|skill|boundary/i);
       }
     } finally {
       await fixture.close();
@@ -827,10 +918,21 @@ for (const interruption of ["auto stop", "new user input"] as const) {
       expect(fixture.errors).toEqual([]);
       expect(fixture.counts()).toMatchObject({ childRequests: 1, childAborted: false, reviews: 0 });
       expect(JSON.stringify(fixture.session.messages)).toContain(fixture.leafResult);
-      expect(await pausedStatus(fixture)).toMatchObject({
+      const settled = await pausedStatus(fixture);
+      expect(settled).toMatchObject({
         status: "paused",
         completionVerified: false,
       });
+      const records = fixture.journal();
+      expect(records.filter((record) => record.kind === "action-settled")).toEqual([]);
+      const held = records.find((record) => record.kind === "action-held")!;
+      expect(held).toMatchObject({ skill: "rasen-apply", nativeReceipts: [{ count: 1 }] });
+      expect((await fixture.receiptBundle(held)).receipts).toEqual([
+        expect.objectContaining({
+          agentId: fixture.id,
+          artifactSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+        }),
+      ]);
     } finally {
       releaseUnrelated.resolve();
       await fixture.close();
@@ -943,7 +1045,11 @@ for (const targetState of ["active", "idle", "parked"] as const) {
       await waitUntil(
         () => fixture.messageResults.length === 1,
         "Main native agent:// message receipt",
-      );
+      ).catch((error) => {
+        throw new Error(
+          `${error.message}; native results=${JSON.stringify(fixture.mainToolResults)}`,
+        );
+      });
       expect(fixture.messageResults[0]!.isError).toBe(false);
       for (const [name, execute] of fixture.nativeExecutors) {
         expect(fixture.session.getToolByName(name)?.execute).toBe(execute);
@@ -1006,11 +1112,10 @@ for (const targetState of ["idle", "parked"] as const) {
       const firstJob = await detachedJob(fixture, "stream");
       const ref = AgentRegistry.global().get(fixture.id)!;
       const initialSession = ref.session;
-      expect((await fixture.status()).hostWorkflow).toMatchObject({
-        phase: "verify",
-        stage: "verify",
-        verifiedStages: [],
+      expect((await fixture.status()).selectedAction).toMatchObject({
+        skill: { name: "rasen-verify" },
       });
+      expect(fixture.journal().filter((record) => record.kind === "action-settled")).toEqual([]);
       fixture.releaseChild();
       await firstJob.promise;
       await waitUntil(() => ref.status === targetState, `first reviewer ${targetState}`);
@@ -1034,12 +1139,7 @@ for (const targetState of ["idle", "parked"] as const) {
       // while the new native request is running, cannot certify security.
       expect(await fixture.status()).toMatchObject({
         completionVerified: false,
-        hostWorkflow: {
-          phase: "verify",
-          stage: "security",
-          verifiedStages: ["verify"],
-          readyForReview: false,
-        },
+        selectedAction: { skill: { name: "rasen-security" }, receipts: [] },
       });
       fixture.releaseChild();
       await ref.session!.waitForIdle();
@@ -1051,11 +1151,18 @@ for (const targetState of ["idle", "parked"] as const) {
       await running;
       await fixture.session.settleAsyncWork();
       const status = await pausedStatus(fixture);
-      expect(status.hostWorkflow).toMatchObject({
-        phase: "review",
-        verifiedStages: ["verify", "security"],
-        readyForReview: true,
-      });
+      expect(status.selectedAction).toMatchObject({ skill: { name: "rasen-ship" } });
+      const settled = fixture.journal().filter((record) => record.kind === "action-settled");
+      expect(settled.map((record) => record.skill)).toEqual(["rasen-verify", "rasen-security"]);
+      const bundles = await Promise.all(settled.map((record) => fixture.receiptBundle(record)));
+      expect(bundles.map((bundle) => bundle.receipts[0].agentId)).toEqual([fixture.id, fixture.id]);
+      expect(bundles[0].receipts[0].receiptId).not.toBe(bundles[1].receipts[0].receiptId);
+      expect(bundles[0].actionId).not.toBe(bundles[1].actionId);
+      expect(fixture.decisions.map((entry) => entry.skill)).toEqual([
+        "rasen-verify",
+        "rasen-security",
+        "rasen-ship",
+      ]);
       expect(status.completionVerified).toBe(false);
       expect(fixture.counts()).toMatchObject({ childRequests: 2, childAborted: false, reviews: 0 });
       expect(fixture.errors).toEqual([]);
@@ -1097,7 +1204,7 @@ test("Auto accepts the original native reviewer task after active steering settl
     expect(await fixture.status()).toMatchObject({
       completionVerified: false,
       nativeWork: { pending: true },
-      hostWorkflow: { phase: "verify", verifiedStages: [], readyForReview: false },
+      selectedAction: { skill: { name: "rasen-verify" }, result: null },
     });
     fixture.releaseChild();
     await original.promise;
@@ -1106,11 +1213,16 @@ test("Auto accepts the original native reviewer task after active steering settl
     fixture.releaseMain();
     await running;
     await fixture.session.settleAsyncWork();
-    expect((await pausedStatus(fixture)).hostWorkflow).toMatchObject({
-      phase: "review",
-      verifiedStages: ["verify"],
-      readyForReview: true,
+    expect((await pausedStatus(fixture)).selectedAction).toMatchObject({
+      skill: { name: "rasen-ship" },
     });
+    const settled = fixture.journal().filter((record) => record.kind === "action-settled");
+    expect(settled).toMatchObject([{ skill: "rasen-verify", outcome: "success" }]);
+    const bundle = await fixture.receiptBundle(settled[0]!);
+    expect(
+      bundle.receipts.some((receipt: { agentId?: string }) => receipt.agentId === fixture.id),
+    ).toBe(true);
+    expect(fixture.decisions.map((entry) => entry.skill)).toEqual(["rasen-verify", "rasen-ship"]);
     expect(fixture.lifecycles.filter((event) => event.status === "started")).toHaveLength(1);
     expect(fixture.counts()).toMatchObject({ childRequests: 2, childAborted: false, reviews: 0 });
     expect(fixture.errors).toEqual([]);

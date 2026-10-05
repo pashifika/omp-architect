@@ -1,43 +1,48 @@
 import { expect, jest, spyOn, test } from "bun:test";
-import { spawnSync } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { createAssistantMessageEventStream, type AssistantMessage } from "@oh-my-pi/pi-ai";
 import {
   AgentRegistry,
   type AgentSession,
   AuthStorage,
-  createAgentSession,
   ModelRegistry,
   SessionManager,
   Settings,
   type ExtensionCommandContext,
   type ExtensionContext,
-  type ExtensionUIContext,
 } from "@oh-my-pi/pi-coding-agent";
 import {
   ExtensionRuntime,
   loadExtensionFromFactory,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
-import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
-import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
-import { MemorySessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
-import { readRasenWorkflow, type RasenWorkflow } from "../src/auto/workflow.ts";
+import type { RasenSkill } from "../src/auto/skills.ts";
+import type { DecisionEvidence } from "../src/auto/decision.ts";
+import { AUTO_JOURNAL_TYPE } from "../src/auto/journal.ts";
 import type { AutoConfig } from "../src/auto/config.ts";
 import { autoStepCarrier, type AutoDependencies } from "../src/auto/extension.ts";
-import { readRasenSnapshot, validateRasenChange, type RasenSnapshot } from "../src/auto/rasen.ts";
-import { buildJevRequest, createJevProvider } from "../src/auto/decision.ts";
-import type { Reviewer } from "../src/core.ts";
+import type { RasenSnapshot } from "../src/auto/rasen.ts";
+import { digest, type Reviewer } from "../src/core.ts";
 import { extensionFactory } from "../src/extension.ts";
 import { withAgentDir } from "./isolated-host.ts";
 
-import { supportsSymlinks } from "../test/fixtures/symlink-support.ts";
-import { readWorkspaceEvidence } from "../src/auto/workspace.ts";
-
 const approved = { decision: "approve" as const, summary: "Fixture evidence checked", issues: [] };
+
+type TerminalResult = {
+  actionId: string;
+  status: "progress" | "success" | "blocked" | "needs_user" | "failed" | "cancelled";
+  note: string;
+};
+
+function selectSkill(evidence: DecisionEvidence, name: string) {
+  const choice = Object.entries(evidence.choices ?? {}).find(([, criterion]) =>
+    criterion.startsWith(`Execute existing native skill ${name}:`),
+  )?.[0];
+  if (!choice) throw new Error(`No native skill option for ${name}`);
+  return { choice, confidence: 0.99 };
+}
 
 function snapshot(complete = 0): RasenSnapshot {
   return {
@@ -57,60 +62,6 @@ function snapshot(complete = 0): RasenSnapshot {
   };
 }
 
-function workflow(complete = false): RasenWorkflow {
-  const stages = [
-    {
-      id: "apply",
-      skill: "rasen-apply-change",
-      role: "apply",
-      kind: "standard",
-      requires: [],
-      status: complete ? "done" : "pending",
-    },
-    {
-      id: "verify",
-      skill: "rasen-verify-change",
-      role: "verify",
-      kind: "standard",
-      requires: ["apply"],
-      status: complete ? "done" : "pending",
-    },
-    {
-      id: "review-loop",
-      skill: "rasen-review-cycle",
-      role: "verify",
-      kind: "standard",
-      requires: ["verify"],
-      status: "pending",
-      loop: { kind: "review-cycle", maxRounds: 3 },
-    },
-    {
-      id: "ship",
-      skill: "rasen-ship",
-      role: "ship",
-      kind: "standard",
-      requires: ["review-loop"],
-      status: "pending",
-    },
-  ];
-  return {
-    kind: "present",
-    change: "fixture-change",
-    pipeline: "small-feature",
-    runStateDir: "/fixture/auto-run",
-    stages,
-    completed: complete ? ["apply", "verify"] : [],
-    remaining: complete ? ["review-loop", "ship"] : ["apply", "verify", "review-loop", "ship"],
-    ready: [complete ? "review-loop" : "apply"],
-    next: complete ? "review-loop" : "apply",
-    inProgressStages: [],
-    escalatedStages: [],
-    openFindings: [],
-    rounds: 0,
-    fingerprint: `workflow-${complete}`,
-  } as RasenWorkflow;
-}
-
 async function project(
   config: Partial<AutoConfig> | null = {},
   minReviews = 1,
@@ -125,8 +76,8 @@ async function project(
   return cwd;
 }
 
-// These tests run the real OMP extension loader, then explicitly deliver lifecycle
-// events. They do not pretend to execute the host's model/continuation loop.
+// The real OMP extension loader and native session/artifact journal are used here.
+// Tool and child results are explicitly delivered fixtures, not real child execution.
 async function loaderFixture(
   config: Partial<AutoConfig> | null = {},
   overrides: {
@@ -141,14 +92,43 @@ async function loaderFixture(
   const cwd = await project(config, overrides.minReviews, overrides.maxReviews);
   const agentDir = path.join(cwd, ".test-host-profile", "agent");
   await overrides.prepare?.(cwd, agentDir);
+  const sessionManager = SessionManager.create(cwd, path.join(cwd, ".test-sessions"));
   const runtime = new ExtensionRuntime();
+  runtime.appendEntry = ((type: string, data: unknown) =>
+    sessionManager.appendCustomEntry(type, data)) as unknown as typeof runtime.appendEntry;
   const messages: Array<{ customType: string; content: unknown }> = [];
   const bootstraps: string[] = [];
   const deliveries: Array<Record<string, unknown>> = [];
+  const observed: DecisionEvidence[] = [];
+  const notifications: string[] = [];
   let reads = 0;
   let completed = 0;
   let decisions = 0;
   let aborts = 0;
+  let desired = "rasen-verify-change";
+  const skills: RasenSkill[] = await Promise.all(
+    [
+      ["rasen-verify-change", "Verify actual implementation against requirements"],
+      ["rasen-apply-change", "Implement remaining change tasks"],
+      ["rasen-review-cycle", "Own the complete review, fix, and strategy loop"],
+      ["pack/rasen-continue~2", "Continue preparation of missing change artifacts"],
+      ["rasen-ship", "Publish only after the normal explicit user authorization"],
+    ].map(async ([name, description]) => {
+      const filePath = path.join(cwd, "native-skills", name.replaceAll("/", "-"), "SKILL.md");
+      await Bun.write(
+        filePath,
+        `---\nname: ${name}\ndescription: ${description}\n---\nComplete ${name} instructions; preserve native tools and skill records.`,
+      );
+      return {
+        name,
+        description,
+        filePath,
+        baseDir: path.dirname(filePath),
+        source: "fixture-native-loader",
+        reference: `skill://${name}`,
+      };
+    }),
+  );
   runtime.sendMessage = (...args: unknown[]) => {
     const message = args[0] as { customType: string; content: unknown };
     if (message.customType === "omp-auto-run") {
@@ -162,16 +142,31 @@ async function loaderFixture(
   };
   const nativeManager = new AsyncJobManager({});
   const nativeRegistry = new AgentRegistry();
+  const model = {
+    provider: "openai",
+    id: "fixture-model",
+    name: "Fixture model",
+    api: "openai-completions",
+    baseUrl: "https://example.invalid",
+    reasoning: false,
+    input: ["text"],
+    contextWindow: 10000,
+    maxTokens: 1000,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  } as NonNullable<AgentSession["model"]>;
   const nativeSession = {
     asyncJobManager: nativeManager,
     getAgentId: () => "main",
-    sessionId: "fixture-native-main",
+    sessionId: sessionManager.getSessionId(),
+    skills,
+    model,
+    modelRegistry: { getAvailable: () => [model] },
     hasPendingAsyncWork: () => nativeManager.getAllJobs().some((job) => job.status === "running"),
     waitForAdmittedSubmissions: async () => {},
     waitForIrcReplies: async () => {},
     settleAsyncWork: async () => {},
     waitForIdle: async () => {},
-  } as AgentSession;
+  } as unknown as AgentSession;
   nativeRegistry.register({
     id: "main",
     displayName: "Main",
@@ -181,13 +176,14 @@ async function loaderFixture(
   const factory = extensionFactory(() => overrides.reviewer ?? (async () => approved), {
     snapshot: async () => {
       reads++;
-      return snapshot(completed);
+      return { ...snapshot(completed), root: cwd };
     },
-    workflow: async () => workflow(true),
-    validate: async () => {},
-    decision: () => async () => {
+    decision: () => async (facts) => {
       decisions++;
-      return { choice: "continue", confidence: 0.99 };
+      observed.push(structuredClone(facts));
+      return desired.startsWith("rasen-") || desired.includes("/rasen-")
+        ? selectSkill(facts, desired)
+        : { choice: desired, confidence: 0.99 };
     },
     fallback: () => async () => {
       throw new Error("Unexpected fallback");
@@ -201,16 +197,19 @@ async function loaderFixture(
     new EventBus(),
     runtime,
   );
-  const sessionManager = SessionManager.create(cwd, path.join(cwd, ".test-sessions"));
-  Object.defineProperty(nativeSession, "sessionId", { get: () => sessionManager.getSessionId() });
   const ctx = {
     cwd,
     sessionManager,
     modelRegistry: overrides.modelRegistry,
+    models: { resolve: () => model, list: () => [model], current: () => model },
     agent: { kind: "main", id: "main", name: "main", depth: 0 },
     hasUI: true,
     isIdle: () => true,
-    ui: { notify() {}, custom: async <T>() => true as T },
+    ui: {
+      notify: (message: string) => notifications.push(message),
+      custom: async <T>() => true as T,
+      confirm: async () => true,
+    },
     abort() {
       aborts++;
     },
@@ -221,7 +220,7 @@ async function loaderFixture(
       .get("auto_status")!
       .definition.execute("status", {}, undefined, undefined, context);
     const content = result.content[0];
-    if (content.type !== "text") throw new Error("Status did not contain text");
+    if (content.type !== "text") throw new Error("Missing status");
     return result.isError ? { error: content.text } : JSON.parse(content.text);
   };
   const stop = async (context: ExtensionContext = ctx) =>
@@ -237,14 +236,11 @@ async function loaderFixture(
       context,
     );
   const start = async () => {
+    const previous = bootstraps.length;
     await extension.commands.get("auto")!.handler("start fixture-change", ctx);
-    expect(bootstraps).toHaveLength(1);
+    expect(bootstraps).toHaveLength(previous + 1);
     await extension.handlers.get("before_agent_start")![0](
-      {
-        type: "before_agent_start",
-        prompt: bootstraps[0],
-        systemPrompt: [],
-      },
+      { type: "before_agent_start", prompt: bootstraps.at(-1), systemPrompt: [] },
       ctx,
     );
     await extension.handlers.get("turn_start")![0](
@@ -253,20 +249,20 @@ async function loaderFixture(
     );
   };
   const step = async (
-    summary = "Recorded pipeline stage frontier",
-    transition?: "triage" | "verify",
+    summary = "Observe the current change and select an existing skill",
+    terminal?: TerminalResult,
   ) => {
     const result = await extension.tools
       .get("auto_step")!
       .definition.execute(
-        "step",
-        { summary, ...(transition ? { transition } : {}) },
+        crypto.randomUUID(),
+        { summary, ...(terminal ? { result: terminal } : {}) },
         undefined,
         undefined,
         ctx,
       );
     const content = result.content[0];
-    if (content.type !== "text") throw new Error("Missing stage advice");
+    if (content.type !== "text") throw new Error("Missing action response");
     return { ...JSON.parse(content.text), isError: !!result.isError };
   };
   const registerNativeChild = (id: string, agent = "omp-reviewer") =>
@@ -280,6 +276,78 @@ async function loaderFixture(
       history: { agent },
       lifecycle: { acceptedAt: Date.now(), terminalAt: Date.now() },
     });
+  const gate = async (
+    toolName: string,
+    input: Record<string, unknown>,
+    toolCallId: string = crypto.randomUUID(),
+  ) => {
+    for (const handler of extension.handlers.get("tool_call") ?? []) {
+      const result = await handler({ type: "tool_call", toolName, toolCallId, input }, ctx);
+      if (result) return result;
+    }
+  };
+  const toolResult = async (
+    toolName: string,
+    input: Record<string, unknown>,
+    toolCallId: string,
+    result: Record<string, unknown>,
+  ) => {
+    for (const handler of extension.handlers.get("tool_result") ?? [])
+      await handler(
+        { type: "tool_result", toolName, toolCallId, input, isError: false, ...result },
+        ctx,
+      );
+  };
+  const mainResult = async (
+    toolName = "read",
+    input: Record<string, unknown> = { path: "tasks.md" },
+    output = "Actual native tool output",
+  ) => {
+    const id = crypto.randomUUID();
+    expect(await gate(toolName, input, id)).toBeUndefined();
+    await toolResult(toolName, input, id, { content: [{ type: "text", text: output }] });
+  };
+  const nativeResult = async (
+    options: { role?: string; id?: string; output?: string; admitted?: boolean } = {},
+  ) => {
+    const state = await status();
+    const action = state.selectedAction;
+    if (!action) throw new Error("No selected action");
+    const role = options.role ?? "omp-reviewer";
+    const id = options.id ?? crypto.randomUUID();
+    const input = {
+      agent: role,
+      task: `Auto action: ${action.actionId}\nInspect the scoped fixture`,
+      model: action.admission.roleRoutes[role].selector,
+      solutionSpace: "Scoped fixture evidence",
+    };
+    if (!options.admitted) expect(await gate("task", input, id)).toBeUndefined();
+    registerNativeChild(id, role);
+    const output = options.output ?? "Complete scoped native evidence, with limitations";
+    await toolResult("task", input, id, {
+      content: [{ type: "text", text: output }],
+      details: {
+        results: [
+          {
+            id,
+            agent: role,
+            exitCode: 0,
+            aborted: false,
+            output,
+            resolvedModelIdentity: `openai/${model.id}`,
+          },
+        ],
+      },
+    });
+    return id;
+  };
+  const finish = (actionId: string, report: Partial<Omit<TerminalResult, "actionId">> = {}) =>
+    step("Main reports the selected skill's natural boundary", {
+      actionId,
+      status: "success",
+      note: "Main completed the selected skill using settled native evidence",
+      ...report,
+    });
   const settled = async () => {
     const deadline = Date.now() + 3000;
     for (;;) {
@@ -290,53 +358,10 @@ async function loaderFixture(
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
   };
-  const verify = async () => {
-    // This loader fixture deliberately delivers lifecycle events. The real
-    // AgentSession cases below exercise actual native reviewer workers instead.
-    expect(await step("Observe the completed loader-fixture task set")).toMatchObject({
-      allowedNextPhase: "verify",
-      isError: false,
-    });
-    const toolCallId = `fixture-reviewer-${crypto.randomUUID()}`;
-    const input = {
-      agent: "omp-reviewer",
-      task: "Independently inspect the current fixture",
-      solutionSpace: "Read-only fixture verification",
-    };
-    for (const handler of extension.handlers.get("tool_call") ?? [])
-      expect(
-        await handler({ type: "tool_call", toolName: "task", toolCallId, input }, ctx),
-      ).toBeUndefined();
-    registerNativeChild(toolCallId);
-    const details = {
-      results: [
-        {
-          id: toolCallId,
-          agent: "omp-reviewer",
-          exitCode: 0,
-          aborted: false,
-          output:
-            "Inspected current loader-fixture implementation and task evidence; no blocking findings",
-        },
-      ],
-    };
-    for (const handler of extension.handlers.get("tool_result") ?? [])
-      await handler(
-        {
-          type: "tool_result",
-          toolName: "task",
-          toolCallId,
-          input,
-          content: [{ type: "text", text: "Independent fixture verification complete" }],
-          details,
-          isError: false,
-        },
-        ctx,
-      );
-    expect(await step("Record the settled independent loader-fixture receipt")).toMatchObject({
-      allowedNextPhase: "review",
-      isError: false,
-    });
+  const evidence = async (content: string) => {
+    const id = await sessionManager.saveArtifact(content, "architect-review");
+    if (!id) throw new Error("Fixture review artifact was not saved");
+    return `artifact://${id}`;
   };
   return {
     cwd,
@@ -346,15 +371,23 @@ async function loaderFixture(
     nativeManager,
     nativeRegistry,
     nativeSession,
-    registerNativeChild,
-    settled,
-    async evidence(content: string): Promise<string> {
-      const id = await sessionManager.saveArtifact(content, "architect-review");
-      if (!id) throw new Error("Fixture review artifact was not saved");
-      return `artifact://${id}`;
-    },
+    skills,
+    observed,
+    notifications,
     messages,
     bootstraps,
+    deliveries,
+    registerNativeChild,
+    nativeResult,
+    mainResult,
+    toolResult,
+    gate,
+    finish,
+    settled,
+    evidence,
+    choose(name: string) {
+      desired = name;
+    },
     complete() {
       completed = 2;
     },
@@ -362,26 +395,27 @@ async function loaderFixture(
       completed = value;
     },
     step,
-    verify,
-    deliveries,
-    async checkpoint(signal?: AbortSignal) {
-      const id = await sessionManager.saveArtifact(
-        "Full implementation, verification findings, and test evidence",
-        "architect-review",
-      );
-      return extension.tools
-        .get("architect_checkpoint")!
-        .definition.execute(
-          `checkpoint-${crypto.randomUUID()}`,
-          { phase: "completion", evidenceRef: `artifact://${id}` },
-          signal,
-          undefined,
-          ctx,
-        );
-    },
     status,
     start,
     stop,
+    appendJournal: (event: unknown) => sessionManager.appendCustomEntry(AUTO_JOURNAL_TYPE, event),
+    journal: () =>
+      sessionManager
+        .getBranch()
+        .filter((entry) => entry.type === "custom" && entry.customType === AUTO_JOURNAL_TYPE)
+        .map((entry) => (entry as { data: any }).data),
+    async checkpoint(signal?: AbortSignal) {
+      return extension.tools.get("architect_checkpoint")!.definition.execute(
+        crypto.randomUUID(),
+        {
+          phase: "completion",
+          evidenceRef: await evidence("Full implementation and test evidence"),
+        },
+        signal,
+        undefined,
+        ctx,
+      );
+    },
     counts: () => ({ reads, decisions, aborts }),
     async close() {
       await extension.handlers.get("session_shutdown")![0]({ type: "session_shutdown" }, ctx);
@@ -401,7 +435,13 @@ for (const stage of ["confirmation", "change snapshot", "workflow", "artifact st
       {
         dependencies: {
           ...(stage === "change snapshot" ? { snapshot: fail } : {}),
-          ...(stage === "workflow" ? { workflow: fail } : {}),
+          ...(stage === "workflow"
+            ? {
+                skills: () => {
+                  throw Object.assign(new Error("PRIVATE HOST TOKEN"), { code: "EACCES" });
+                },
+              }
+            : {}),
         },
       },
     );
@@ -536,7 +576,7 @@ test("real loader uses host profile defaults with selective project overrides", 
     expect(await fixture.status()).toMatchObject({
       status: "running",
       supervision: { maxDurationMs: 7200000, noOutputTimeoutMs: 240000 },
-      steps: "1",
+      steps: "0",
     });
   } finally {
     await fixture.close();
@@ -660,64 +700,7 @@ for (const cancel of ["stop", "input", "session"] as const) {
   });
 }
 
-test("brief is frozen after consent; new runs replace instructions and stopped runs keep their budgets", async () => {
-  const fixture = await loaderFixture(
-    {},
-    {
-      minReviews: 2,
-      prepare: async (cwd) => {
-        await Bun.write(path.join(cwd, ".omp/brief/example/_shared.md"), "Frozen {var}\n{blocks}");
-      },
-    },
-  );
-  try {
-    const ctx = {
-      ...fixture.ctx,
-      ui: {
-        ...fixture.ctx.ui,
-        custom: async <T>() => {
-          await Bun.write(path.join(fixture.cwd, ".omp/brief/example/_shared.md"), "MUTATED");
-          return true as T;
-        },
-      },
-    };
-    await fixture.extension.commands
-      .get("auto")!
-      .handler("start fixture-change --brief example -- Preserve me", ctx);
-    expect(fixture.bootstraps[0]).toContain("Frozen fixture-change");
-    expect(fixture.bootstraps[0]).not.toContain("MUTATED");
-    await fixture.extension.handlers.get("before_agent_start")![0](
-      { type: "before_agent_start", prompt: fixture.bootstraps[0], systemPrompt: [] },
-      fixture.ctx,
-    );
-    fixture.complete();
-    await fixture.verify();
-    const next = (await fixture.stop()) as { additionalContext: string };
-    expect(next.additionalContext).toContain("Frozen fixture-change");
-    expect(next.additionalContext).toContain("Preserve me");
-    await fixture.extension.commands
-      .get("auto")!
-      .handler("start fixture-change Replace me", fixture.ctx);
-    expect(fixture.bootstraps).toHaveLength(1);
-    expect((await fixture.status()).steps).toBe("2");
-    await fixture.extension.commands.get("auto")!.handler("stop", fixture.ctx);
-    expect(await fixture.settled()).toMatchObject({
-      status: "paused",
-      outcome: "needs_user",
-      steps: "2",
-    });
-    await fixture.extension.commands
-      .get("auto")!
-      .handler("start fixture-change New guidance", fixture.ctx);
-    expect(fixture.bootstraps).toHaveLength(2);
-    expect(fixture.bootstraps[1]).toContain("New guidance");
-    expect(fixture.bootstraps[1]).not.toContain("Preserve me");
-  } finally {
-    await fixture.close();
-  }
-});
-
-for (const delivery of ["bootstrap", "continuation"] as const) {
+for (const delivery of ["bootstrap"] as const) {
   for (const cancel of ["stop", "session", "new-input"] as const) {
     test(`real loader rejects queued ${delivery} after ${cancel} without ordinary-request fallback`, async () => {
       const fixture = await loaderFixture({}, { minReviews: 2 });
@@ -726,15 +709,6 @@ for (const delivery of ["bootstrap", "continuation"] as const) {
           .get("auto")!
           .handler("start fixture-change Old instructions", fixture.ctx);
         let text = fixture.bootstraps[0];
-        if (delivery === "continuation") {
-          await fixture.extension.handlers.get("before_agent_start")![0](
-            { type: "before_agent_start", prompt: text, systemPrompt: [] },
-            fixture.ctx,
-          );
-          fixture.complete();
-          await fixture.verify();
-          text = ((await fixture.stop()) as { additionalContext: string }).additionalContext;
-        }
         if (cancel === "stop")
           await fixture.extension.commands.get("auto")!.handler("stop", fixture.ctx);
         else if (cancel === "session")
@@ -828,20 +802,25 @@ async function jevAuthFixture(
     globalThis.fetch = Object.defineProperties(
       (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
         requests.push({ url: String(input), init });
+        const request = JSON.parse(String(init?.body));
+        const criteria = request.questions.next.criteria as Record<string, string>;
+        const choice = Object.entries(criteria).find(([, value]) =>
+          value.startsWith("Execute existing native skill rasen-verify-change:"),
+        )![0];
         return new Response(
           JSON.stringify({
             model: "jev-latest",
             answers: {
               next: {
                 type: "choice",
-                choice: "continue",
+                choice,
                 confidence: 0.99,
-                probabilities: {
-                  continue: 0.97,
-                  replan: 0.01,
-                  needs_user: 0.01,
-                  uncertain: 0.01,
-                },
+                probabilities: Object.fromEntries(
+                  Object.keys(criteria).map((key) => [
+                    key,
+                    key === choice ? 0.99 : 0.01 / (Object.keys(criteria).length - 1),
+                  ]),
+                ),
               },
             },
             usage: { input_tokens: 1, output_tokens: 1 },
@@ -919,9 +898,11 @@ test.each(jevAuthCases)("real loader default Jev $scenario", async (testCase) =>
     expect(process.env.TYPESAFE_API_KEY).toBe(testCase.envKey);
     await fixture.start();
     const continuation = await fixture.step();
-    expect(continuation).toMatchObject({ choice: "continue", isError: false });
+    expect(continuation).toMatchObject({
+      action: { skill: { name: "rasen-verify-change" } },
+      isError: false,
+    });
     expect(await fixture.step("same frontier, different prose")).toMatchObject({
-      choice: "continue",
       cached: true,
     });
     expect(fixture.requests).toHaveLength(1);
@@ -998,28 +979,6 @@ test("real loader default Jev fails closed when OMP key resolution rejects witho
     expect(visible).not.toContain(loginFixtureKey);
     expect(visible).not.toContain(envFixtureKey);
     expect(visible).not.toContain("Resolver rejected");
-  } finally {
-    await fixture.close();
-  }
-});
-
-test("real loader stops Auto at its turn cap without another decision or retry", async () => {
-  const fixture = await loaderFixture({ maxSteps: 1 }, { minReviews: 2 });
-  try {
-    await fixture.start();
-    fixture.complete();
-    await fixture.verify();
-    expect(await fixture.stop()).toBeUndefined();
-    expect(await fixture.status()).toMatchObject({
-      status: "draining",
-      outcome: "budget_exhausted",
-      steps: "1/1",
-      completionVerified: false,
-    });
-    expect(fixture.counts()).toMatchObject({ decisions: 2, aborts: 0 });
-    expect(await fixture.stop()).toBeUndefined();
-    expect(fixture.counts()).toMatchObject({ decisions: 2, aborts: 0 });
-    expect(fixture.messages.filter((message) => message.customType === "omp-auto")).toHaveLength(1);
   } finally {
     await fixture.close();
   }
@@ -1252,41 +1211,6 @@ test("Auto start resets old input provenance and internal hooks cannot fabricate
   }
 });
 
-test("new input still revokes provisional completion while preserving its initial stop", async () => {
-  const f = await loaderFixture({}, { dependencies: { snapshot: async () => snapshot(2) } });
-  const idle = Promise.withResolvers<void>();
-  f.nativeSession.waitForIdle = async () => idle.promise;
-  try {
-    await f.start();
-    await f.verify();
-    expect((await f.checkpoint()).isError).toBe(false);
-    await f.stop();
-    const first = await f.status();
-    expect(first).toMatchObject({ status: "draining", outcome: "completed" });
-    await f.extension.handlers.get("input")![0](
-      { type: "input", text: "A new user request", source: "interactive" },
-      f.ctx,
-    );
-    await f.extension.handlers.get("before_agent_start")![0](
-      { type: "before_agent_start", prompt: "A new user request", systemPrompt: [] },
-      f.ctx,
-    );
-    idle.resolve();
-    expect(await f.settled()).toMatchObject({
-      status: "paused",
-      outcome: "needs_user",
-      reason: "Superseded by new user input",
-      initialStop: first.initialStop,
-      inputEvent: { kind: "text", statusBefore: "draining", outcomeBefore: "completed" },
-      completionVerified: false,
-    });
-    expect(f.counts().aborts).toBe(0);
-  } finally {
-    idle.resolve();
-    await f.close();
-  }
-});
-
 test("new user input releases Main while hidden native starts cannot reset or resume held Auto", async () => {
   const f = await loaderFixture();
   try {
@@ -1440,54 +1364,6 @@ test("Auto stop drains native work without cancelling or consuming its result", 
   }
 });
 
-for (const fresh of [true, false]) {
-  test(`Auto completion waits detached Main settlement and ${fresh ? "certifies fresh" : "rejects changed"} facts`, async () => {
-    const mainIdle = Promise.withResolvers<void>();
-    const idleWaitStarted = Promise.withResolvers<void>();
-    let changed = false;
-    const f = await loaderFixture(
-      {},
-      {
-        dependencies: {
-          snapshot: async () => ({
-            ...snapshot(2),
-            fingerprint: changed ? "changed-after-review" : "fixture-2",
-          }),
-        },
-      },
-    );
-    f.nativeSession.waitForIdle = async () => {
-      idleWaitStarted.resolve();
-      await mainIdle.promise;
-    };
-    try {
-      await f.start();
-      await f.verify();
-      expect((await f.checkpoint()).isError).toBe(false);
-      // onStop must return before Main's idle wait can resolve.
-      expect(await f.stop()).toBeUndefined();
-      await idleWaitStarted.promise;
-      expect(await f.status()).toMatchObject({
-        status: "draining",
-        outcome: "completed",
-        completionVerified: false,
-      });
-      changed = !fresh;
-      mainIdle.resolve();
-      expect(await f.settled()).toMatchObject({
-        status: fresh ? "completed" : "paused",
-        outcome: "completed",
-        completionVerified: fresh,
-      });
-      expect(f.counts().aborts).toBe(0);
-      expect(f.bootstraps).toHaveLength(1);
-    } finally {
-      mainIdle.resolve();
-      await f.close();
-    }
-  });
-}
-
 test("real loader denies subagents Auto ownership, status, and lifecycle continuation", async () => {
   const fixture = await loaderFixture();
   const child = {
@@ -1521,7 +1397,7 @@ test("real loader denies subagents Auto ownership, status, and lifecycle continu
       child,
     );
     await fixture.extension.commands.get("auto")!.handler("stop", child);
-    expect(await fixture.status()).toMatchObject({ status: "running", steps: "1" });
+    expect(await fixture.status()).toMatchObject({ status: "running", steps: "0" });
     expect(fixture.counts()).toMatchObject({ decisions: 0, aborts: 0 });
   } finally {
     await fixture.close();
@@ -1593,583 +1469,6 @@ for (const boundary of ["confirmation", "preflight"] as const) {
   }
 }
 
-for (const valid of [true, false]) {
-  test(`real loader completion checkpoint requires fresh strict validation ${valid ? "passes" : "fails"}`, async () => {
-    let reads = 0;
-    let reviews = 0;
-    let validations = 0;
-    const fixture = await loaderFixture(
-      {},
-      {
-        minReviews: 1,
-        maxReviews: 1,
-        reviewer: async () => {
-          reviews++;
-          return approved;
-        },
-        dependencies: {
-          snapshot: async () => snapshot(reads++ === 0 ? 0 : 2),
-          validate: async () => {
-            validations++;
-            if (!valid) throw new Error("Strict validation fixture failed");
-          },
-        },
-      },
-    );
-    try {
-      await fixture.start();
-      await fixture.verify();
-      const explicit = await fixture.extension.tools
-        .get("architect_checkpoint")!
-        .definition.execute(
-          "completion",
-          {
-            phase: "completion",
-            evidenceRef: await fixture.evidence("Claimed done before CLI validation"),
-          },
-          undefined,
-          undefined,
-          fixture.ctx,
-        );
-      expect(explicit.isError).toBe(!valid);
-      expect(validations).toBe(1);
-      expect(reviews).toBe(valid ? 1 : 0);
-      await fixture.stop();
-      expect(validations).toBe(2);
-      expect(reviews).toBe(valid ? 1 : 0);
-      expect(await fixture.status()).toMatchObject({
-        status: "draining",
-        outcome: valid ? "completed" : "blocked",
-        completionVerified: false,
-      });
-      expect(await fixture.settled()).toMatchObject({
-        status: valid ? "completed" : "paused",
-        outcome: valid ? "completed" : "blocked",
-        completionVerified: valid,
-      });
-      expect(validations).toBe(valid ? 3 : 2);
-    } finally {
-      await fixture.close();
-    }
-  });
-}
-
-test("Auto step Eval carriers require one reset-safe literal call and reject batching", () => {
-  const input = {
-    path: "xd://auto_step",
-    content: JSON.stringify({ summary: "Inspect the current allowed host phase" }),
-  };
-  const literal = `await tool.write(${JSON.stringify(input)})`;
-  expect(autoStepCarrier({ language: "js", reset: true, code: literal })).toBe(true);
-  expect(
-    autoStepCarrier({
-      language: "js",
-      reset: true,
-      code: `await tool.write(${JSON.stringify({ ...input, content: JSON.stringify({ summary: "Current edits need tests", transition: "verify" }) })})`,
-    }),
-  ).toBe(true);
-  expect(autoStepCarrier({ language: "js", reset: true, code: `console.log(${literal});` })).toBe(
-    true,
-  );
-  for (const candidate of [
-    { language: "js", reset: false, code: literal },
-    { language: "js", reset: true, async: true, code: literal },
-    {
-      language: "js",
-      reset: true,
-      code: `${literal}; await tool.write({"path":"fixture.ts","content":"changed"})`,
-    },
-    {
-      language: "js",
-      reset: true,
-      code: `const args = ${JSON.stringify(input)}; await tool.write(args)`,
-    },
-    {
-      language: "js",
-      reset: true,
-      code: `await tool.write(${JSON.stringify({ ...input, extra: true })})`,
-    },
-  ])
-    expect(autoStepCarrier(candidate)).toBe(false);
-});
-
-test("independent checks precede honest test-task completion and final current-state review", async () => {
-  const fixture = await loaderFixture(
-    {},
-    {
-      dependencies: {
-        workflow: async () => ({
-          kind: "absent",
-          change: "fixture-change",
-          reason: "No source workflow",
-          fingerprint: "absent",
-        }),
-      },
-    },
-  );
-  const native = Promise.withResolvers<string>();
-  try {
-    await fixture.start();
-    fixture.setProgress(1);
-    expect(await fixture.step()).toMatchObject({ allowedNextPhase: "apply" });
-    expect(fixture.bootstraps[0]).toContain("transition=verify");
-    const jobId = fixture.nativeManager.register(
-      "bash",
-      "settling implementation",
-      () => native.promise,
-      { ownerId: "main" },
-    );
-    expect(await fixture.step("Ready for independent checks", "verify")).toMatchObject({
-      isError: true,
-    });
-    expect((await fixture.status()).hostWorkflow.phase).toBe("apply");
-    native.resolve("Implementation settled");
-    await fixture.nativeManager.getJob(jobId)!.promise;
-    const admitted = await fixture.step(
-      "Current implementation needs focused independent tests",
-      "verify",
-    );
-    expect(admitted).toMatchObject({
-      isError: false,
-      hostWorkflow: { phase: "verify", readyForReview: false, verifiedStages: [] },
-      ready: ["verify"],
-    });
-    expect(await fixture.status()).toMatchObject({ progress: { complete: 1, remaining: 1 } });
-    expect((await fixture.step("Repeated check frontier", "verify")).hostWorkflow.revision).toBe(
-      admitted.hostWorkflow.revision,
-    );
-    const toolCallId = "pending-checkbox-check";
-    const input = {
-      agent: "omp-reviewer",
-      task: "Run the pending focused test",
-      solutionSpace: "Current implementation",
-    };
-    for (const handler of fixture.extension.handlers.get("tool_call") ?? [])
-      expect(
-        await handler({ type: "tool_call", toolName: "task", toolCallId, input }, fixture.ctx),
-      ).toBeUndefined();
-    fixture.registerNativeChild(toolCallId);
-    for (const handler of fixture.extension.handlers.get("tool_result") ?? [])
-      await handler(
-        {
-          type: "tool_result",
-          toolName: "task",
-          toolCallId,
-          input,
-          isError: false,
-          content: [{ type: "text", text: "Focused test passed" }],
-          details: {
-            results: [
-              {
-                id: toolCallId,
-                agent: "omp-reviewer",
-                exitCode: 0,
-                output:
-                  "Independent focused test passed; task remains pending until Main records the evidence",
-              },
-            ],
-          },
-        },
-        fixture.ctx,
-      );
-    expect(await fixture.step()).toMatchObject({
-      allowedNextPhase: "apply",
-      hostWorkflow: { verifiedStages: ["verify"], readyForReview: false },
-    });
-    expect((await fixture.checkpoint()).isError).toBe(true);
-    expect(await fixture.status()).toMatchObject({ progress: { complete: 1, remaining: 1 } });
-    fixture.complete();
-    await fixture.verify();
-    expect((await fixture.checkpoint()).isError).toBe(false);
-    expect((await fixture.step("Cannot bypass approved review", "verify")).isError).toBe(true);
-    await fixture.stop();
-    expect(await fixture.settled()).toMatchObject({
-      status: "completed",
-      completionVerified: true,
-    });
-  } finally {
-    native.resolve("Cleanup");
-    await fixture.close();
-  }
-});
-
-for (const phase of ["unadmitted", "apply", "verify", "review", "triage", "fix"] as const) {
-  test(`Main mutations obey the extension-owned ${phase} phase boundary`, async () => {
-    const fixture = await loaderFixture(
-      {},
-      {
-        reviewer: async () => ({
-          decision: "revise",
-          summary: "A scoped correction is needed",
-          issues: ["Repair the fixture output"],
-        }),
-      },
-    );
-    try {
-      await fixture.start();
-      if (phase !== "unadmitted") await fixture.step();
-      if (["verify", "review", "triage", "fix"].includes(phase)) {
-        fixture.complete();
-        if (phase === "verify") await fixture.step();
-        else await fixture.verify();
-      }
-      if (phase === "triage" || phase === "fix") {
-        expect((await fixture.checkpoint()).isError).toBe(true);
-        expect(await fixture.status()).toMatchObject({ hostWorkflow: { phase: "triage" } });
-      }
-      if (phase === "fix")
-        expect(await fixture.step("Triage the recorded scoped finding", "triage")).toMatchObject({
-          allowedNextPhase: "fix",
-        });
-      for (const [toolName, input] of [
-        ["write", { path: "fixture.ts", content: "changed" }],
-        ["edit", { path: "fixture.ts", oldText: "old", newText: "new" }],
-        ["bash", { command: "printf changed > fixture.ts" }],
-      ] as const) {
-        const admission = await fixture.extension.handlers.get("tool_call")![0](
-          { type: "tool_call", toolName, input, toolCallId: `${phase}-${toolName}` },
-          fixture.ctx,
-        );
-        if (phase === "apply" || phase === "fix") expect(admission).toBeUndefined();
-        else expect(admission).toMatchObject({ block: true });
-      }
-      for (const [toolName, input] of [
-        [
-          "write",
-          {
-            path: "agent://finished-leaf",
-            content: "Read the current fixture and report findings",
-          },
-        ],
-        [
-          "send",
-          { agent: "finished-leaf", message: "Read the current fixture and report findings" },
-        ],
-        [
-          "irc",
-          { target: "finished-leaf", message: "Read the current fixture and report findings" },
-        ],
-      ] as const)
-        expect(
-          await fixture.extension.handlers.get("tool_call")![0](
-            { type: "tool_call", toolName, input, toolCallId: `${phase}-revive-${toolName}` },
-            fixture.ctx,
-          ),
-        ).toBeUndefined();
-      expect(await fixture.status()).toMatchObject({
-        status: "running",
-        completionVerified: false,
-      });
-    } finally {
-      await fixture.close();
-    }
-  });
-}
-
-test("parallel reviewer receipts stay bound to their admitted sequential verification stage", async () => {
-  const observed = workflow(true);
-  if (observed.kind !== "present") throw new Error("Expected workflow fixture");
-  observed.stages.splice(2, 0, {
-    id: "verify-extra",
-    skill: "rasen-cso",
-    kind: "standard",
-    role: "verify",
-    requires: ["verify"],
-    status: "done",
-  });
-  observed.stages.find((stage) => stage.id === "review-loop")!.requires = ["verify-extra"];
-  observed.completed.push("verify-extra");
-  observed.fingerprint = "sequential-verify-fixture";
-  const fixture = await loaderFixture(
-    {},
-    { dependencies: { snapshot: async () => snapshot(2), workflow: async () => observed } },
-  );
-  const input = {
-    agent: "omp-reviewer",
-    task: "Verify only the admitted stage",
-    solutionSpace: "The current stage",
-  };
-  const dispatch = async (toolCallId: string) => {
-    for (const handler of fixture.extension.handlers.get("tool_call") ?? [])
-      expect(
-        await handler({ type: "tool_call", toolName: "task", toolCallId, input }, fixture.ctx),
-      ).toBeUndefined();
-  };
-  const receipt = async (toolCallId: string) => {
-    fixture.registerNativeChild(toolCallId);
-    for (const handler of fixture.extension.handlers.get("tool_result") ?? [])
-      await handler(
-        {
-          type: "tool_result",
-          toolName: "task",
-          toolCallId,
-          input,
-          content: [],
-          isError: false,
-          details: {
-            results: [
-              {
-                id: toolCallId,
-                agent: "omp-reviewer",
-                exitCode: 0,
-                aborted: false,
-                output: "Finished the admitted stage's independent verification",
-              },
-            ],
-          },
-        },
-        fixture.ctx,
-      );
-  };
-  try {
-    await fixture.start();
-    expect(await fixture.step()).toMatchObject({
-      hostWorkflow: { phase: "verify", stage: "verify" },
-    });
-    await dispatch("first-check-a");
-    await dispatch("first-check-b");
-    await receipt("first-check-a");
-    await receipt("first-check-b");
-    expect(await fixture.step()).toMatchObject({
-      hostWorkflow: { phase: "verify", stage: "verify-extra", verifiedStages: ["verify"] },
-    });
-    expect((await fixture.checkpoint()).isError).toBe(true);
-    await dispatch("second-check");
-    await receipt("second-check");
-    expect(await fixture.step()).toMatchObject({
-      hostWorkflow: {
-        phase: "review",
-        readyForReview: true,
-        verifiedStages: ["verify", "verify-extra"],
-      },
-    });
-  } finally {
-    await fixture.close();
-  }
-});
-
-test("uncharged oversized enriched completion evidence can be corrected within the same host review phase", async () => {
-  let reviews = 0;
-  const fixture = await loaderFixture(
-    {},
-    {
-      prepare: async (cwd) => {
-        await Bun.write(
-          path.join(cwd, ".omp/architect.json"),
-          JSON.stringify({ maxReviewBytes: 8192, reviews: { min: 1, max: 2 } }),
-        );
-      },
-      reviewer: async () => {
-        reviews++;
-        return approved;
-      },
-    },
-  );
-  try {
-    await fixture.start();
-    fixture.complete();
-    await fixture.verify();
-    const rejected = await fixture.extension.tools
-      .get("architect_checkpoint")!
-      .definition.execute(
-        "oversized-enriched",
-        { phase: "completion", evidenceRef: await fixture.evidence("F".repeat(7000)) },
-        undefined,
-        undefined,
-        fixture.ctx,
-      );
-    expect(rejected.isError).toBe(true);
-    expect(reviews).toBe(0);
-    expect(await fixture.status()).toMatchObject({
-      status: "running",
-      hostWorkflow: { phase: "review", readyForReview: true },
-      architect: {
-        attempts: { completion: 0 },
-        lastReview: { status: "input_rejected", charged: false },
-      },
-    });
-    expect((await fixture.checkpoint()).isError).toBe(false);
-    await fixture.stop();
-    expect(await fixture.status()).toMatchObject({ status: "draining", completionVerified: false });
-    expect(await fixture.settled()).toMatchObject({
-      status: "completed",
-      completionVerified: true,
-    });
-    expect(reviews).toBe(1);
-  } finally {
-    await fixture.close();
-  }
-});
-
-test("external completion flags and model claims cannot replace a native verification receipt", async () => {
-  let reviews = 0;
-  const fixture = await loaderFixture(
-    {},
-    {
-      dependencies: { snapshot: async () => snapshot(2), workflow: async () => workflow(true) },
-      reviewer: async () => {
-        reviews++;
-        return approved;
-      },
-    },
-  );
-  try {
-    await fixture.start();
-    expect(await fixture.step("All verification passed according to the assistant")).toMatchObject({
-      allowedNextPhase: "verify",
-      hostWorkflow: { readyForReview: false, verifiedStages: [] },
-    });
-    const result = await fixture.checkpoint();
-    expect(result.isError).toBe(true);
-    expect(JSON.stringify(result)).toContain("independent verification");
-    expect(reviews).toBe(0);
-    expect(await fixture.status()).toMatchObject({
-      completionVerified: false,
-      architect: { completionApproved: false },
-    });
-  } finally {
-    await fixture.close();
-  }
-});
-
-test("Auto stage fallback uses the Architect review deadline beyond the old 27s boundary", async () => {
-  const started = Promise.withResolvers<void>();
-  const response = Promise.withResolvers<{ choice: "continue"; confidence: number }>();
-  let fallbackSignal: AbortSignal | undefined;
-  const f = await loaderFixture(
-    {},
-    {
-      dependencies: {
-        decision: () => async () => ({ choice: "continue", confidence: 0.58 }),
-        fallback: () => async (_evidence, signal) => {
-          fallbackSignal = signal;
-          started.resolve();
-          return response.promise;
-        },
-      },
-    },
-  );
-  let pending: ReturnType<typeof f.step> | undefined;
-  try {
-    await f.start();
-    jest.useFakeTimers();
-    pending = f.step();
-    await started.promise;
-    jest.advanceTimersByTime(40000);
-    await Promise.resolve();
-    expect(fallbackSignal?.aborted).toBe(false);
-    response.resolve({ choice: "continue", confidence: 0.95 });
-    expect(await pending).toMatchObject({ choice: "continue", isError: false });
-    expect(await f.status()).toMatchObject({
-      status: "running",
-      completionVerified: false,
-      fallbacks: "1/2",
-      decisionDiagnostics: {
-        attempts: [
-          { provider: "jev", confidence: 0.58, timeoutMs: 8000 },
-          { provider: "architect", outcome: "accepted", timeoutMs: 120000 },
-        ],
-      },
-    });
-  } finally {
-    response.resolve({ choice: "continue", confidence: 0.95 });
-    jest.useRealTimers();
-    await pending;
-    await f.close();
-  }
-});
-
-test("Auto checkpoint review keeps the normal Architect timeout beyond the 24s stop-hook window", async () => {
-  const started = Promise.withResolvers<void>();
-  const cancel = new AbortController();
-  let reviewSignal: AbortSignal | undefined;
-  let reviews = 0;
-  const f = await loaderFixture(
-    {},
-    {
-      dependencies: { snapshot: async () => snapshot(2), validate: async () => {} },
-      reviewer: async (_request, signal) => {
-        reviews++;
-        reviewSignal = signal;
-        started.resolve();
-        return new Promise((_resolve, reject) => {
-          const abort = () => reject(signal.reason ?? new Error("Canceled fixture review"));
-          signal.addEventListener("abort", abort, { once: true });
-          if (signal.aborted) abort();
-        });
-      },
-    },
-  );
-  let pending: ReturnType<typeof f.checkpoint> | undefined;
-  try {
-    await f.start();
-    await f.verify();
-    jest.useFakeTimers();
-    let settled = false;
-    pending = f.checkpoint(cancel.signal);
-    void pending.then(() => {
-      settled = true;
-    });
-    await started.promise;
-    jest.advanceTimersByTime(24001);
-    await Promise.resolve();
-    expect(reviewSignal?.aborted).toBe(false);
-    expect(settled).toBe(false);
-    expect(reviews).toBe(1);
-    cancel.abort();
-    const result = await pending;
-    expect(result.isError).toBe(true);
-    expect(reviewSignal?.aborted).toBe(true);
-    expect(await f.status()).toMatchObject({
-      completionVerified: false,
-      architect: { completionApproved: false },
-    });
-  } finally {
-    cancel.abort();
-    jest.useRealTimers();
-    await pending?.catch(() => {});
-    await f.close();
-  }
-});
-
-test("real loader blocks unregistered spawning while preserving native async tool paths during Auto", async () => {
-  const fixture = await loaderFixture();
-  try {
-    await fixture.start();
-    await fixture.step();
-    expect(
-      await fixture.extension.handlers.get("before_subagent_spawn")![0](
-        {
-          type: "before_subagent_spawn",
-          agent: "unregistered-worker",
-          task: "Delegate implementation",
-        },
-        fixture.ctx,
-      ),
-    ).toMatchObject({ block: true });
-    for (const [toolName, input] of [
-      ["task", { task: "Detached work in a child", async: true }],
-      ["bash", { command: "echo hello", async: true }],
-      ["bash", { command: "echo hello", name: "fixture-service" }],
-    ] as const) {
-      expect(
-        await fixture.extension.handlers.get("tool_call")![0](
-          {
-            type: "tool_call",
-            toolName,
-            toolCallId: `${toolName}-${JSON.stringify(input)}`,
-            input,
-          },
-          fixture.ctx,
-        ),
-      ).toBeUndefined();
-    }
-    expect(await fixture.status()).toMatchObject({ status: "running" });
-  } finally {
-    await fixture.close();
-  }
-});
-
 test("real loader preserves identical preparation retries but rejects replay after a turn starts", async () => {
   const fixture = await loaderFixture();
   try {
@@ -2177,7 +1476,7 @@ test("real loader preserves identical preparation retries but rejects replay aft
     const event = { type: "before_agent_start", prompt: fixture.bootstraps[0], systemPrompt: [] };
     await fixture.extension.handlers.get("before_agent_start")![0](event, fixture.ctx);
     await fixture.extension.handlers.get("before_agent_start")![0](event, fixture.ctx);
-    expect(await fixture.status()).toMatchObject({ status: "running", steps: "1" });
+    expect(await fixture.status()).toMatchObject({ status: "running", steps: "0" });
     await fixture.extension.handlers.get("turn_start")![0](
       { type: "turn_start", turnIndex: 0, timestamp: Date.now() },
       fixture.ctx,
@@ -2186,7 +1485,7 @@ test("real loader preserves identical preparation retries but rejects replay aft
     expect(await fixture.status()).toMatchObject({
       status: "draining",
       outcome: "needs_user",
-      steps: "1",
+      steps: "0",
     });
     expect(fixture.counts()).toMatchObject({ decisions: 0, aborts: 0 });
   } finally {
@@ -2195,914 +1494,47 @@ test("real loader preserves identical preparation retries but rejects replay aft
 });
 
 for (const interrupt of ["status", "unexpected-hidden", "new-user"] as const) {
-  test(`real loader ${interrupt} preserves the correct continuation ownership`, async () => {
-    const fixture = await loaderFixture({}, { minReviews: 3 });
+  test(`real loader ${interrupt} preserves native action ownership`, async () => {
+    const f = await loaderFixture();
     try {
-      await fixture.start();
-      fixture.complete();
-      await fixture.verify();
-      const continuation = (await fixture.stop()) as {
-        continue: boolean;
-        additionalContext: string;
-      };
-      expect(continuation.continue).toBe(true);
-      expect(await fixture.status()).toMatchObject({ status: "running", steps: "2" });
+      await f.start();
+      await f.step();
+      const before = await f.status();
       if (interrupt === "status") {
-        await fixture.extension.handlers.get("input")![0](
-          {
-            type: "input",
-            text: "/auto status",
-            source: "interactive",
-          },
-          fixture.ctx,
+        await f.extension.handlers.get("input")![0](
+          { type: "input", text: "/auto status", source: "interactive" },
+          f.ctx,
         );
-        await fixture.extension.commands.get("auto")!.handler("status", fixture.ctx);
-      } else if (interrupt === "new-user") {
-        await fixture.extension.handlers.get("input")![0](
-          {
-            type: "input",
-            text: "Work on a different user request",
-            source: "interactive",
-          },
-          fixture.ctx,
-        );
-      }
-      await fixture.extension.handlers.get("before_agent_start")![0](
-        {
-          type: "before_agent_start",
-          prompt:
-            interrupt === "status"
-              ? continuation.additionalContext
-              : "Work on a different user request",
-          systemPrompt: [],
-        },
-        fixture.ctx,
-      );
-      if (interrupt === "status") {
-        expect(await fixture.status()).toMatchObject({ status: "running", steps: "2" });
-        expect(await fixture.stop()).toMatchObject({ continue: true });
-        expect(await fixture.status()).toMatchObject({ status: "running", steps: "3" });
-        expect(fixture.counts().decisions).toBe(2);
-      } else {
-        expect(await fixture.status()).toMatchObject({
-          status: "draining",
-          outcome: "needs_user",
-          steps: "2",
+        await f.extension.commands.get("auto")!.handler("status", f.ctx);
+        expect(await f.status()).toMatchObject({
+          status: "running",
+          steps: before.steps,
+          selectedAction: before.selectedAction,
         });
-        expect(fixture.counts().decisions).toBe(2);
-        expect(fixture.counts().aborts).toBe(0);
+      } else {
+        if (interrupt === "new-user")
+          await f.extension.handlers.get("input")![0](
+            { type: "input", text: "A different request", source: "interactive" },
+            f.ctx,
+          );
+        await f.extension.handlers.get("before_agent_start")![0](
+          { type: "before_agent_start", prompt: "A different request", systemPrompt: [] },
+          f.ctx,
+        );
+        expect(await f.status()).toMatchObject(
+          interrupt === "new-user"
+            ? { status: "draining", outcome: "needs_user", steps: before.steps }
+            : { status: "running", steps: before.steps, selectedAction: before.selectedAction },
+        );
       }
+      expect(f.counts()).toMatchObject({ decisions: 1, aborts: 0 });
     } finally {
-      await fixture.close();
+      await f.close();
     }
   });
 }
 
-// A real OMP AgentSession plus local stream transport: /auto dispatch, extension
-// lifecycle, hidden continuation delivery, and agent-end handling are host code.
-// The combined case runs the pinned actual Rasen CLI and actual OMP write tools;
-// only model transports and the architect verdict are deterministic fixtures.
-for (const mode of [
-  "snapshots",
-  "real-cli",
-  "max-cap",
-  "config-free",
-  "brief",
-  "cancel-delivery",
-] as const) {
-  test(`real OMP session ${mode === "cancel-delivery" ? "holds cancelled queued delivery without aborting the native turn" : mode === "max-cap" ? "enforces an explicit one-turn cap without terminal retry" : `completes ${mode} with two architect reviews`}`, async () => {
-    let executable: string | undefined;
-    if (mode === "real-cli") {
-      executable = process.env.RASEN_BIN;
-      if (!executable) {
-        const stamp = await Bun.file(
-          path.resolve(import.meta.dir, "../node_modules/.cache/omp-architect/rasen-build.json"),
-        ).json();
-        expect(stamp.commit).toBe("f0ae20d19a30c265ad3f3ffaaa5bb3cd148d12dd");
-        executable = stamp.executable;
-      }
-    }
-    const cwd = await project(
-      mode === "config-free" || mode === "brief"
-        ? null
-        : {
-            ...(executable ? { rasenExecutable: executable } : {}),
-            ...(mode === "max-cap" ? { maxSteps: 1 } : {}),
-          },
-      2,
-    );
-    const guidance = "  Keep changes small  and preserve spacing\n  Report facts in Japanese\n";
-    const briefText = "Apply fixture-change\n  TS for fixture-change\nUnknown {untouched}\n";
-    if (mode === "brief") {
-      await Bun.write(
-        path.join(cwd, ".omp/brief/example/_shared.md"),
-        "---\nvariable: change\n---\nApply {change}\n{blocks}\nUnknown {untouched}\n",
-      );
-      await Bun.write(
-        path.join(cwd, ".omp/brief/example/ts.md"),
-        "---\naliases: typescript\n---\n  TS for {change}\n",
-      );
-    }
-    const taskPath = path.join(cwd, "rasen", "changes", "fixture-change", "tasks.md");
-    const implementationPath = path.join(cwd, "fixture-output.txt");
-    const taskCount = mode === "real-cli" ? 15 : 2;
-    const tasks = (complete: number) =>
-      `## 1. Local integration fixture\n\n${Array.from(
-        { length: taskCount },
-        (_, index) =>
-          `- [${complete > index ? "x" : " "}] 1.${index + 1} Mark fixture unit ${index + 1}\n`,
-      ).join("")}`;
-    let workflowPath = "";
-    if (executable) {
-      const cli = (args: string[]) => {
-        const result = spawnSync(executable!, args, {
-          cwd,
-          shell: false,
-          encoding: "utf8",
-          timeout: 15000,
-          maxBuffer: 1024 * 1024,
-          env: {
-            ...process.env,
-            HOME: path.join(cwd, "isolated-home"),
-            XDG_CONFIG_HOME: path.join(cwd, "isolated-config"),
-            XDG_DATA_HOME: path.join(cwd, "isolated-data"),
-            XDG_STATE_HOME: path.join(cwd, "isolated-state"),
-            RASEN_TELEMETRY: "0",
-            DO_NOT_TRACK: "1",
-            CI: "1",
-            NO_COLOR: "1",
-          },
-        });
-        if (result.error || result.status !== 0)
-          throw new Error(`Real Rasen fixture ${args[0]} failed`);
-        return result.stdout;
-      };
-      expect(cli(["--version"]).trim()).toMatch(/^0\.1\.8 \(dev\.local f0ae20d[0-9a-f]*\)$/);
-      // Install only the generated apply skill. rasen-auto is never installed.
-      cli(["config", "set", "profile", "custom"]);
-      cli(["config", "set", "workflows", '["apply"]']);
-      cli(["init", "--tools", "omp", "--profile", "custom"]);
-      await expect(fs.lstat(path.join(cwd, ".omp/skills/rasen-auto"))).rejects.toMatchObject({
-        code: "ENOENT",
-      });
-      cli(["new", "change", "fixture-change", "--schema", "spec-driven", "--json"]);
-      await Bun.write(taskPath, tasks(0));
-      await Promise.all(
-        Array.from({ length: 85 }, (_, i) =>
-          Bun.write(
-            path.join(cwd, "fixture-sources", `${i}.txt`),
-            `Fixture source ${i}: inspect this scoped module\n`,
-          ),
-        ),
-      );
-      const status = JSON.parse(cli(["status", "--change", "fixture-change", "--json"]));
-      workflowPath = path.join(status.ephemeraDir, "auto-run.json");
-      await expect(fs.lstat(workflowPath)).rejects.toMatchObject({ code: "ENOENT" });
-      await Bun.write(
-        path.join(path.dirname(taskPath), "specs", "fixture-progress", "spec.md"),
-        "## ADDED Requirements\n\n### Requirement: Fixture progress\nThe fixture SHALL record the completion of its local units.\n\n#### Scenario: Unit completed\n- **WHEN** a local fixture unit finishes\n- **THEN** its task checkbox is checked\n",
-      );
-    }
-    if (mode === "real-cli") {
-      const initialized = spawnSync("git", ["init", "--quiet"], { cwd, encoding: "utf8" });
-      expect(initialized.status).toBe(0);
-      // Exercise the real default snapshot reader with the common tracked
-      // CLAUDE.md -> AGENTS.md convention, not a mocked workspace snapshot.
-      if (supportsSymlinks) {
-        await fs.writeFile(path.join(cwd, "AGENTS.md"), "Local fixture instructions\n");
-        await fs.symlink("AGENTS.md", path.join(cwd, "CLAUDE.md"), "file");
-        expect(spawnSync("git", ["add", "AGENTS.md", "CLAUDE.md"], { cwd }).status).toBe(0);
-      }
-      await Bun.write(
-        path.join(cwd, ".gitignore"),
-        ".test-artifacts/\nisolated-agent/\nisolated-home/\nisolated-config/\nisolated-data/\nisolated-state/\n",
-      );
-    }
-    const auth = await AuthStorage.create(":memory:");
-    const provider = `auto-fixture-${crypto.randomUUID()}`;
-    const api = `auto-api-${crypto.randomUUID()}`;
-    const settings = Settings.isolated({
-      "memory.backend": "off",
-      "bash.autoBackground.enabled": false,
-      "async.enabled": mode === "real-cli",
-      // This fixture exercises in-process jobs, not the separate service broker.
-      // The container forbids its native FileLock; do not change user settings.
-      "launch.enabled": false,
-      "tools.xdev": mode === "brief",
-      "task.speculativeLaunch": false,
-      "task.maxRuntimeMs": 30000,
-      "task.agentIdleTtlMs": 1,
-      modelRoles: Object.fromEntries(
-        [
-          "default",
-          "implementation",
-          "architect",
-          "research",
-          "task",
-          "smol",
-          "tiny",
-          "title",
-          "compaction",
-        ].map((role) => [role, `${provider}/${role === "default" ? "main" : role}`]),
-      ),
-    });
-    for (const agent of ["omp-worker", "omp-reviewer"])
-      await Bun.write(
-        path.join(cwd, ".omp/agents", `${agent}.md`),
-        (await Bun.file(path.resolve(import.meta.dir, "../agents", `${agent}.md`)).text()).replace(
-          "spawns: []",
-          "spawns: []\nblocking: false",
-        ),
-      );
-    const workerPrefix = `auto_${crypto.randomUUID().replaceAll("-", "")}`;
-    const workerIds = ["apply", "verify", "fix", "delta"].map(
-      (phase) => `${workerPrefix}_${phase}`,
-    );
-    const childStorage = new MemorySessionStorage();
-    const originalOpen = SessionManager.open.bind(SessionManager);
-    const open = spyOn(SessionManager, "open").mockImplementation(
-      (file, directory, backend, options) =>
-        originalOpen(
-          file,
-          directory,
-          workerIds.some((id) => path.basename(file) === `${id}.jsonl`) ? childStorage : backend,
-          options,
-        ),
-    );
-    // Native child journals use the same supported in-memory test backend as
-    // auto-native-worker.test.ts. Native tasks, tools and result receipts are real.
-    const registry = new ModelRegistry(auth, path.join(cwd, "models.yml"), { settings });
-    auth.keys.setRuntime(provider, "fixture-not-a-secret");
-    let requests = 0;
-    let reads = 0;
-    let validations = 0;
-    let decisions = 0;
-    let reviews = 0;
-    const reviewEvidence: string[] = [];
-    const reviewMaterials: string[] = [];
-    let confirms = 0;
-    let beforeStarts = 0;
-    const stops: boolean[] = [];
-    const errors: unknown[] = [];
-    const sends: Promise<unknown>[] = [];
-    const contexts: string[] = [];
-    const prompts: string[] = [];
-    const childTurns = new Map<string, number>();
-    const nativeTaskResults: unknown[] = [];
-    // Native consumed jobs are evicted after 30 seconds. Preserve receipts when
-    // observed, rather than treating the live job cache as a durable journal.
-    const nativeJobReceipts = new Map<
-      string,
-      { agentId?: string; type: string; status: string; resultText?: string }
-    >();
-    const captureNativeReceipts = () => {
-      for (const job of session?.asyncJobManager?.getAllJobs() ?? []) {
-        if (workerIds.includes(job.agentId ?? "") && job.status !== "running")
-          nativeJobReceipts.set(job.id, {
-            agentId: job.agentId,
-            type: job.type,
-            status: job.status,
-            resultText: job.resultText,
-          });
-      }
-    };
-    const realCliSteps = [1, "reads", 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16] as const;
-    let realCliCursor = 0;
-    let scriptFailed = false;
-    const executedRealCliSteps: Array<number | string> = [];
-    const phaseResults: unknown[] = [];
-    const decisionStates: Array<Record<string, unknown>> = [];
-    const providerConfig: Parameters<ModelRegistry["registerProvider"]>[1] = {
-      baseUrl: "https://unused.invalid",
-      apiKey: "fixture-not-a-secret",
-      api,
-      streamSimple(model, context) {
-        const child = context.tools?.some((tool) => tool.name === "yield");
-        const main = model.id === "main";
-        if (main) {
-          requests++;
-          contexts.push(JSON.stringify(context.messages));
-        }
-        const stream = createAssistantMessageEventStream();
-        const calls: Array<{
-          type: "toolCall";
-          id: string;
-          name: string;
-          arguments: Record<string, unknown>;
-        }> = [];
-        const call = (name: string, args: Record<string, unknown>) => {
-          calls.push({
-            type: "toolCall",
-            id: `${name}-${crypto.randomUUID()}`,
-            name,
-            arguments: args,
-          });
-        };
-        if (child) {
-          const serialized = JSON.stringify(context.messages);
-          const assignment = workerIds
-            .filter((id) => serialized.includes(id))
-            .sort((a, b) => serialized.lastIndexOf(b) - serialized.lastIndexOf(a))[0];
-          if (!assignment)
-            throw new Error("Native child did not receive its named fixture assignment");
-          const turn = (childTurns.get(assignment) ?? 0) + 1;
-          childTurns.set(assignment, turn);
-          const applying = assignment.endsWith("_apply");
-          const fixing = assignment.endsWith("_fix");
-          if (turn === 1) {
-            if (applying) {
-              call("write", { path: taskPath, content: tasks(taskCount) });
-              call("write", { path: implementationPath, content: "Scoped fixture output\n" });
-            } else if (fixing)
-              call("write", {
-                path: implementationPath,
-                content: "Scoped fixture output\nVerified footer\n",
-              });
-            else {
-              call("read", { path: taskPath });
-              call("read", { path: implementationPath });
-            }
-          } else {
-            const report = `Native ${assignment}: ${applying ? "Completed the actual implementation and task-file update" : fixing ? "Added the requested footer" : "Read the actual implementation and completed task file"}`;
-            call("yield", {
-              data:
-                mode === "real-cli" && !applying && !fixing
-                  ? {
-                      report,
-                      // More lines than OMP's native 5000-line preview limit;
-                      // the full retained artifact still fits Auto's 128 KiB bound.
-                      checks: Array.from({ length: 6000 }, () => "ok"),
-                      finalFinding: assignment.endsWith("_verify")
-                        ? "LATE_NATIVE_FINDING: add the missing fixture footer"
-                        : "LATE_NATIVE_DELTA: verified footer; no remaining blocking findings",
-                    }
-                  : report,
-            });
-          }
-        } else if (main) {
-          captureNativeReceipts();
-          // Background settlement may take any number of wait calls. Advance
-          // the deterministic model script by completed actions, never by a
-          // transport request index or wall-clock-dependent wait count.
-          const pendingNative = session?.asyncJobManager
-            ?.getAllJobs()
-            .some((job) => workerIds.includes(job.agentId ?? "") && job.status === "running");
-          const step =
-            mode === "real-cli"
-              ? scriptFailed
-                ? undefined
-                : pendingNative
-                  ? "wait"
-                  : realCliSteps[realCliCursor++]
-              : requests;
-          if (mode === "real-cli" && step !== "wait" && step !== undefined)
-            executedRealCliSteps.push(step);
-          if (mode === "cancel-delivery") {
-            // The host may still call the provider. Our cancelled instructions
-            // must be absent, and Auto must not create another scheduling turn.
-            expect(JSON.stringify(context.messages)).not.toContain("Auto run:");
-          } else if (requests === 1)
-            call("auto_step", { summary: "Initial extension-owned prepared-change frontier" });
-          else if (step === "wait") call("wait", {});
-          else if (step === "reads") {
-            for (let i = 0; i < 85; i++)
-              call("read", { path: path.join(cwd, "fixture-sources", `${i}.txt`) });
-          } else {
-            const assignment = (phase: number, agent: string) =>
-              call("task", {
-                name: workerIds[phase],
-                agent,
-                task: `${workerIds[phase]}: ${phase === 0 ? "Complete the scoped fixture tasks" : "Independently inspect the scoped completed tasks"}`,
-                solutionSpace: "Only the fixture task file and one terminal native yield",
-              });
-            if (step === 2) assignment(0, "omp-worker");
-            if (step === 3)
-              call("auto_step", {
-                summary: "Native implementation completed the actual fixture tasks",
-              });
-            if (step === 4) assignment(1, "omp-reviewer");
-            if (step === 5)
-              call("auto_step", {
-                summary: "Independent native verification settled with its actual receipt",
-              });
-            if ((mode !== "max-cap" && step === 6) || (mode === "real-cli" && step === 13))
-              call("write", {
-                path: "local://architect-review/auto-result.md",
-                content: `${step === 6 ? "Initial" : "Delta"} evidence: native implementation completed the scoped task file; an independent native reviewer read the completed tasks and reported no blocking findings. Downstream shipping is pending.`,
-              });
-            if (step === 7 || (mode === "real-cli" && step === 14))
-              call("architect_checkpoint", {
-                phase: "completion",
-                evidenceRef: "local://architect-review/auto-result.md",
-              });
-            if (mode === "real-cli") {
-              if (step === 8)
-                call("auto_step", {
-                  summary: "Triage the missing-footer review finding",
-                  transition: "triage",
-                });
-              if (step === 9) assignment(2, "omp-worker");
-              if (step === 10)
-                call("auto_step", { summary: "Native fixer added the requested footer" });
-              if (step === 11) assignment(3, "omp-reviewer");
-              if (step === 12)
-                call("auto_step", {
-                  summary: "Independent delta verification settled with its actual receipt",
-                });
-              if (step === 15)
-                call("auto_step", {
-                  summary:
-                    "Confirm the approved host settlement before returning the final summary",
-                });
-            } else {
-              if (step === 8)
-                call("auto_step", {
-                  summary: "Proceed to the configured additional independent review round",
-                });
-              if (step === 9)
-                call("architect_checkpoint", {
-                  phase: "completion",
-                  evidenceRef: "local://architect-review/auto-result.md",
-                });
-              if (step === 10) {
-                const summary =
-                  "Confirm the approved host settlement before returning the final summary";
-                if (mode === "brief")
-                  call("eval", {
-                    language: "js",
-                    reset: true,
-                    code: `console.log(await tool.write(${JSON.stringify({ path: "xd://auto_step", content: JSON.stringify({ summary }) })}))`,
-                    timeout: 20,
-                  });
-                else call("auto_step", { summary });
-              }
-            }
-          }
-        }
-        const toolStep = calls.length > 0;
-        const message: AssistantMessage = {
-          role: "assistant",
-          api,
-          provider,
-          model: model.id,
-          content: toolStep
-            ? calls
-            : [{ type: "text", text: `Supervised workflow fixture response ${requests}` }],
-          stopReason: toolStep ? "toolUse" : "stop",
-          timestamp: Date.now(),
-          usage: {
-            input: 0,
-            output: 0,
-            cacheRead: 0,
-            cacheWrite: 0,
-            totalTokens: 0,
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-          },
-        };
-        stream.push({ type: "start", partial: message });
-        for (const [contentIndex, toolCall] of calls.entries()) {
-          stream.push({ type: "toolcall_start", contentIndex, partial: message });
-          stream.push({
-            type: "toolcall_delta",
-            contentIndex,
-            delta: JSON.stringify(toolCall.arguments),
-            partial: message,
-          });
-          stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: message });
-        }
-        stream.push({ type: "done", reason: toolStep ? "toolUse" : "stop", message });
-        stream.end();
-        return stream;
-      },
-      models: [
-        "main",
-        "implementation",
-        "architect",
-        "research",
-        "task",
-        "smol",
-        "tiny",
-        "title",
-        "compaction",
-      ].map((name) => ({
-        id: name,
-        name: `Local Auto fixture ${name}`,
-        reasoning: false,
-        input: ["text" as const],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 1000000,
-        maxTokens: 1024,
-      })),
-    };
-    registry.registerProvider(provider, providerConfig, provider);
-    const dependencies: AutoDependencies = {
-      workflow:
-        mode === "real-cli"
-          ? async (...args) => {
-              try {
-                const value = await readRasenWorkflow(...args);
-                if (value.kind === "invalid") errors.push(value);
-                return value;
-              } catch (error) {
-                errors.push({ phase: "workflow", error: String(error) });
-                throw error;
-              }
-            }
-          : async () => workflow(requests >= 2),
-      ...(mode !== "real-cli"
-        ? {
-            snapshot: async () => {
-              reads++;
-              return snapshot(requests >= 2 ? 2 : 0);
-            },
-          }
-        : {}),
-      validate: async (...args) => {
-        validations++;
-        try {
-          if (mode === "real-cli") await validateRasenChange(...args);
-        } catch (error) {
-          errors.push({ phase: "validation", error: String(error) });
-          throw error;
-        }
-      },
-      decision: () =>
-        mode === "real-cli"
-          ? createJevProvider(
-              { model: "jev-latest", timeoutMs: 500, maxEvidenceChars: 12000 },
-              {
-                readApiKey: () => "local-fixture-not-a-secret",
-                fetch: async (url, init) => {
-                  decisions++;
-                  expect(url).toBe("https://api.typesafe.ai/v1/systemone");
-                  const state = JSON.parse(String(init.body)).state;
-                  expect(state.change).toBe("fixture-change");
-                  expect(Number.isInteger(state.completed)).toBe(true);
-                  expect(Number.isInteger(state.remaining)).toBe(true);
-                  decisionStates.push(state);
-                  return new Response(
-                    JSON.stringify({
-                      model: "jev-latest",
-                      answers: {
-                        next: {
-                          type: "choice",
-                          choice: "continue",
-                          confidence: 0.99,
-                          probabilities: {
-                            continue: 0.97,
-                            replan: 0.01,
-                            needs_user: 0.01,
-                            uncertain: 0.01,
-                          },
-                        },
-                      },
-                      usage: { input_tokens: 1, output_tokens: 1 },
-                    }),
-                  );
-                },
-              },
-            )
-          : async () => {
-              decisions++;
-              return { choice: "continue", confidence: 0.99 };
-            },
-      fallback: () => async () => {
-        throw new Error("Unexpected fallback");
-      },
-    };
-    // Keep the journal isolated in memory while native review artifacts remain readable on disk.
-    const sessionManager = SessionManager.inMemory(cwd);
-    sessionManager.adoptArtifactManager(new ArtifactManager(path.join(cwd, ".test-artifacts")));
-    let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
-    try {
-      const created = await createAgentSession({
-        cwd,
-        agentDir: path.join(cwd, "isolated-agent"),
-        authStorage: auth,
-        modelRegistry: registry,
-        model: registry
-          .getAvailable()
-          .find((model) => model.provider === provider && model.id === "main"),
-        settings,
-        sessionManager,
-        extensions: [
-          (pi) => {
-            if (mode === "cancel-delivery")
-              pi.on("context", async () => {
-                // Stop after native sendMessage dispatch, before Auto admits provider context.
-                await session!
-                  .extensionRunner!.getCommand("auto")!
-                  .handler("stop", session!.extensionRunner!.createCommandContext());
-              });
-          },
-          withAgentDir(
-            extensionFactory(
-              () => async (request) => {
-                reviews++;
-                reviewEvidence.push(request.evidence);
-                reviewMaterials.push(request.material.content);
-                return mode === "real-cli" && reviews === 1
-                  ? {
-                      decision: "revise",
-                      summary: "Add the missing fixture footer",
-                      issues: ["The output needs the verified footer before completion"],
-                    }
-                  : approved;
-              },
-              dependencies,
-            ),
-            path.join(cwd, "isolated-agent"),
-          ),
-          (pi) => {
-            pi.registerProvider(provider, providerConfig);
-            pi.on("before_agent_start", (event, ctx) => {
-              if (ctx.agent.kind !== "main") return;
-              beforeStarts++;
-              prompts.push(event.prompt);
-            });
-            pi.on("session_stop", (event, ctx) => {
-              if (ctx.agent.kind === "main") stops.push(event.stop_hook_active);
-            });
-            pi.on("tool_result", (event, ctx) => {
-              if (ctx.agent.kind !== "main") return;
-              captureNativeReceipts();
-              if (mode === "real-cli" && event.isError) {
-                const expectedRevision =
-                  event.toolName === "architect_checkpoint" &&
-                  reviews === 1 &&
-                  (event.details as { review?: { charged?: boolean } })?.review?.charged === true;
-                if (!expectedRevision) {
-                  scriptFailed = true;
-                  errors.push({
-                    tool: event.toolName,
-                    content: event.content,
-                    details: event.details,
-                  });
-                }
-              }
-              if (event.toolName === "task") nativeTaskResults.push(event.details);
-              if (event.toolName === "auto_step") phaseResults.push(event.content);
-            });
-          },
-        ],
-        disableExtensionDiscovery: true,
-        skills: [],
-        rules: [],
-        contextFiles: [],
-        promptTemplates: [],
-        slashCommands: [],
-        enableMCP: false,
-        enableLsp: false,
-        enableIrc: false,
-        skipPythonPreflight: true,
-        spawns: "omp-worker,omp-reviewer",
-        toolNames:
-          mode === "real-cli"
-            ? ["task", "wait", "read", "write"]
-            : mode === "brief"
-              ? ["task", "read", "write", "eval"]
-              : ["task", "write"],
-        autoApprove: true,
-        cacheWarming: false,
-        bindProcessState: false,
-        systemPrompt: "Execute only the local smoke-test fixture",
-        hasUI: true,
-      });
-      session = created.session;
-      expect(created.extensionsResult.errors).toEqual([]);
-      await initializeExtensions(session, {
-        reportSendError: (_action, error) => {
-          errors.push(error);
-        },
-        reportRuntimeError: (error) => {
-          errors.push(error);
-        },
-        trackExtensionSend: (task) => {
-          sends.push(task);
-        },
-        uiContext: {
-          ...session.extensionRunner!.getUIContext(),
-          notify: (message: string, type: string) => {
-            if (type === "error") errors.push(message);
-          },
-          custom: async <T>() => {
-            confirms++;
-            return true as T;
-          },
-        } as unknown as ExtensionUIContext,
-      });
-      await session.prompt(
-        mode === "brief"
-          ? `/auto start fixture-change --brief example typescript -- ${guidance}`
-          : `/auto start fixture-change ${guidance}`,
-      );
-      await Promise.all(sends);
-      await session.waitForIdle();
-      const tool = session.extensionRunner!.getRegisteredTool("auto_status")!.definition;
-      const readStatus = () =>
-        tool.execute("status", {}, undefined, undefined, session!.extensionRunner!.createContext());
-      let result = await readStatus();
-      const drainDeadline = Date.now() + 20000;
-      for (;;) {
-        if (result.content[0].type !== "text") throw new Error("Missing status text");
-        const observed = JSON.parse(result.content[0].text);
-        if (observed.status === "completed" || observed.status === "paused") break;
-        expect(["running", "draining"]).toContain(observed.status);
-        expect(observed.completionVerified).toBe(false);
-        if (Date.now() >= drainDeadline)
-          throw new Error(`Native Auto did not drain: ${result.content[0].text}`);
-        await new Promise((resolve) => setTimeout(resolve, 10));
-        result = await readStatus();
-      }
-      if (result.content[0].type !== "text") throw new Error("Missing status text");
-      expect(errors).toEqual([]);
-      if (mode === "cancel-delivery") {
-        expect(requests).toBe(1);
-        expect(reads).toBeGreaterThanOrEqual(1);
-        expect(decisions).toBe(0);
-        expect(reviews).toBe(0);
-        expect(session.isStreaming).toBe(false);
-        expect(JSON.parse(result.content[0].text)).toMatchObject({
-          status: "paused",
-          outcome: "needs_user",
-          completionVerified: false,
-        });
-        return;
-      }
-      for (const prompt of prompts) {
-        expect(prompt).toContain(guidance);
-        if (mode === "brief") expect(prompt).toContain(briefText);
-      }
-      for (const evidence of reviewEvidence) {
-        expect(JSON.parse(evidence).request).toContain(guidance);
-        if (mode === "brief") expect(JSON.parse(evidence).request).toContain(briefText);
-      }
-      const delivered = session.agent.state.messages.filter(
-        (message) => message.role === "custom" && message.customType === "omp-auto-run",
-      );
-      expect(delivered).toHaveLength(1);
-      expect(delivered[0]).toMatchObject({
-        role: "custom",
-        display: false,
-        attribution: "agent",
-      });
-      expect(session.agent.state.messages.filter((message) => message.role === "user")).toEqual([]);
-      const firstContext = JSON.parse(contexts[0]);
-      const payload = firstContext.find((message: { content: unknown }) =>
-        JSON.stringify(message.content).includes("Auto run:"),
-      );
-      expect(payload.role).toBe("developer");
-      expect(JSON.stringify(payload.content)).toContain("Register the exact approved todo steps");
-      expect(JSON.stringify(payload.content)).not.toContain("installed rasen-auto workflow");
-      expect(JSON.stringify(payload.content)).not.toContain(
-        "Complete installed rasen-auto fixture body",
-      );
-      await expect(fs.lstat(path.join(cwd, ".omp/skills/rasen-auto"))).rejects.toMatchObject({
-        code: "ENOENT",
-      });
-      const native = delivered[0];
-      if (native.role !== "custom") throw new Error("Expected internal native message");
-      const ref = (native.details as { ref: string }).ref;
-      const saved = await Bun.file((await sessionManager.getArtifactPath(ref.slice(11)))!).text();
-      expect(saved).toContain("Auto run:");
-      expect(saved).not.toContain("installed rasen-auto workflow");
-      expect(confirms).toBe(1);
-      if (mode === "real-cli") expect(executedRealCliSteps).toEqual([...realCliSteps]);
-      else expect(requests).toBe(mode === "max-cap" ? 6 : 11);
-      if (mode !== "real-cli") expect(reads).toBeGreaterThanOrEqual(mode === "max-cap" ? 3 : 4);
-      expect(decisions).toBe(mode === "max-cap" ? 3 : mode === "real-cli" ? 6 : 4);
-      expect(validations).toBe(mode === "max-cap" ? 1 : 4);
-      expect(reviews).toBe(mode === "max-cap" ? 0 : 2);
-      expect(beforeStarts).toBe(0);
-      expect(stops).toEqual([false]);
-      if (mode === "brief") {
-        const evalResults = session.agent.state.messages.filter(
-          (message) => message.role === "toolResult" && message.toolName === "eval",
-        );
-        expect(evalResults).toHaveLength(1);
-        expect(evalResults[0]).toMatchObject({ isError: false });
-        expect(JSON.stringify(evalResults[0])).toContain("settled");
-      }
-      if (mode !== "max-cap")
-        expect(contexts.at(-1)).toContain(
-          mode === "real-cli"
-            ? "Add the missing fixture footer"
-            : "Minimum independent review rounds not yet met",
-        );
-
-      expect(JSON.parse(result.content[0].text)).toMatchObject({
-        status: mode === "max-cap" ? "paused" : "completed",
-        outcome: mode === "max-cap" ? "budget_exhausted" : "completed",
-        steps: mode === "max-cap" ? "1/1" : "1",
-        completionVerified: mode !== "max-cap",
-        hostWorkflow: { phase: mode === "max-cap" ? "review" : "settled" },
-      });
-      const phases = phaseResults.map((content) => {
-        const text = (content as Array<{ type: string; text?: string }>).find(
-          (part) => part.type === "text",
-        );
-        return JSON.parse(text!.text!).hostWorkflow.phase;
-      });
-      expect(phases).toEqual(
-        mode === "max-cap"
-          ? ["apply", "verify", "review"]
-          : mode === "real-cli"
-            ? ["apply", "verify", "review", "fix", "verify", "delta-review", "settled"]
-            : ["apply", "verify", "review", "delta-review", "settled"],
-      );
-      if (mode === "real-cli") {
-        expect(await Bun.file(taskPath).text()).toBe(tasks(15));
-        expect((await readRasenSnapshot(cwd, "fixture-change", { executable })).progress).toEqual({
-          total: 15,
-          complete: 15,
-          remaining: 0,
-        });
-        expect((await readRasenWorkflow(cwd, "fixture-change", { executable })).kind).toBe(
-          "absent",
-        );
-        await expect(fs.lstat(workflowPath)).rejects.toMatchObject({ code: "ENOENT" });
-        expect(nativeTaskResults).toHaveLength(4);
-        captureNativeReceipts();
-        const nativeJobs = [...nativeJobReceipts.values()];
-        expect(nativeJobs).toHaveLength(4);
-        expect(nativeJobs.map((job) => job.agentId).sort()).toEqual([...workerIds].sort());
-        expect(nativeJobs.every((job) => job.type === "task" && job.status === "completed")).toBe(
-          true,
-        );
-        expect(childTurns.size).toBe(4);
-        expect(reviewMaterials[0]).toContain("LATE_NATIVE_FINDING: add the missing fixture footer");
-        expect(reviewMaterials[1]).toContain(
-          "LATE_NATIVE_DELTA: verified footer; no remaining blocking findings",
-        );
-        const verificationJobs = nativeJobs.filter(
-          (job) => job.agentId?.endsWith("_verify") || job.agentId?.endsWith("_delta"),
-        );
-        expect(verificationJobs).toHaveLength(2);
-        for (const job of verificationJobs) expect(job.resultText).not.toContain("LATE_NATIVE_");
-        expect(
-          decisionStates.map((state) => JSON.parse(String(state.summary)).allowedPhase),
-        ).toEqual(phases.slice(0, -1));
-        expect(JSON.parse(result.content[0].text)).toMatchObject({
-          hostWorkflow: { source: "builtin", phase: "settled", verifiedStages: ["verify"] },
-          workflow: { kind: "absent" },
-        });
-        expect(await Bun.file(implementationPath).text()).toBe(
-          "Scoped fixture output\nVerified footer\n",
-        );
-        for (const evidence of reviewEvidence) {
-          expect(evidence).toContain("Mark fixture unit 1");
-          expect(evidence).toContain("Mark fixture unit 15");
-          expect(evidence).toContain("Strict CLI artifact validation passed");
-        }
-        expect(Number(JSON.parse(result.content[0].text).toolCalls)).toBeGreaterThan(80);
-        if (supportsSymlinks) {
-          const before = await readWorkspaceEvidence(cwd);
-          await fs.writeFile(path.join(cwd, "AGENTS.md"), "Changed fixture instructions\n");
-          expect((await readWorkspaceEvidence(cwd)).fingerprint).not.toBe(before.fingerprint);
-          const refreshed = await tool.execute(
-            "status-after-link-target-edit",
-            {},
-            undefined,
-            undefined,
-            session.extensionRunner!.createContext(),
-          );
-          if (refreshed.content[0].type !== "text") throw new Error("Missing refreshed status");
-          expect(JSON.parse(refreshed.content[0].text)).toMatchObject({
-            status: "completed",
-            completionVerified: false,
-          });
-        }
-        const readResults = session.agent.state.messages.filter(
-          (message) => message.role === "toolResult" && message.toolName === "read",
-        );
-        expect(readResults).toHaveLength(85);
-        // Preparation, 85 reads, implementation and both completion checkpoints
-        // stayed in the same LEAD turn, with no tool-count forced stop.
-        expect(stops).toEqual([false]);
-        const failures = session.agent.state.messages.filter(
-          (message) => message.role === "toolResult" && message.isError,
-        );
-        expect(failures).toHaveLength(1);
-        expect(failures[0]).toMatchObject({
-          toolName: "architect_checkpoint",
-          details: { decision: "revise", review: { charged: true, attempt: 1 } },
-        });
-        expect(JSON.stringify(failures[0])).toContain("Add the missing fixture footer");
-      }
-    } finally {
-      await session?.dispose();
-      for (const id of workerIds) {
-        const child = AgentRegistry.global().get(id);
-        await child?.session?.dispose();
-        AgentRegistry.global().unregister(id);
-      }
-      open.mockRestore();
-      registry.clearSourceRegistrations(provider);
-      auth.close();
-      await fs.rm(cwd, { recursive: true, force: true });
-    }
-  }, 90000);
-}
+// Full native OMP child execution is covered by the separate native suites.
 
 test.each([
   "blocked",
@@ -3287,73 +1719,6 @@ test("active Auto status calls keep their tool budget, and terminal diagnostics 
   }
 });
 
-test("delayed Auto native artifact admission cannot alter a newer request after session switch", async () => {
-  let reviews = 0;
-  const f = await loaderFixture(
-    {},
-    {
-      reviewer: async () => {
-        reviews++;
-        return approved;
-      },
-      dependencies: { snapshot: async () => snapshot(2), validate: async () => {} },
-    },
-  );
-  const entered = Promise.withResolvers<void>();
-  const release = Promise.withResolvers<void>();
-  const manager = f.ctx.sessionManager;
-  const original = manager.saveArtifact.bind(manager);
-  let stopping: ReturnType<typeof f.checkpoint> | undefined;
-  try {
-    await f.start();
-    await f.verify();
-    const evidenceRef = await f.evidence(
-      "Full scoped verification evidence before the delayed admission",
-    );
-    manager.saveArtifact = async (content, kind) => {
-      entered.resolve();
-      await release.promise;
-      return original(content, kind);
-    };
-    stopping = f.extension.tools
-      .get("architect_checkpoint")!
-      .definition.execute(
-        "delayed-completion",
-        { phase: "completion", evidenceRef },
-        undefined,
-        undefined,
-        f.ctx,
-      );
-    await entered.promise;
-    await f.extension.handlers.get("session_switch")![0](
-      { type: "session_switch", reason: "resume", previousSessionFile: undefined },
-      f.ctx,
-    );
-    await f.extension.handlers.get("before_agent_start")![0](
-      { type: "before_agent_start", prompt: "A completely new request", systemPrompt: [] },
-      f.ctx,
-    );
-    const before = await f.status();
-    expect(before.architect).toMatchObject({
-      completionApproved: false,
-      lastReview: null,
-      attempts: { completion: 0 },
-    });
-    release.resolve();
-    await stopping;
-    const after = await f.status();
-    expect(after.architect).toEqual(before.architect);
-    expect(after.status).toBe("idle");
-    expect(reviews).toBe(0);
-    expect(f.counts().aborts).toBe(0);
-  } finally {
-    release.resolve();
-    await stopping?.catch(() => {});
-    manager.saveArtifact = original;
-    await f.close();
-  }
-});
-
 test("internal Auto payload uses a verified session artifact and context admission without a user prompt", async () => {
   const f = await loaderFixture();
   try {
@@ -3374,7 +1739,7 @@ test("internal Auto payload uses a verified session artifact and context admissi
       const result = await f.extension.handlers.get("context")![0](event, f.ctx);
       expect(result).toEqual({ messages: [delivery] });
     }
-    expect(await f.status()).toMatchObject({ status: "running", steps: "1" });
+    expect(await f.status()).toMatchObject({ status: "running", steps: "0" });
     expect(f.counts().aborts).toBe(0);
   } finally {
     await f.close();
@@ -3490,13 +1855,11 @@ for (const userKind of ["text", "skill"] as const) {
     const f = await loaderFixture({}, { minReviews: 2 });
     try {
       await f.start();
-      f.complete();
-      await f.verify();
-      const next = (await f.stop()) as { additionalContext: string };
+      const tag = (f.deliveries[0]!.details as { controller: string }).controller;
       const continuation = {
         role: "custom",
         customType: "session-stop-continuation",
-        content: next.additionalContext,
+        content: `Old continuation\n\nAuto continuation: ${tag}:retired-run:2`,
         display: false,
         attribution: "agent",
         timestamp: Date.now(),
@@ -3549,77 +1912,6 @@ for (const userKind of ["text", "skill"] as const) {
   });
 }
 
-test("Jev selects recorded stage frontiers, caches task-only churn, and never substitutes for approvals", async () => {
-  let observed = workflow(false);
-  const f = await loaderFixture({}, { dependencies: { workflow: async () => observed } });
-  try {
-    await f.start();
-    expect(await f.step()).toMatchObject({ choice: "continue", cached: false, ready: ["apply"] });
-    expect(f.counts().decisions).toBe(1);
-    f.setProgress(1);
-    expect(await f.step("One checkbox changed without a stage transition")).toMatchObject({
-      cached: true,
-    });
-    expect(f.counts().decisions).toBe(1);
-    observed = workflow(true);
-    expect(
-      await f.step("External stage claims changed while a task remains incomplete"),
-    ).toMatchObject({
-      cached: false,
-      ready: ["apply"],
-      allowedNextPhase: "apply",
-    });
-    expect(f.counts().decisions).toBe(2);
-    expect(await f.status()).toMatchObject({
-      status: "running",
-      progress: { complete: 1, remaining: 1 },
-      architect: { completionApproved: false },
-    });
-    expect(await f.stop()).toBeUndefined();
-    expect(await f.status()).toMatchObject({
-      status: "draining",
-      outcome: "needs_user",
-      completionVerified: false,
-    });
-    expect(f.counts().decisions).toBe(2);
-  } finally {
-    await f.close();
-  }
-});
-
-for (const choice of ["replan", "needs_user"] as const) {
-  test(`stage Jev ${choice} preserves recovery/authorization gates`, async () => {
-    const f = await loaderFixture(
-      {},
-      { dependencies: { decision: () => async () => ({ choice, confidence: 0.99 }) } },
-    );
-    try {
-      await f.start();
-      const advice = await f.step();
-      expect(await f.status()).toMatchObject(
-        choice === "replan"
-          ? { status: "running", architect: { pendingRecovery: true, completionApproved: false } }
-          : { status: "draining", outcome: "needs_user", completionVerified: false },
-      );
-      if (choice === "replan") expect(advice.instruction).toContain("recovery");
-      else expect(advice.isError).toBe(true);
-      expect(
-        await f.extension.handlers.get("tool_call")![0](
-          {
-            type: "tool_call",
-            toolCallId: "ungated-write",
-            toolName: "write",
-            input: { path: "x", content: "y" },
-          },
-          f.ctx,
-        ),
-      ).toMatchObject({ block: true });
-    } finally {
-      await f.close();
-    }
-  });
-}
-
 test("premature LEAD stop requires user input without an invented task loop or routine Jev call", async () => {
   const f = await loaderFixture();
   try {
@@ -3628,158 +1920,13 @@ test("premature LEAD stop requires user input without an invented task loop or r
     expect(await f.status()).toMatchObject({
       status: "draining",
       outcome: "needs_user",
-      steps: "1",
+      steps: "0",
       decisions: 0,
       completionVerified: false,
     });
     expect(f.bootstraps).toHaveLength(1);
     expect(f.counts().decisions).toBe(0);
   } finally {
-    await f.close();
-  }
-});
-
-test("terminal tool cap retains fresh CLI progress and diagnostic failures never resume the run", async () => {
-  let completed = 0;
-  let unavailable = false;
-  const f = await loaderFixture(
-    { maxToolCalls: 1 },
-    {
-      dependencies: {
-        snapshot: async () => {
-          if (unavailable) throw new Error("Fixture CLI unavailable");
-          return snapshot(completed);
-        },
-      },
-    },
-  );
-  try {
-    await f.start();
-    const gate = f.extension.handlers.get("tool_call")![0];
-    expect(
-      await gate(
-        { type: "tool_call", toolCallId: "first", toolName: "read", input: { path: "tasks.md" } },
-        f.ctx,
-      ),
-    ).toBeUndefined();
-    completed = 1;
-    expect(
-      await gate(
-        { type: "tool_call", toolCallId: "excess", toolName: "read", input: { path: "tasks.md" } },
-        f.ctx,
-      ),
-    ).toMatchObject({ block: true });
-    expect(await f.status()).toMatchObject({
-      status: "draining",
-      outcome: "budget_exhausted",
-      toolCalls: "1/1",
-      progress: { total: 2, complete: 1, remaining: 1 },
-      completionVerified: false,
-    });
-    completed = 2;
-    expect(await f.status()).toMatchObject({
-      status: "draining",
-      outcome: "budget_exhausted",
-      progress: { complete: 2, remaining: 0 },
-      completionVerified: false,
-    });
-    unavailable = true;
-    expect(await f.status()).toMatchObject({
-      status: "draining",
-      outcome: "budget_exhausted",
-      progress: { complete: 2 },
-      observation: { error: expect.stringContaining("last known") },
-      completionVerified: false,
-    });
-    expect(await f.stop()).toBeUndefined();
-    expect(f.counts().decisions).toBe(0);
-  } finally {
-    await f.close();
-  }
-});
-
-test("native registered implementation/research/reviewer leaves preserve configured model routing", async () => {
-  const f = await loaderFixture();
-  try {
-    await f.start();
-    await f.step();
-    const ctx = {
-      ...f.ctx,
-      models: { resolve: () => ({ model: { id: "fixture" } }) },
-    } as unknown as ExtensionContext;
-    for (const [agent, model] of [
-      ["omp-worker", "@implementation"],
-      ["omp-explorer", "@research"],
-    ]) {
-      expect(
-        await f.extension.handlers.get("before_subagent_spawn")![0](
-          { type: "before_subagent_spawn", agent, invocationKind: "task" },
-          ctx,
-        ),
-      ).toMatchObject({ model });
-    }
-    f.complete();
-    expect(await f.step()).toMatchObject({ allowedNextPhase: "verify" });
-    expect(
-      await f.extension.handlers.get("before_subagent_spawn")![0](
-        { type: "before_subagent_spawn", agent: "omp-reviewer", invocationKind: "task" },
-        ctx,
-      ),
-    ).toMatchObject({ model: "@architect" });
-    expect(
-      await f.extension.handlers.get("before_subagent_spawn")![0](
-        { type: "before_subagent_spawn", agent: "other-agent", invocationKind: "task" },
-        ctx,
-      ),
-    ).toMatchObject({ block: true });
-    expect(await f.status()).toMatchObject({ status: "running", completionVerified: false });
-  } finally {
-    await f.close();
-  }
-});
-
-test("status refresh during a delayed completion review cannot approve different task/workflow facts", async () => {
-  const entered = Promise.withResolvers<void>();
-  const release = Promise.withResolvers<void>();
-  let revision = "A";
-  let reviews = 0;
-  const f = await loaderFixture(
-    {},
-    {
-      dependencies: {
-        snapshot: async () => ({ ...snapshot(2), fingerprint: `tasks-${revision}` }),
-        workflow: async () => ({ ...workflow(true), fingerprint: `workflow-${revision}` }),
-        validate: async () => {},
-      },
-      reviewer: async () => {
-        reviews++;
-        entered.resolve();
-        await release.promise;
-        return approved;
-      },
-    },
-  );
-  let reviewing: ReturnType<typeof f.checkpoint> | undefined;
-  try {
-    await f.start();
-    await f.verify();
-    reviewing = f.checkpoint();
-    await entered.promise;
-    revision = "B";
-    expect(await f.status()).toMatchObject({ status: "running", completionVerified: false });
-    release.resolve();
-    const result = await reviewing;
-    expect(result.isError).toBe(true);
-    expect(await f.status()).toMatchObject({
-      completionVerified: false,
-      architect: { completionApproved: false },
-    });
-    await f.stop();
-    expect(await f.status()).not.toMatchObject({ status: "completed" });
-    expect(reviews).toBe(1);
-  } finally {
-    release.resolve();
-    await reviewing?.catch(() => {});
     await f.close();
   }
 });
@@ -3868,21 +2015,82 @@ for (const active of [true, false]) {
   });
 }
 
-test("Jev advice rejects an in-flight stage-status change even when completed/ready lists are unchanged", async () => {
+// Pipeline-free action-selection contract. Assertions target observable native
+// facts; no fixture-owned DAG or phase state is manufactured for the controller.
+test("missing pipeline and auto-run still start; Jev receives exact native catalogue and selects a non-first skill", async () => {
+  const f = await loaderFixture();
+  try {
+    await expect(
+      fs.stat(path.join(f.cwd, "rasen/changes/fixture-change/auto-run.json")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    await f.start();
+    expect(f.journal().map((event) => event.kind)).toEqual(["run-start"]);
+    expect(f.observed).toHaveLength(0);
+    const boundary = await f.step();
+    expect(boundary).toMatchObject({
+      isError: false,
+      action: { skill: { name: "rasen-verify-change" } },
+    });
+    const choices = f.observed[0].choices!;
+    const skillOptions = Object.entries(choices).filter(([key]) => key.startsWith("skill_"));
+    expect(skillOptions.map(([, criterion]) => criterion)).toEqual(
+      [...f.skills]
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .map((skill) => `Execute existing native skill ${skill.name}: ${skill.description}`),
+    );
+    expect(boundary.decision.choice).not.toBe(skillOptions[0][0]);
+    expect(boundary.decision.criterion).toBe(choices[boundary.decision.choice]);
+    expect(boundary.decision.evidenceRefs).toContain("change:fixture-0");
+    expect(f.journal().map((event) => event.kind)).toEqual([
+      "run-start",
+      "action-selected",
+      "action-admitted",
+    ]);
+    expect(boundary.instruction).toContain(`Auto action: ${boundary.action.actionId}`);
+    expect(await f.status()).not.toHaveProperty("workflow");
+  } finally {
+    await f.close();
+  }
+});
+
+for (const skill of ["rasen-apply-change", "rasen-verify-change", "pack/rasen-continue~2"]) {
+  test(`all_done does not predetermine completion or prevent Jev choosing ${skill}`, async () => {
+    const f = await loaderFixture();
+    try {
+      f.complete();
+      f.choose(skill);
+      await f.start();
+      const boundary = await f.step();
+      expect(boundary.action.skill.name).toBe(skill);
+      expect(boundary.finishProposed).toBeUndefined();
+      expect(await f.status()).toMatchObject({ status: "running", completionVerified: false });
+      expect(JSON.parse(f.observed[0].summary).changeFacts.state).toBe("all_done");
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+test("Jev selection precedes skill loading and admission; execution cannot race a pending selection", async () => {
   const entered = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
-  let observed = workflow(false);
-  let decisions = 0;
+  let reads = 0;
   const f = await loaderFixture(
     {},
     {
       dependencies: {
-        workflow: async () => observed,
-        decision: () => async () => {
-          decisions++;
+        decision: () => async (facts) => {
           entered.resolve();
           await release.promise;
-          return { choice: decisions === 1 ? "replan" : "continue", confidence: 0.99 };
+          return selectSkill(facts, "rasen-review-cycle");
+        },
+        skill: async (skill) => {
+          reads++;
+          return {
+            ...skill,
+            text: "Full selected review-cycle body",
+            sha256: digest("Full selected review-cycle body"),
+          };
         },
       },
     },
@@ -3892,262 +2100,1292 @@ test("Jev advice rejects an in-flight stage-status change even when completed/re
     await f.start();
     pending = f.step();
     await entered.promise;
-    if (observed.kind !== "present") throw new Error("Expected workflow fixture");
-    observed = {
-      ...observed,
-      stages: observed.stages.map((stage) =>
-        stage.id === "apply" ? { ...stage, status: "in_progress" } : stage,
-      ),
-      inProgressStages: ["apply"],
-      fingerprint: "changed-stage-status",
-    };
-    await f.status();
+    expect(reads).toBe(0);
+    expect(f.journal().map((event) => event.kind)).toEqual(["run-start"]);
+    expect(await f.gate("write", { path: "early.txt", content: "Too early" })).toMatchObject({
+      block: true,
+    });
     release.resolve();
-    expect(await pending).toMatchObject({
-      isError: true,
-      error: expect.stringContaining("changed"),
-    });
-    expect(await f.status()).toMatchObject({
-      status: "running",
-      architect: { pendingRecovery: false },
-    });
-    expect(await f.step()).toMatchObject({
-      status: "draining",
-      outcome: "needs_user",
-      isError: true,
-    });
-    expect(decisions).toBe(1);
+    const selected = await pending;
+    expect(selected.action.skill.name).toBe("rasen-review-cycle");
+    expect(reads).toBe(1);
   } finally {
     release.resolve();
-    await pending?.catch(() => {});
+    await pending;
     await f.close();
   }
 });
 
-for (const mixed of [false, true]) {
-  test(`native async delivery remains intact for a newer user turn, mixed=${mixed}`, async () => {
+test("legitimate task and skill-owned record updates retain one invocation until its boundary", async () => {
+  let revision = 0;
+  const f = await loaderFixture(
+    {},
+    {
+      dependencies: {
+        snapshot: async () => ({
+          ...snapshot(revision > 0 ? 1 : 0),
+          fingerprint: `task-and-record-${revision}`,
+          skillRecord: {
+            kind: "valid",
+            path: "/local-fixture/auto-run.json",
+            sha256: digest(String(revision)),
+            content: { rounds: revision },
+          },
+        }),
+      },
+    },
+  );
+  try {
+    await f.start();
+    const first = await f.step();
+    revision++;
+    const observed = await f.status();
+    expect(observed.status).toBe("running");
+    expect(observed.selectedAction.actionId).toBe(first.action.actionId);
+    const again = await f.step("The existing skill is still executing");
+    expect(again).toMatchObject({ cached: true, action: { actionId: first.action.actionId } });
+    expect(f.observed).toHaveLength(1);
+    await f.mainResult();
+    f.choose("rasen-apply-change");
+    const next = await f.finish(first.action.actionId, { status: "progress" });
+    expect(next.action.skill.name).toBe("rasen-apply-change");
+    expect(next.action.actionId).not.toBe(first.action.actionId);
+    expect(f.journal().find((event) => event.kind === "action-settled")).toMatchObject({
+      outcome: "progress",
+      outputFingerprint: "task-and-record-1",
+    });
+  } finally {
+    await f.close();
+  }
+});
+
+test("a skill may create and update auto-run.json without a pipeline; native evidence stays usable", async () => {
+  const f = await loaderFixture();
+  try {
+    f.choose("rasen-review-cycle");
+    await f.start();
+    const first = await f.step();
+    const file = path.join(f.cwd, "rasen/changes/fixture-change/auto-run.json");
+    const content = JSON.stringify({
+      reviewCycle: { rounds: 2, state: "clean" },
+      ui: { status: "reviewed" },
+    });
+    const id = crypto.randomUUID();
+    const input = { path: file, content };
+    expect(await f.gate("write", input, id)).toBeUndefined();
+    await Bun.write(file, content);
+    await f.toolResult("write", input, id, {
+      content: [{ type: "text", text: "Wrote native skill report" }],
+    });
+    expect(await Bun.file(file).json()).not.toHaveProperty("pipeline");
+    f.choose("rasen-verify-change");
+    const next = await f.finish(first.action.actionId);
+    expect(next).toMatchObject({
+      isError: false,
+      action: { skill: { name: "rasen-verify-change" } },
+    });
+    expect(await Bun.file(file).json()).toEqual(JSON.parse(content));
+    expect(await f.status()).toMatchObject({
+      status: "running",
+      completionVerified: false,
+      history: { valid: true },
+    });
+  } finally {
+    await f.close();
+  }
+});
+
+test("the same existing skill can be selected again as a distinct native action", async () => {
+  const f = await loaderFixture();
+  try {
+    await f.start();
+    const first = await f.step();
+    await f.nativeResult();
+    const next = await f.finish(first.action.actionId);
+    expect(next).toMatchObject({
+      isError: false,
+      action: { skill: { name: first.action.skill.name } },
+    });
+    expect(next.action.actionId).not.toBe(first.action.actionId);
+    const records = f.journal();
+    expect(records.filter((event) => event.kind === "action-admitted")).toHaveLength(2);
+    expect(records.filter((event) => event.kind === "action-settled")).toHaveLength(1);
+    expect(
+      records.find((event) => event.kind === "action-settled").nativeReceipts[0].artifactRef,
+    ).toStartWith("artifact://");
+  } finally {
+    await f.close();
+  }
+});
+
+test("the complete review-cycle remains one action across native reviewer and worker rounds", async () => {
+  const f = await loaderFixture();
+  try {
+    f.choose("rasen-review-cycle");
+    await f.start();
+    const first = await f.step();
+    expect(first.instruction).toContain("Do not checkpoint the skill's internal review/fix rounds");
+    await f.nativeResult({ role: "omp-reviewer", output: "Round 1: concrete findings" });
+    await f.nativeResult({ role: "omp-worker", output: "Round 1: fixes and tests" });
+    await f.nativeResult({
+      role: "omp-reviewer",
+      output: "Round 2: accepted-known minor findings, no blocking issue",
+    });
+    expect((await f.step()).action.actionId).toBe(first.action.actionId);
+    expect(f.counts().decisions).toBe(1);
+    expect(f.journal().filter((event) => event.kind === "action-admitted")).toHaveLength(1);
+    f.choose("finish");
+    expect(await f.finish(first.action.actionId)).toMatchObject({
+      finishProposed: true,
+      decision: { choice: "finish" },
+    });
+    expect(f.journal().filter((event) => event.kind === "action-settled")).toHaveLength(1);
+    expect(await f.status()).toMatchObject({
+      architect: { attempts: { completion: 0 } },
+      completionVerified: false,
+    });
+  } finally {
+    await f.close();
+  }
+});
+
+for (const changed of ["snapshot", "catalogue"] as const) {
+  test(`a Jev choice is refused when ${changed} changes in flight, without admitting stale work`, async () => {
+    let revision = 0;
+    let fixture: Awaited<ReturnType<typeof loaderFixture>>;
+    fixture = await loaderFixture(
+      {},
+      {
+        dependencies: {
+          snapshot: async () => ({ ...snapshot(), fingerprint: `revision-${revision}` }),
+          decision: () => async (facts) => {
+            const selected = selectSkill(facts, "rasen-verify-change");
+            if (changed === "snapshot") revision++;
+            else fixture.skills[0].description = "Changed native description";
+            return selected;
+          },
+        },
+      },
+    );
+    try {
+      await fixture.start();
+      expect(await fixture.step()).toMatchObject({
+        isError: true,
+        error: expect.stringContaining("changed during selection"),
+      });
+      expect(fixture.journal().filter((event) => event.kind === "action-admitted")).toHaveLength(0);
+      expect(await fixture.status()).toMatchObject({ status: "running", selectedAction: null });
+    } finally {
+      await fixture.close();
+    }
+  });
+}
+
+test("unknown Jev choices and stale action results cannot admit or settle work", async () => {
+  const f = await loaderFixture();
+  try {
+    f.choose("unknown_native_skill");
+    await f.start();
+    expect((await f.step()).isError).toBe(true);
+    expect(f.journal().filter((event) => event.kind === "action-admitted")).toHaveLength(0);
+    expect(await f.settled()).toMatchObject({ completionVerified: false });
+  } finally {
+    await f.close();
+  }
+  const g = await loaderFixture();
+  try {
+    await g.start();
+    const selected = await g.step();
+    await g.mainResult();
+    expect(await g.finish(`stale-${selected.action.actionId}`)).toMatchObject({ isError: true });
+    expect(g.journal().filter((event) => event.kind === "action-settled")).toHaveLength(0);
+  } finally {
+    await g.close();
+  }
+});
+
+for (const proof of ["bare", "status", "step", "removed-record", "unadmitted-task"] as const) {
+  test(`${proof} cannot manufacture native execution proof for Main's action result`, async () => {
     const f = await loaderFixture();
     try {
       await f.start();
-      await f.step();
-      await f.extension.handlers.get("tool_call")![0](
-        { type: "tool_call", toolName: "bash", toolCallId: "owned", input: { command: "fixture" } },
-        f.ctx,
-      );
-      const id = f.nativeManager.register("bash", "owned", async () => "old", { ownerId: "main" });
-      for (const handler of f.extension.handlers.get("tool_result") ?? [])
-        await handler(
-          {
-            type: "tool_result",
-            toolName: "bash",
-            toolCallId: "owned",
-            input: {},
-            content: [],
-            details: { async: { jobId: id } },
-            isError: false,
+      const selected = await f.step();
+      if (proof === "status") await f.mainResult("auto_status", {}, "Success");
+      if (proof === "step")
+        await f.mainResult("auto_step", { summary: "Claim progress" }, "Success");
+      if (proof === "removed-record") {
+        expect(f.extension.tools.has("auto_record")).toBe(false);
+        await f.toolResult("auto_record", {}, "invented-record", {
+          content: [{ type: "text", text: "Success" }],
+        });
+      }
+      if (proof === "unadmitted-task") {
+        f.registerNativeChild("unadmitted");
+        await f.toolResult("task", {}, "never-admitted", {
+          content: [{ type: "text", text: "Success" }],
+          details: {
+            results: [{ id: "unadmitted", agent: "omp-reviewer", exitCode: 0, output: "Success" }],
           },
-          f.ctx,
-        );
-      await f.nativeManager.getJob(id)!.promise;
-      const delivery = {
-        role: "custom",
-        customType: "async-result",
-        attribution: "agent",
-        display: true,
-        content: "STALE BODY plus unrelated",
-        details: { jobs: [{ jobId: id }, ...(mixed ? [{ jobId: "unrelated-job" }] : [])] },
-        timestamp: Date.now(),
-      };
-      await f.extension.handlers.get("input")![0](
-        { type: "input", text: "New user task", source: "interactive" },
-        f.ctx,
-      );
-      await f.extension.handlers.get("before_agent_start")![0](
-        { type: "before_agent_start", prompt: "New user task", systemPrompt: [] },
-        f.ctx,
-      );
-      const messages = [
-        { role: "user", content: "New user task", timestamp: Date.now() },
-        { role: "assistant", content: [], stopReason: "toolUse", timestamp: Date.now() },
-        {
-          role: "toolResult",
-          toolCallId: "new-read",
-          toolName: "read",
-          content: [],
-          isError: false,
-          timestamp: Date.now(),
-        },
-      ];
-      const aborts = f.counts().aborts;
-      const result = await f.extension.handlers.get("context")![0](
-        { type: "context", messages: [...messages, delivery] },
-        f.ctx,
-      );
-      expect(f.counts().aborts).toBe(aborts);
-      expect(result).toEqual({ messages: [...messages, delivery] });
-      expect(f.nativeManager.getJob(id)?.status).toBe("completed");
-      expect((await f.status()).outcome).toBe("needs_user");
+        });
+      }
+      expect(await f.finish(selected.action.actionId)).toMatchObject({
+        isError: true,
+        error: expect.stringContaining("actual native tool/task evidence"),
+      });
+      expect(f.journal().filter((event) => event.kind === "action-settled")).toHaveLength(0);
+      expect(await f.status()).toMatchObject({ completionVerified: false });
     } finally {
       await f.close();
     }
   });
 }
 
-test("unreceipted interrupted native work cannot pass Auto completion", async () => {
+for (const finishChoice of [false, true]) {
+  test(`all_done at stop ${finishChoice ? "can complete only after explicit finish selection" : "cannot self-complete without Jev finish"}`, async () => {
+    const f = await loaderFixture();
+    try {
+      f.complete();
+      await f.start();
+      if (finishChoice) {
+        f.choose("finish");
+        expect((await f.step()).finishProposed).toBe(true);
+      }
+      await f.stop();
+      expect(await f.settled()).toMatchObject({
+        status: finishChoice ? "completed" : "paused",
+        outcome: finishChoice ? "completed" : "needs_user",
+        completionVerified: finishChoice,
+        architect: { completionApproved: false, attempts: { completion: 0 } },
+      });
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+for (const fresh of [true, false]) {
+  test(`finish waits detached Main settlement and ${fresh ? "certifies fresh" : "rejects changed"} evidence`, async () => {
+    const idle = Promise.withResolvers<void>();
+    const waiting = Promise.withResolvers<void>();
+    let changed = false;
+    const f = await loaderFixture(
+      {},
+      {
+        dependencies: {
+          snapshot: async () => ({
+            ...snapshot(2),
+            fingerprint: changed ? "changed-after-finish" : "stable",
+          }),
+        },
+      },
+    );
+    f.nativeSession.waitForIdle = async () => {
+      waiting.resolve();
+      await idle.promise;
+    };
+    try {
+      await f.start();
+      f.choose("finish");
+      expect((await f.step()).finishProposed).toBe(true);
+      await f.stop();
+      await waiting.promise;
+      expect(await f.status()).toMatchObject({ status: "draining", completionVerified: false });
+      changed = !fresh;
+      idle.resolve();
+      expect(await f.settled()).toMatchObject({
+        status: fresh ? "completed" : "paused",
+        completionVerified: fresh,
+      });
+      expect(f.counts().aborts).toBe(0);
+    } finally {
+      idle.resolve();
+      await f.close();
+    }
+  });
+}
+
+test("pending native work prevents both action settlement and an additional Jev decision", async () => {
   const f = await loaderFixture();
+  const work = Promise.withResolvers<string>();
   try {
     await f.start();
-    await f.step();
-    expect(
-      await f.extension.handlers.get("tool_call")![0](
-        {
-          type: "tool_call",
-          toolName: "bash",
-          toolCallId: "interrupted",
-          input: { command: "fixture" },
-        },
-        f.ctx,
-      ),
-    ).toBeUndefined();
-    for (const handler of f.extension.handlers.get("tool_execution_end") ?? [])
-      await handler(
-        {
-          type: "tool_execution_end",
-          toolName: "bash",
-          toolCallId: "interrupted",
-          isError: true,
-          result: { content: [], details: { __interrupted: true, execution: "started" } },
-        },
-        f.ctx,
-      );
-    f.complete();
-    const result = await f.checkpoint();
-    expect(result.isError).toBe(true);
-    expect(await f.status()).toMatchObject({
-      completionVerified: false,
-      nativeWork: { settlementUnverified: ["interrupted"] },
+    const first = await f.step();
+    const id = f.nativeManager.register("bash", "native work", async () => work.promise, {
+      ownerId: "main",
     });
+    expect(await f.finish(first.action.actionId)).toMatchObject({
+      pending: true,
+      action: { actionId: first.action.actionId },
+    });
+    expect(f.counts().decisions).toBe(1);
+    expect(f.journal().filter((event) => event.kind === "action-settled")).toHaveLength(0);
+    work.resolve("Done");
+    await f.nativeManager.getJob(id)!.promise;
+    await f.mainResult();
+    f.choose("finish");
+    expect((await f.finish(first.action.actionId)).finishProposed).toBe(true);
+  } finally {
+    work.resolve("cleanup");
+    await f.close();
+  }
+});
+
+test("held action recovery offers resume from native history without a pipeline or reset", async () => {
+  const f = await loaderFixture();
+  try {
+    f.choose("rasen-review-cycle");
+    await f.start();
+    const initial = await f.step();
+    await f.mainResult();
+    await f.extension.commands.get("auto")!.handler("stop", f.ctx);
+    await f.settled();
+    expect(f.journal().find((event) => event.kind === "action-held")).toMatchObject({
+      actionId: initial.action.actionId,
+      skill: "rasen-review-cycle",
+    });
+    f.choose("resume");
+    await f.start();
+    const resumed = await f.step();
+    expect(resumed).toMatchObject({
+      isError: false,
+      decision: { choice: "resume" },
+      action: { skill: { name: "rasen-review-cycle" } },
+    });
+    expect(resumed.action.actionId).not.toBe(initial.action.actionId);
+    expect(resumed.instruction).toContain(initial.action.actionId);
+    expect(resumed.instruction).toContain("do not reset counters or replay uncertain side effects");
   } finally {
     await f.close();
   }
 });
 
-test("built-in apply sends its native host route to Jev even without external run-state", async () => {
-  let request: ReturnType<typeof buildJevRequest> | undefined;
+test("normal authorization denial still pauses a selected ship skill without fallback", async () => {
+  const f = await loaderFixture();
+  try {
+    f.choose("rasen-ship");
+    await f.start();
+    expect((await f.step()).action.skill.name).toBe("rasen-ship");
+    expect(f.bootstraps[0]).toContain("no available skill is blanket-authorized");
+    await f.extension.handlers.get("tool_approval_resolved")![0](
+      { type: "tool_approval_resolved", approved: false },
+      f.ctx,
+    );
+    expect(await f.settled()).toMatchObject({
+      status: "paused",
+      outcome: "needs_user",
+      completionVerified: false,
+    });
+    expect(f.counts().decisions).toBe(1);
+    expect((await f.step()).isError).toBe(true);
+  } finally {
+    await f.close();
+  }
+});
+
+test("Auto step Eval carriers accept only one reset-safe literal action boundary", () => {
+  const input = {
+    path: "xd://auto_step",
+    content: JSON.stringify({ summary: "Inspect current skill evidence" }),
+  };
+  const literal = `await tool.write(${JSON.stringify(input)})`;
+  expect(autoStepCarrier({ language: "js", reset: true, code: literal })).toBe(true);
+  expect(autoStepCarrier({ language: "js", reset: true, code: `console.log(${literal});` })).toBe(
+    true,
+  );
+  const result = {
+    summary: "Skill reports progress",
+    result: { actionId: "current-action", status: "progress", note: "Native evidence is ready" },
+  };
+  expect(
+    autoStepCarrier({
+      language: "js",
+      reset: true,
+      code: `await tool.write(${JSON.stringify({ ...input, content: JSON.stringify(result) })})`,
+    }),
+  ).toBe(true);
+  for (const candidate of [
+    { language: "js", reset: false, code: literal },
+    { language: "js", reset: true, async: true, code: literal },
+    {
+      language: "js",
+      reset: true,
+      code: `${literal}; await tool.write({"path":"fixture.ts","content":"changed"})`,
+    },
+    {
+      language: "js",
+      reset: true,
+      code: `const args = ${JSON.stringify(input)}; await tool.write(args)`,
+    },
+    ...["stage", "transition", "leadReview", "outcome"].map((key) => ({
+      language: "js",
+      reset: true,
+      code: `await tool.write(${JSON.stringify({ ...input, content: JSON.stringify({ summary: "Obsolete controller field", [key]: "verify" }) })})`,
+    })),
+  ])
+    expect(autoStepCarrier(candidate)).toBe(false);
+});
+
+test("Auto action fallback retains the configured Architect deadline past 40 seconds", async () => {
+  const started = Promise.withResolvers<void>();
+  const response = Promise.withResolvers<{ choice: string; confidence: number }>();
+  let fallbackSignal: AbortSignal | undefined;
+  let choice = "";
   const f = await loaderFixture(
     {},
     {
       dependencies: {
-        workflow: async () => ({
-          kind: "absent",
-          change: "fixture-change",
-          reason: "No external run-state",
-          fingerprint: "absent",
+        decision: () => async (facts) => ({
+          ...selectSkill(facts, "rasen-verify-change"),
+          confidence: 0.58,
         }),
-        decision: () =>
-          createJevProvider(
-            { model: "jev-latest", timeoutMs: 500, maxEvidenceChars: 12000 },
-            {
-              readApiKey: () => "fixture-not-a-secret",
-              fetch: async (_url, init) => {
-                request = JSON.parse(String(init.body));
-                return new Response(
-                  JSON.stringify({
-                    model: "jev-latest",
-                    answers: {
-                      next: {
-                        type: "choice",
-                        choice: "continue",
-                        confidence: 0.95,
-                        probabilities: {
-                          continue: 0.95,
-                          replan: 0.01,
-                          needs_user: 0.02,
-                          uncertain: 0.02,
-                        },
-                      },
-                    },
-                    usage: { input_tokens: 1, output_tokens: 1 },
-                  }),
-                );
-              },
-            },
-          ),
+        fallback: () => async (facts, signal) => {
+          choice = selectSkill(facts, "rasen-verify-change").choice;
+          fallbackSignal = signal;
+          started.resolve();
+          return response.promise;
+        },
       },
     },
   );
+  let pending: ReturnType<typeof f.step> | undefined;
   try {
     await f.start();
-    expect(await f.step("Need to apply remaining prepared tasks")).toMatchObject({
-      choice: "continue",
-      allowedNextPhase: "apply",
+    jest.useFakeTimers();
+    pending = f.step();
+    await started.promise;
+    jest.advanceTimersByTime(40000);
+    await Promise.resolve();
+    expect(fallbackSignal?.aborted).toBe(false);
+    response.resolve({ choice, confidence: 0.95 });
+    expect(await pending).toMatchObject({
+      action: { skill: { name: "rasen-verify-change" } },
+      isError: false,
     });
-    const facts = JSON.parse(request!.state.summary);
-    expect(facts).toMatchObject({
-      allowedPhase: "apply",
-      hostSource: "builtin",
-      hostBlocker: null,
-      stage: { role: "implementer", runtime: "omp", dispatchMode: "native" },
-      nativeWorkSettled: true,
-    });
-    expect(facts.nextStep).toContain("native omp-worker");
-    expect(facts.workflowContext).toContain("external Rasen run-state is not required");
     expect(await f.status()).toMatchObject({
       status: "running",
+      completionVerified: false,
+      fallbacks: "1/2",
       decisionDiagnostics: {
-        attempts: [{ provider: "jev", outcome: "accepted", confidence: 0.95 }],
+        attempts: [
+          { provider: "jev", confidence: 0.58, timeoutMs: 8000 },
+          { provider: "architect", outcome: "accepted", timeoutMs: 120000 },
+        ],
       },
     });
+  } finally {
+    response.resolve({ choice, confidence: 0.95 });
+    jest.useRealTimers();
+    await pending;
+    await f.close();
+  }
+});
+
+for (const interrupt of ["stop", "input", "session"] as const) {
+  test(`delayed skill loading cannot admit an action after ${interrupt}`, async () => {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const f = await loaderFixture(
+      {},
+      {
+        dependencies: {
+          skill: async (skill) => {
+            entered.resolve();
+            await release.promise;
+            return {
+              ...skill,
+              text: "Complete selected skill body",
+              sha256: digest("Complete selected skill body"),
+            };
+          },
+        },
+      },
+    );
+    let pending: ReturnType<typeof f.step> | undefined;
+    try {
+      await f.start();
+      pending = f.step();
+      await entered.promise;
+      if (interrupt === "stop") await f.extension.commands.get("auto")!.handler("stop", f.ctx);
+      else if (interrupt === "input")
+        await f.extension.handlers.get("input")![0](
+          { type: "input", text: "New user request", source: "interactive" },
+          f.ctx,
+        );
+      else
+        await f.extension.handlers.get("session_switch")![0](
+          { type: "session_switch", reason: "resume" },
+          f.ctx,
+        );
+      release.resolve();
+      expect(await pending).toMatchObject({ isError: true });
+      expect(f.journal().filter((event) => event.kind === "action-admitted")).toHaveLength(0);
+      expect(f.bootstraps).toHaveLength(1);
+      expect(f.counts().aborts).toBe(0);
+    } finally {
+      release.resolve();
+      await pending;
+      await f.close();
+    }
+  });
+}
+
+for (const interrupt of ["stop", "input"] as const) {
+  test(`late admitted native results after ${interrupt} are retained without resuming or self-completing`, async () => {
+    const f = await loaderFixture();
+    const body = Promise.withResolvers<string>();
+    try {
+      await f.start();
+      const first = await f.step();
+      const taskId = crypto.randomUUID();
+      expect(
+        await f.gate(
+          "task",
+          {
+            agent: "omp-reviewer",
+            task: `Auto action: ${first.action.actionId}\nInspect native evidence`,
+            model: first.action.admission.roleRoutes["omp-reviewer"].selector,
+            solutionSpace: "Scoped evidence",
+          },
+          taskId,
+        ),
+      ).toBeUndefined();
+      const jobId = f.nativeManager.register(
+        "bash",
+        "fixture native pending work",
+        async () => body.promise,
+        { ownerId: "main" },
+      );
+      if (interrupt === "stop") await f.extension.commands.get("auto")!.handler("stop", f.ctx);
+      else
+        await f.extension.handlers.get("input")![0](
+          { type: "input", text: "New request wins", source: "interactive" },
+          f.ctx,
+        );
+      expect(await f.status()).toMatchObject({ status: "draining", nativeWork: { pending: true } });
+      await f.nativeResult({
+        id: taskId,
+        admitted: true,
+        output: "Late native evidence remains available",
+      });
+      body.resolve("Native job finished");
+      await f.nativeManager.getJob(jobId)!.promise;
+      expect(await f.settled()).toMatchObject({
+        status: "paused",
+        completionVerified: false,
+        selectedAction: { actionId: first.action.actionId },
+      });
+      expect(f.journal().filter((event) => event.kind === "action-settled")).toHaveLength(0);
+      const held = f.journal().find((event) => event.kind === "action-held");
+      expect(held.nativeReceipts[0].count).toBe(1);
+      const bundlePath = await f.ctx.sessionManager.getArtifactPath(
+        held.nativeReceipts[0].artifactRef.slice("artifact://".length),
+      );
+      expect(bundlePath).toBeTruthy();
+      const bundleText = await Bun.file(bundlePath!).text();
+      expect(digest(bundleText)).toBe(held.nativeReceipts[0].sha256);
+      const bundle = JSON.parse(bundleText);
+      expect(bundle).toMatchObject({
+        actionId: first.action.actionId,
+        receipts: [
+          {
+            agentId: taskId,
+            role: "omp-reviewer",
+          },
+        ],
+      });
+      expect(typeof bundle.receipts[0].artifactRef).toBe("string");
+      expect(bundle.receipts[0].artifactRef).toStartWith("artifact://");
+      const evidencePath = await f.ctx.sessionManager.getArtifactPath(
+        bundle.receipts[0].artifactRef.slice("artifact://".length),
+      );
+      expect(evidencePath).toBeTruthy();
+      const retained = await Bun.file(evidencePath!).text();
+      expect(retained).toBe("Late native evidence remains available");
+      expect(digest(retained)).toBe(bundle.receipts[0].artifactSha256);
+      expect(f.counts()).toMatchObject({ decisions: 1, aborts: 0 });
+      expect(f.bootstraps).toHaveLength(1);
+      expect((await f.step()).isError).toBe(true);
+    } finally {
+      body.resolve("cleanup");
+      await f.close();
+    }
+  });
+}
+
+for (const kind of ["deadline", "no-output"] as const) {
+  test(`the real ${kind} timer holds idle Auto without waiting for another tool call`, async () => {
+    const f = await loaderFixture(
+      kind === "deadline"
+        ? { maxDurationMs: 1000, noOutputTimeoutMs: 2000 }
+        : { noOutputTimeoutMs: 1000 },
+    );
+    try {
+      await f.start();
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+      expect(await f.settled()).toMatchObject({
+        status: "paused",
+        outcome: kind === "deadline" ? "budget_exhausted" : "stalled",
+        completionVerified: false,
+      });
+      expect(f.counts()).toMatchObject({ decisions: 0, aborts: 0 });
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+for (const route of [
+  "auto_record",
+  "xd://auto_record",
+  "[xd://auto_record#ABCD]",
+  "XD://auto_record:raw",
+  "opaque-eval",
+] as const) {
+  test(`${route} cannot supply self-minted controller execution proof`, async () => {
+    const f = await loaderFixture();
+    try {
+      await f.start();
+      const selected = await f.step();
+      const tool =
+        route === "auto_record" ? "auto_record" : route === "opaque-eval" ? "eval" : "write";
+      const input =
+        route === "auto_record"
+          ? { facts: "Controller bookkeeping only" }
+          : route === "opaque-eval"
+            ? { language: "js", reset: true, code: "console.log('Controller bookkeeping only')" }
+            : { path: route, content: "Controller bookkeeping only" };
+      const id = crypto.randomUUID();
+      expect(await f.gate(tool, input, id)).toBeUndefined();
+      await f.toolResult(tool, input, id, {
+        content: [{ type: "text", text: "Controller bookkeeping recorded" }],
+      });
+      expect((await f.status()).selectedAction.mainReceipts).toEqual([]);
+      expect(await f.finish(selected.action.actionId)).toMatchObject({
+        isError: true,
+        error: expect.stringContaining("actual native tool/task evidence"),
+      });
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+for (const successful of [false, true]) {
+  test(`Main's native command result ${successful ? "supports factual action progress" : "cannot turn failure into successful action progress"}`, async () => {
+    const f = await loaderFixture();
+    try {
+      await f.start();
+      const selected = await f.step();
+      const id = crypto.randomUUID();
+      const input = { command: "Run the selected skill's scoped native verification" };
+      expect(await f.gate("bash", input, id)).toBeUndefined();
+      await f.toolResult("bash", input, id, {
+        isError: !successful,
+        content: [
+          { type: "text", text: successful ? "Scoped checks passed" : "Scoped command failed" },
+        ],
+      });
+      expect((await f.status()).selectedAction.mainReceipts).toMatchObject([
+        { toolCallId: id, tool: "bash", isError: !successful, sha256: expect.any(String) },
+      ]);
+      f.choose("rasen-apply-change");
+      const next = await f.finish(selected.action.actionId, { status: "progress" });
+      expect(next.isError).toBe(!successful);
+      expect(f.journal().filter((event) => event.kind === "action-settled")).toHaveLength(
+        successful ? 1 : 0,
+      );
+      expect(await f.status()).toMatchObject({ completionVerified: false });
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+test("native action leaves preserve role selectors and admitted queued spawns across a scheduling hold", async () => {
+  const f = await loaderFixture();
+  const queued = Promise.withResolvers<string>();
+  const models = ["worker", "reviewer", "explorer"].map((id) => ({
+    ...f.nativeSession.model!,
+    provider: "fixture",
+    id,
+    reasoning: true,
+    thinking: { efforts: ["low", "high", "xhigh"] },
+  }));
+  const selectors: Record<string, string> = {
+    implementation: "fixture/worker:xhigh",
+    architect: "fixture/reviewer:high",
+    research: "fixture/explorer:low",
+  };
+  Object.defineProperty(f.nativeSession, "settings", {
+    value: { getModelRole: (role: string) => selectors[role] },
+  });
+  f.ctx.models.resolve = ((selector: string) => {
+    const expanded = selector.startsWith("@") ? selectors[selector.slice(1)] : selector;
+    return models.find((model) => expanded?.split(":")[0] === `${model.provider}/${model.id}`);
+  }) as typeof f.ctx.models.resolve;
+  try {
+    await f.start();
+    const selected = await f.step();
+    expect(selected.action.admission.roleRoutes).toMatchObject({
+      "omp-worker": { selector: selectors.implementation, thinkingLevel: "xhigh" },
+      "omp-reviewer": { selector: selectors.architect, thinkingLevel: "high" },
+      "omp-explorer": { selector: selectors.research, thinkingLevel: "low" },
+    });
+    const tasks = ["omp-worker", "omp-reviewer"].map((agent, index) => ({
+      agent,
+      name: `queued-${index}`,
+      task: `Auto action: ${selected.action.actionId}\nExecute a scoped leaf`,
+      model: selected.action.admission.roleRoutes[agent].selector,
+      solutionSpace: "Scoped native work",
+    }));
+    expect(await f.gate("task", { tasks }, "parallel-call")).toBeUndefined();
+    const job = f.nativeManager.register("task", "queued native task", async () => queued.promise, {
+      ownerId: "main",
+    });
+    await f.extension.commands.get("auto")!.handler("stop", f.ctx);
+    const spawn = f.extension.handlers.get("before_subagent_spawn")![0];
+    for (const task of tasks)
+      expect(
+        await spawn(
+          {
+            type: "before_subagent_spawn",
+            agent: task.agent,
+            invocationKind: "task",
+            spawnKey: task.name,
+            patterns: [task.model],
+          },
+          f.ctx,
+        ),
+      ).toMatchObject({ model: task.model });
+    expect(
+      await spawn(
+        {
+          type: "before_subagent_spawn",
+          agent: "omp-worker",
+          invocationKind: "task",
+          spawnKey: "unadmitted",
+          patterns: [],
+        },
+        f.ctx,
+      ),
+    ).toMatchObject({ block: true });
+    expect(await f.gate("task", tasks[0])).toMatchObject({ block: true });
+    queued.resolve("Native queue drained normally");
+    await f.nativeManager.getJob(job)!.promise;
+    expect(await f.settled()).toMatchObject({ status: "paused", completionVerified: false });
+    expect(f.counts()).toMatchObject({ decisions: 1, aborts: 0 });
+  } finally {
+    queued.resolve("cleanup");
+    await f.close();
+  }
+});
+
+for (const during of ["decision", "skill-loading"] as const) {
+  test(`native Auto history changes during ${during} invalidate the pending selection even after status refresh`, async () => {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let first = true;
+    const f = await loaderFixture(
+      {},
+      {
+        dependencies: {
+          decision: () => async (facts) => {
+            if (during === "decision" && first) {
+              first = false;
+              entered.resolve();
+              await release.promise;
+            }
+            return selectSkill(facts, "rasen-verify-change");
+          },
+          skill: async (skill) => {
+            if (during === "skill-loading" && first) {
+              first = false;
+              entered.resolve();
+              await release.promise;
+            }
+            return {
+              ...skill,
+              text: "Complete selected skill body",
+              sha256: digest("Complete selected skill body"),
+            };
+          },
+        },
+      },
+    );
+    let pending: ReturnType<typeof f.step> | undefined;
+    try {
+      await f.start();
+      pending = f.step();
+      await entered.promise;
+      const start = f.journal()[0];
+      f.appendJournal({
+        ...start,
+        eventId: crypto.randomUUID(),
+        kind: "action-held",
+        actionId: crypto.randomUUID(),
+        skill: "rasen-apply-change",
+        reason: "Another native observation records unresolved prior action evidence",
+      });
+      expect(await f.status()).toMatchObject({ history: { valid: true, records: 2 } });
+      release.resolve();
+      expect(await pending).toMatchObject({ isError: true });
+      expect(f.journal().filter((event) => event.kind === "action-admitted")).toHaveLength(0);
+      expect(await f.status()).toMatchObject({
+        status: "running",
+        selectedAction: null,
+        steps: "0",
+        history: { valid: true },
+      });
+      const retry = await f.step("Reconsider the new native evidence");
+      expect(retry).toMatchObject({
+        isError: false,
+        action: { skill: { name: "rasen-verify-change" } },
+      });
+      expect(await f.status()).toMatchObject({ steps: "1", history: { valid: true } });
+    } finally {
+      release.resolve();
+      await pending;
+      await f.close();
+    }
+  });
+}
+
+test("workspace changes observed by status during skill loading cannot mismatch action journal fingerprints", async () => {
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let revision = 0;
+  let first = true;
+  const f = await loaderFixture(
+    {},
+    {
+      dependencies: {
+        snapshot: async () => ({ ...snapshot(), fingerprint: `workspace-${revision}` }),
+        skill: async (skill) => {
+          if (first) {
+            first = false;
+            entered.resolve();
+            await release.promise;
+          }
+          return {
+            ...skill,
+            text: "Complete selected skill body",
+            sha256: digest("Complete selected skill body"),
+          };
+        },
+      },
+    },
+  );
+  let pending: ReturnType<typeof f.step> | undefined;
+  try {
+    await f.start();
+    pending = f.step();
+    await entered.promise;
+    revision = 1;
+    expect(await f.status()).toMatchObject({ selectedAction: null, history: { valid: true } });
+    release.resolve();
+    expect(await pending).toMatchObject({ isError: true });
+    expect(
+      f
+        .journal()
+        .filter((event) => event.kind === "action-selected" || event.kind === "action-admitted"),
+    ).toHaveLength(0);
+    expect(await f.status()).toMatchObject({
+      status: "running",
+      steps: "0",
+      history: { valid: true },
+    });
+    const retry = await f.step("Choose again from the new workspace");
+    expect(retry.action.admission.inputFingerprint).toBe("workspace-1");
+    await f.mainResult();
+    f.choose("finish");
+    expect(await f.finish(retry.action.actionId)).toMatchObject({
+      isError: false,
+      finishProposed: true,
+    });
+    const actionRecords = f.journal().filter((event) => event.actionId === retry.action.actionId);
+    expect(actionRecords.map((event) => event.kind)).toEqual([
+      "action-selected",
+      "action-admitted",
+      "action-settled",
+    ]);
+    expect(actionRecords.every((event) => event.inputFingerprint === "workspace-1")).toBe(true);
+    expect(await f.status()).toMatchObject({
+      steps: "1",
+      history: { valid: true, diagnostics: [] },
+    });
+    await f.stop();
+    expect(await f.settled()).toMatchObject({
+      status: "completed",
+      completionVerified: true,
+      history: { valid: true },
+    });
+  } finally {
+    release.resolve();
+    await pending;
+    await f.close();
+  }
+});
+
+for (const next of ["finish", "rasen-verify-change"] as const) {
+  test(`maxSteps two admits exactly two actions and ${next === "finish" ? "permits uncharged finish selection" : "refuses a third admission"}`, async () => {
+    const f = await loaderFixture({ maxSteps: 2 });
+    try {
+      await f.start();
+      expect(await f.status()).toMatchObject({ steps: "0/2" });
+      const first = await f.step();
+      expect(await f.status()).toMatchObject({ steps: "1/2" });
+      expect((await f.step("Same action, no extra admission")).action.actionId).toBe(
+        first.action.actionId,
+      );
+      expect(await f.status()).toMatchObject({ steps: "1/2" });
+      await f.mainResult();
+      const second = await f.finish(first.action.actionId);
+      expect(second.action.actionId).not.toBe(first.action.actionId);
+      expect(await f.status()).toMatchObject({ steps: "2/2" });
+      await f.mainResult();
+      f.choose(next);
+      const last = await f.finish(second.action.actionId);
+      expect(last.isError).toBe(next !== "finish");
+      if (next === "finish") {
+        expect(last.finishProposed).toBe(true);
+        await f.stop();
+      }
+      expect(await f.settled()).toMatchObject({
+        steps: "2/2",
+        outcome: next === "finish" ? "completed" : "budget_exhausted",
+        completionVerified: next === "finish",
+      });
+      expect(f.journal().filter((event) => event.kind === "action-admitted")).toHaveLength(2);
+      expect(f.journal().filter((event) => event.kind === "action-settled")).toHaveLength(2);
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+for (const boundary of ["finish", "skill-failure"] as const) {
+  test(`${boundary} does not charge an unadmitted action`, async () => {
+    const f = await loaderFixture(
+      { maxSteps: 2 },
+      boundary === "skill-failure"
+        ? {
+            dependencies: {
+              skill: async () => {
+                throw new Error("Synthetic skill body failure");
+              },
+            },
+          }
+        : {},
+    );
+    try {
+      await f.start();
+      if (boundary === "finish") f.choose("finish");
+      const result = await f.step();
+      expect(result.isError).toBe(boundary === "skill-failure");
+      expect(f.journal().filter((event) => event.kind === "action-admitted")).toHaveLength(0);
+      expect(await f.status()).toMatchObject({ steps: "0/2" });
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+for (const complete of [false, true]) {
+  for (const outcome of ["failed", "blocked"] as const) {
+    test(`maxStalls one admits initial work but stops an unchanged ${complete ? "all_done" : "ready"} action reported ${outcome}`, async () => {
+      const f = await loaderFixture({ maxStalls: 1 });
+      try {
+        if (complete) f.complete();
+        await f.start();
+        expect(await f.status()).toMatchObject({ steps: "0", stalls: "0/1" });
+        const first = await f.step();
+        expect(first).toMatchObject({
+          isError: false,
+          action: { skill: { name: "rasen-verify-change" } },
+        });
+        expect(await f.status()).toMatchObject({ status: "running", steps: "1", stalls: "0/1" });
+        expect((await f.step("Read-only check of the same invocation")).action.actionId).toBe(
+          first.action.actionId,
+        );
+        const repeated = await f.finish(first.action.actionId, {
+          status: outcome,
+          note: "The selected skill made no progress; the existing evidence is unchanged",
+        });
+        expect(repeated.isError).toBe(true);
+        expect(await f.settled()).toMatchObject({
+          status: "paused",
+          outcome: "stalled",
+          steps: "1",
+          stalls: "1/1",
+          completionVerified: false,
+        });
+        expect(f.journal().filter((event) => event.kind === "action-admitted")).toHaveLength(1);
+        expect(f.journal().filter((event) => event.kind === "action-settled")).toMatchObject([
+          { actionId: first.action.actionId, outcome },
+        ]);
+        expect((await f.step()).isError).toBe(true);
+        expect(f.bootstraps).toHaveLength(1);
+      } finally {
+        await f.close();
+      }
+    });
+  }
+}
+
+for (const provider of ["jev", "fallback"] as const) {
+  test(`accepted ${provider} needs_user retains its exact criterion and confidence in native stop history`, async () => {
+    let supplied: DecisionEvidence | undefined;
+    const confidence = provider === "jev" ? 0.97 : 0.93;
+    const f = await loaderFixture(
+      {},
+      {
+        dependencies: {
+          decision: () => async (facts) => {
+            supplied = structuredClone(facts);
+            return provider === "jev"
+              ? { choice: "needs_user", confidence }
+              : { ...selectSkill(facts, "rasen-verify-change"), confidence: 0.51 };
+          },
+          fallback: () => async (facts) => {
+            supplied = structuredClone(facts);
+            return { choice: "needs_user", confidence };
+          },
+        },
+      },
+    );
+    try {
+      await f.start();
+      expect((await f.step()).isError).toBe(true);
+      const status = await f.settled();
+      expect(status).toMatchObject({
+        status: "paused",
+        outcome: "needs_user",
+        steps: "0",
+        completionVerified: false,
+        lastDecision: {
+          choice: "needs_user",
+          criterion: supplied!.choices!.needs_user,
+          confidence,
+        },
+      });
+      const stop = f.journal().find((event) => event.kind === "run-stop");
+      expect(stop.decision).toEqual(status.lastDecision);
+      expect(stop.decision.evidenceRefs).toContain("change:fixture-0");
+      expect(
+        stop.decision.evidenceRefs.some((ref: string) => ref.startsWith("native-event:")),
+      ).toBe(true);
+      expect(f.journal().filter((event) => event.kind === "action-admitted")).toHaveLength(0);
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+for (const when of ["before-stop", "during-drain", "after-completion"] as const) {
+  test(`native history changed ${when} invalidates a finish proposal without resuming Auto`, async () => {
+    const f = await loaderFixture();
+    const idle = Promise.withResolvers<void>();
+    const waiting = Promise.withResolvers<void>();
+    if (when === "during-drain")
+      f.nativeSession.waitForIdle = async () => {
+        waiting.resolve();
+        await idle.promise;
+      };
+    try {
+      await f.start();
+      f.choose("finish");
+      expect(await f.step()).toMatchObject({ isError: false, finishProposed: true });
+      if (when !== "before-stop") {
+        await f.stop();
+        if (when === "during-drain") {
+          await waiting.promise;
+          expect(await f.status()).toMatchObject({
+            status: "draining",
+            outcome: "completed",
+            completionVerified: false,
+          });
+        } else {
+          expect(await f.settled()).toMatchObject({
+            status: "completed",
+            completionVerified: true,
+          });
+          // The controller's own terminal journal append is included in its
+          // completion binding, so a second diagnostic still verifies it.
+          expect(await f.status()).toMatchObject({ status: "completed", completionVerified: true });
+        }
+      }
+      const start = f.journal()[0];
+      f.appendJournal({
+        ...start,
+        eventId: crypto.randomUUID(),
+        kind: "action-held",
+        actionId: crypto.randomUUID(),
+        skill: "rasen-review-cycle",
+        reason: "New native review evidence requires attention after the finish proposal",
+      });
+      expect(await f.status()).toMatchObject({
+        completionVerified: false,
+        history: { valid: true },
+      });
+      if (when === "before-stop") await f.stop();
+      idle.resolve();
+      expect(await f.settled()).toMatchObject({
+        status: when === "after-completion" ? "completed" : "paused",
+        completionVerified: false,
+      });
+      expect(f.journal().filter((event) => event.kind === "action-admitted")).toHaveLength(0);
+      expect(f.counts()).toMatchObject({ decisions: 1, aborts: 0 });
+      expect(f.bootstraps).toHaveLength(1);
+      expect((await f.step()).isError).toBe(true);
+    } finally {
+      idle.resolve();
+      await f.close();
+    }
+  });
+}
+
+for (const scenario of ["decision-skill", "decision-finish", "body-skill"] as const) {
+  test(`native work arriving during ${scenario} defers admission and finishing until a new quiescent selection`, async () => {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const jobBody = Promise.withResolvers<string>();
+    let first = true;
+    let selections = 0;
+    const f = await loaderFixture(
+      {},
+      {
+        dependencies: {
+          decision: () => async (facts) => {
+            selections++;
+            if (scenario.startsWith("decision") && first) {
+              first = false;
+              entered.resolve();
+              await release.promise;
+            }
+            return scenario === "decision-finish"
+              ? { choice: "finish", confidence: 0.99 }
+              : selectSkill(facts, "rasen-verify-change");
+          },
+          skill: async (skill) => {
+            if (scenario === "body-skill" && first) {
+              first = false;
+              entered.resolve();
+              await release.promise;
+            }
+            return {
+              ...skill,
+              text: "Complete selected skill body",
+              sha256: digest("Complete selected skill body"),
+            };
+          },
+        },
+      },
+    );
+    let pending: ReturnType<typeof f.step> | undefined;
+    try {
+      await f.start();
+      pending = f.step();
+      await entered.promise;
+      const jobId = f.nativeManager.register(
+        "bash",
+        "New native work admitted by the host",
+        async () => jobBody.promise,
+        { ownerId: "main" },
+      );
+      release.resolve();
+      const deferred = await pending;
+      expect(deferred).toMatchObject({ pending: true, isError: false });
+      expect(deferred.finishProposed).toBeUndefined();
+      expect(deferred.action).toBeUndefined();
+      expect(await f.status()).toMatchObject({
+        status: "running",
+        selectedAction: null,
+        steps: "0",
+        completionVerified: false,
+        nativeWork: { pending: true },
+      });
+      expect(f.journal().filter((event) => event.kind === "action-admitted")).toHaveLength(0);
+      expect(await f.step("Still waiting for the existing native job")).toMatchObject({
+        pending: true,
+      });
+      expect(selections).toBe(1);
+      jobBody.resolve("Native work is now settled");
+      await f.nativeManager.getJob(jobId)!.promise;
+      const retry = await f.step("Reconsider after normal native settlement");
+      expect(retry.isError).toBe(false);
+      expect(selections).toBe(2);
+      if (scenario === "decision-finish") {
+        expect(retry.finishProposed).toBe(true);
+        expect(await f.status()).toMatchObject({ steps: "0", selectedAction: null });
+      } else {
+        expect(retry.action.skill.name).toBe("rasen-verify-change");
+        expect(await f.status()).toMatchObject({ steps: "1" });
+      }
+      expect(f.nativeManager.isJobResultConsumed(jobId)).toBe(false);
+      expect(f.counts().aborts).toBe(0);
+    } finally {
+      release.resolve();
+      jobBody.resolve("cleanup");
+      await pending;
+      await f.close();
+    }
+  });
+}
+
+test("a newer replan choice revokes an earlier finish proposal and preserves recovery gating", async () => {
+  const f = await loaderFixture();
+  try {
+    await f.start();
+    f.choose("finish");
+    expect(await f.step()).toMatchObject({ finishProposed: true, decision: { choice: "finish" } });
+    f.choose("replan");
+    expect(await f.step("New evidence requires recovery before completion")).toMatchObject({
+      decision: { choice: "replan" },
+    });
+    expect(await f.status()).toMatchObject({
+      status: "running",
+      steps: "0",
+      completionVerified: false,
+      architect: { pendingRecovery: true, attempts: { completion: 0, recovery: 0 } },
+    });
+    await f.stop();
+    expect(await f.settled()).toMatchObject({
+      status: "paused",
+      outcome: "needs_user",
+      completionVerified: false,
+      architect: { pendingRecovery: true },
+    });
+    expect(f.journal().find((event) => event.kind === "run-stop").decision.choice).toBe("replan");
+    expect(f.counts().decisions).toBe(2);
   } finally {
     await f.close();
   }
 });
 
-test("small decision evidence budgets preserve complete JSON and built-in next-step facts", async () => {
-  const f = await loaderFixture(
-    { maxEvidenceChars: 1000 },
-    {
-      dependencies: {
-        workflow: async () => ({
-          kind: "absent",
-          change: "fixture-change",
-          reason: "No external run-state",
-          fingerprint: "absent",
-        }),
-        decision: () => async (evidence) => {
-          const request = buildJevRequest(evidence, {
-            model: "jev-latest",
-            maxEvidenceChars: 1000,
-          });
-          const facts = JSON.parse(request.state.summary);
-          expect(facts).toMatchObject({
-            hostSource: "builtin",
-            allowedPhase: "apply",
-            externalRunStateRequired: false,
-            truncated: true,
-          });
-          expect(facts.nextStep).toContain("native omp-worker");
-          return { choice: "continue", confidence: 0.95 };
-        },
-      },
-    },
-  );
+test("Jev finish cannot bypass an existing pending recovery gate", async () => {
+  const f = await loaderFixture();
   try {
     await f.start();
-    for (const handler of f.extension.handlers.get("tool_result") ?? []) {
-      await handler(
-        {
-          type: "tool_result",
-          toolName: "read",
-          toolCallId: "escaped-evidence",
-          input: { path: "tasks.md" },
-          content: [{ type: "text", text: '\"'.repeat(1000) }],
-          isError: false,
-        },
-        f.ctx,
-      );
-    }
-    expect(await f.step("Untrusted claim ".repeat(1000))).toMatchObject({ choice: "continue" });
+    f.choose("replan");
+    expect(await f.step()).toMatchObject({ decision: { choice: "replan" } });
+    f.choose("finish");
+    const proposed = await f.step("Ask whether the requested outcome is complete");
+    expect(proposed).toMatchObject({ blocked: true, decision: { choice: "finish" } });
+    expect(proposed.finishProposed).toBeUndefined();
+    expect(await f.status()).toMatchObject({
+      status: "running",
+      steps: "0",
+      completionVerified: false,
+      architect: { pendingRecovery: true, attempts: { completion: 0, recovery: 0 } },
+    });
+    await f.stop();
+    expect(await f.settled()).toMatchObject({
+      status: "paused",
+      outcome: "needs_user",
+      completionVerified: false,
+    });
+    expect(f.journal().filter((event) => event.kind === "action-admitted")).toHaveLength(0);
+    expect(f.counts().decisions).toBe(2);
   } finally {
     await f.close();
   }
