@@ -207,3 +207,58 @@ loading passed with and without optional Brief. The first concurrently executed
 case retry and a subsequent complete 119-test smoke rerun passed. The cause of
 that initial timing-sensitive result was not established. No live model provider
 or user profile was used, and these local results do not establish remote CI.
+
+## Native async ownership revision (2026-10-05)
+
+Auto no longer requires `async.enabled`, `bash.autoBackground.enabled`, or
+`eval.autoBackground.enabled` to be false. It leaves host settings unchanged and
+uses the owning Main session's exported registry and native job APIs. Native
+scheduling, result delivery and wait remain in control. Run-scoped receipts and
+child lifecycle identities provide exact cancellation, late adoption, actual
+promise-settlement barriers, and stale-delivery protection without cancelling
+unrelated jobs owned by the same Main.
+
+The final locked **OMP 18.6.0** / **Bun 1.3.14** run passed formatting, TypeScript,
+**328 unit/installer tests (2,091 assertions)**, **162 smoke tests (1,426
+assertions)**, packed loading (**42 entries**), workflow/ruleset validation, and
+whitespace checks. Independent source review found and verified fixes for queued
+batch admission, reused child identities, hidden descendant cleanup, newer-user
+context ownership, mixed result batches, and job-ID reuse after eviction.
+
+Separate isolated **18.5.1** and **18.6.1** hosts each passed TypeScript, the
+**112-test focused async/controller/native-worker suite (854 assertions)**,
+**4 native/sparse bundled-host installer cases (87 assertions)**, and packed
+loading (**42 entries**). All four OMP SDK packages matched each selected version.
+These focused host matrices did not rerun the other 107 installer cases or the
+entire smoke suite; the full aggregate above ran on the lockfile host.
+
+Coverage includes native detached task success through Main wait and scheduling
+pause, result arrival in actual provider context, denied child tools, recursive
+spawn rejection, live Main interruption, explicit `/auto stop`, new input,
+same-Main unrelated-job preservation, and real child-owned async Bash cancellation.
+A first full run exposed the new Bash fixture using the process-default agent
+home; the fixture now refreshes the public directory resolver into its isolated
+home and restores it on cleanup. The final full and version-matrix reruns passed.
+Child journals still use the supported in-memory backend because this executor
+does not permit native OS journal publish locks; persistent child journaling is
+not established by these cases.
+
+Native probes distinguish Main's live interruption from idle ESC/backtrack and
+focused-child ESC/focus switching. `/auto stop` is the explicit reliable Auto
+cancellation path. OMP's terminal stop scheduling still waits for all Main jobs;
+the Auto checkpoint itself considers only run-owned work. Native waiting does
+not create an extra Auto hidden-continuation loop.
+
+The SDK does not expose the job ID for every interrupted foreground-backed
+Bash/Eval call before background promotion. For Main calls, the extension reports
+`nativeWork.settlementUnverified` and refuses completion or a same-session
+restart instead of claiming termination or cancelling unrelated jobs. Inspect
+native jobs and start a new session when an exact late receipt is unavailable.
+A tool error immediately followed by interruption can remain ambiguous until the
+next genuine assistant message. Leaf owner-scoped joins cover hidden descendant
+jobs. Mixed stale batches preserve unrelated job IDs for native result recovery,
+not their original combined body. See the [operating contract](rasen-auto.md#native-async-ownership-and-stopping).
+
+Model responses and review/decision providers remain deterministic local fixtures.
+No paid provider run, private upload, publishing, merge, deployment, or
+macOS/Windows execution is claimed. Remote CI must verify the published commit.

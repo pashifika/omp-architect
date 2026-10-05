@@ -9,7 +9,7 @@ while a separate reviewer checks plans, recovery approaches, and completion evid
 - **Role-based agents:** Send coding tasks to `omp-worker` and read-only research to `omp-explorer`.
 - **Independent reviews:** Hand a complete native OMP file to an architect model at meaningful checkpoints.
 - **Bounded review rounds:** Set minimum and maximum rounds; unresolved findings stop the workflow.
-- **Optional Rasen Auto:** Load the full generated [Rasen](https://github.com/DumoeDss/rasen) Auto workflow through native OMP skill autoload for a prepared change. The main LEAD uses foreground native implementation/research/reviewer leaves, with Jev stage-boundary advice, time supervision, and the existing synchronous native-file Architect checkpoint as its sole bounded completion-review loop.
+- **Optional Rasen Auto:** Load the full generated [Rasen](https://github.com/DumoeDss/rasen) Auto workflow through native OMP skill autoload for a prepared change. The main LEAD uses native implementation/research/reviewer leaves, with Jev stage-boundary advice, time supervision, and the existing synchronous native-file Architect checkpoint as its sole bounded completion-review loop.
 
 ## Install
 
@@ -67,11 +67,13 @@ Outside Auto, completion requested inside Eval is queued without approval and
 reviewed once at the turn boundary after outer results arrive. Auto instead uses
 the native completion checkpoint synchronously in the LEAD turn, with fresh Rasen
 evidence and the full configured review timeout. Its Eval route requires a
-dedicated foreground JavaScript `reset: true` single-call checkpoint carrier;
-general or batched carriers are rejected without spending a review. Auto requires
-both `async.enabled: false` and `bash.autoBackground.enabled: false`. Its stop hook
+dedicated JavaScript `reset: true` single-call checkpoint carrier;
+general or batched carriers are rejected without spending a review. Auto preserves
+native async settings and tracks its own Main-owned jobs. Its stop hook
 only validates fresh facts against the approval; it does not run the reviewer.
-Wait for background jobs to finish and submit fresh evidence before review. The
+Await Auto-owned native jobs and submit fresh evidence before review. Use `/auto stop`
+to cancel Auto-owned work, including detached workers; idle ESC is not a universal
+job-cancellation command. The
 extension does not silently switch your active main model. Reviews send the full
 admitted file and bounded host evidence to your configured provider; do not include secrets. These checks
 do not replace tool approvals or prove that assistant-authored claims occurred.

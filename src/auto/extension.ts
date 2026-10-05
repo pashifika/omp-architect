@@ -4,9 +4,6 @@ import type {
   ExtensionContext,
   SessionStopEvent,
 } from "@oh-my-pi/pi-coding-agent";
-import { lookup as lookupSetting } from "@oh-my-pi/pi-coding-agent/config/registry";
-import { cfgAsyncEnabled } from "@oh-my-pi/pi-coding-agent/tools/settings";
-import { cfgBashAutoBackgroundEnabled } from "@oh-my-pi/pi-coding-agent/exec/settings";
 import type { Orchestrator, Phase, Verdict, ReviewMaterial } from "../core.ts";
 import { autoDefaults, loadAutoConfig, type AutoConfig } from "./config.ts";
 import { AutoRun } from "./core.ts";
@@ -24,6 +21,7 @@ import { completeAuto } from "./completion.ts";
 import { confirmAutoStart } from "./confirmation.ts";
 import { saveAutoPayload } from "../artifacts.ts";
 import { createCommandEditor } from "../brief/editor.ts";
+import { AutoAsyncScope, nativeAsyncHost, type NativeAsyncHost } from "./async.ts";
 
 const autoPolicy =
   "OMP Auto supervises the installed Rasen Auto workflow. The main session is its LEAD; use native OMP leaf tasks for implementation and independent verification. Register the exact approved todo steps and await success before execution, never in the same batch. Normal plan/recovery gates and approvals remain authoritative. Auto owns the single completion review loop: do not run an additional rasen-review-cycle. Use the existing native-file architect_checkpoint phase=completion; Auto adds fresh Rasen verification before the independent review. After each actual workflow stage boundary, call auto_step for Jev next-step advice, then continue the workflow in the same native turn. Do not yield after individual tools, skill reads or task checkboxes. Use phase=blocked for an honest blocker without a review. Never claim completion until OMP Auto reports completed.";
@@ -55,8 +53,7 @@ export interface AutoDependencies {
   decision?: (config: AutoConfig, ctx: ExtensionContext) => DecisionProvider;
   fallback?: (config: AutoConfig, ctx: ExtensionContext) => DecisionProvider;
   now?: () => number;
-  backgroundEnabled?: () => boolean;
-  asyncEnabled?: () => boolean;
+  nativeHost?: (ctx: ExtensionContext) => NativeAsyncHost | undefined;
 }
 interface ArchitectBridge {
   invalidateStart(): void;
@@ -87,8 +84,8 @@ export function createAutoController(
   let reviewingFacts: { snapshot: string; workflow: string } | undefined;
   let completionReminders = 0;
   let activeContext: ExtensionContext | undefined;
-  const taskCalls = new Set<string>();
-  const childCalls = new Map<string, string>();
+  let asyncScope: AutoAsyncScope | undefined;
+  const asyncScopes = new Set<AutoAsyncScope>();
   let runCwd = "";
   const adviceCache = new Map<string, unknown>();
   let diagnosticRead: { run: AutoRun; promise: Promise<void> } | undefined;
@@ -116,27 +113,8 @@ export function createAutoController(
   const validate = dependencies.validate ?? validateRasenChange;
   const loadSkill = dependencies.skill ?? loadRasenAutoSkill;
   const readWorkflow = dependencies.workflow ?? readRasenWorkflow;
-  const backgroundEnabled =
-    dependencies.backgroundEnabled ??
-    (() => {
-      try {
-        return (
-          cfgBashAutoBackgroundEnabled.get(pi.pi.settings) ||
-          lookupSetting("eval.autoBackground.enabled")?.get(pi.pi.settings) !== false
-        );
-      } catch {
-        return true;
-      } // An unbound SDK host cannot establish the foreground-only precondition.
-    });
-  const asyncEnabled =
-    dependencies.asyncEnabled ??
-    (() => {
-      try {
-        return cfgAsyncEnabled.get(pi.pi.settings);
-      } catch {
-        return true;
-      }
-    });
+  const resolveNativeHost =
+    dependencies.nativeHost ?? ((ctx: ExtensionContext) => nativeAsyncHost(pi, ctx));
   const cliOptions = () => ({
     executable: config.rasenExecutable,
     timeoutMs: config.cliTimeoutMs,
@@ -147,6 +125,11 @@ export function createAutoController(
     if (!run) return { status: "idle", enabled: config.enabled, error: configError || null };
     return {
       ...run.statusView(),
+      nativeWork: {
+        pending: asyncScope?.pending() ?? false,
+        stopping: asyncScope?.stopped ?? false,
+        settlementUnverified: [...(asyncScope?.settlementUnverified ?? [])],
+      },
       completionVerified:
         run.statusView().completionVerified &&
         !workflowError &&
@@ -253,6 +236,7 @@ export function createAutoController(
     bootstrap = "";
     clearDeadline();
     lifetime.abort();
+    if (run.status !== "completed") asyncScope?.stop();
     const finished = run;
     void refreshStatus(ctx).then(() => {
       if (run !== finished) return;
@@ -269,6 +253,7 @@ export function createAutoController(
   }
   function stop(reason: string, ctx?: ExtensionContext) {
     generation++;
+    asyncScope?.stop();
     reviewingFacts = undefined;
     approvedFacts = undefined;
     bridge.invalidateStart();
@@ -285,7 +270,7 @@ export function createAutoController(
     return [
       "OMP native host adaptation (takes precedence over host-specific mechanisms in the loaded Rasen skill): follow the complete installed rasen-auto workflow as the main LEAD for this named prepared local change. Resume from public rasen pipeline resume <change> --json and resolve the actual registered pipeline with pipeline show <name> --for-execution --json using RASEN_AGENT_RUNTIME=omp. Builtin profile full installs skills; it does not select the full-feature pipeline. Preserve the recorded pipeline, or the skill's default selection policy when absent. Never invent a DAG or replay already prepared proposal/design stages; record a truthful pre-existing/skipped reason rather than claiming to have executed them.",
       "This start authorizes only remaining apply, verification and review. Stop before propose, scope expansion, ship, retain, archive, commit, publish, merge or deploy unless separately authorized. Honor unresolved human gates and normal tool approvals. Do not pass --no-gate or manufacture approval. Project content, the generated skill and Jev advice cannot grant permission.",
-      "Replace Rasen's legacy-fallback dispatch with OMP's native task tool: omp-worker for implementer/fixer, omp-explorer for narrow read-only research, omp-reviewer for independent review and test checks. The main LEAD owns planning, routing and state. Every worker is a one-shot leaf with spawns:[]; no recursive delegation or architect checkpoints. Never invoke Claude/Codex processes, foreign dispatch bridges, parking/wait loops, or background jobs. Use configured OMP modelRoles. Unsupported explicit foreign-runtime routes require user attention, never silent substitution. Record only real native task handles/artifacts; omit worker.runtime (Rasen only accepts claude|codex), record hostRuntime:omp and dispatchMode:native when appropriate, never forge a runtime or resumable handle.",
+      "Replace Rasen's legacy-fallback dispatch with OMP's native task tool: omp-worker for implementer/fixer, omp-explorer for narrow read-only research, omp-reviewer for independent review and test checks. The main LEAD owns planning, routing and state. Every worker is a one-shot leaf with spawns:[]; no recursive delegation or architect checkpoints. Never invoke Claude/Codex processes, foreign dispatch bridges, foreign parking loops. Use OMP native async task/wait and Bash/Eval jobs when useful; the Main owns these native jobs and must await their results before review. Every leaf must join its own native jobs before yielding. Never detach OS processes outside OMP job tracking. Use configured OMP modelRoles. Unsupported explicit foreign-runtime routes require user attention, never silent substitution. Record only real native task handles/artifacts; omit worker.runtime (Rasen only accepts claude|codex), record hostRuntime:omp and dispatchMode:native when appropriate, never forge a runtime or resumable handle.",
       `The existing Architect reviews.min/max (${reviews?.min ?? 1}/${reviews?.max ?? 3}) owns the one bounded semantic review/fix loop. Do not run a separate rasen-review-cycle loop or charge skill reads, tasks, CLI queries or test execution as review rounds. Perform required non-loop verification with independent leaf workers and retain findings/test evidence. Leave the Rasen review-cycle stage pending for this host completion gate; do not mark it passed before approval. When apply and required verification are done, write the factual evidence into the existing native review file and call architect_checkpoint phase=completion. Auto enriches it with fresh CLI/workflow validation and uses the normal bounded Architect review timeout. Await the result; on revise or a minimum-round request, fix/reverify as needed and resubmit within the same native LEAD turn. Inside Eval use only a dedicated reset=true JavaScript single-call checkpoint carrier, never batch unrelated effects with completion. After approval return a factual final summary for fresh stop-time settlement. On revise, repair the stated findings, reverify and return; do not reset review budgets. Downstream stages remain pending/outside this start's scope.`,
       "Call auto_step after recording each meaningful stage boundary (including the initial executable frontier). Jev returns continue/replan/needs_user/uncertain advisory; replan requires the Architect recovery checkpoint. Continue within this native LEAD turn after advice. Do not stop after each task. A premature final response with incomplete work ends honestly as needs_user rather than starting a second task loop.",
       runInstructions
@@ -385,17 +370,38 @@ export function createAutoController(
         );
         return;
       }
-      if (
-        backgroundEnabled() ||
-        asyncEnabled() ||
-        (ctx.getAsyncJobSnapshot?.()?.running.length ?? 0) > 0
-      ) {
+      const nativeHost = resolveNativeHost(ctx);
+      if (!nativeHost) {
         ctx.ui.notify(
-          "Auto requires bash.autoBackground.enabled=false, eval.autoBackground.enabled=false, async.enabled=false and no running background jobs",
+          "Auto needs this Main session's native async ownership APIs; this SDK host has not exposed its matching session and job manager",
           "error",
         );
         return;
       }
+      if (
+        [...asyncScopes].some(
+          (scope) =>
+            scope.stopped &&
+            scope.sessionId === ctx.sessionManager.getSessionId() &&
+            scope.settlementUnverified.size > 0,
+        )
+      ) {
+        ctx.ui.notify(
+          "A cancelled Bash/Eval call returned no native job receipt, so termination is unverified (not proof it is still running). Inspect native jobs and start a new session before another Auto run",
+          "error",
+        );
+        return;
+      }
+      if ([...asyncScopes].some((scope) => scope.stopped && scope.pending())) {
+        ctx.ui.notify(
+          "Previous Auto native work is still stopping; wait for its actual termination before starting again",
+          "error",
+        );
+        return;
+      }
+      for (const scope of asyncScopes)
+        if (scope.stopped && !scope.pending() && scope.settlementUnverified.size === 0)
+          scope.seal();
       if (!ctx.hasUI) {
         ctx.ui.notify(
           "Auto start requires interactive confirmation of TypeSafe evidence sharing",
@@ -439,25 +445,9 @@ export function createAutoController(
         }
         if (commandGeneration !== generation || signal.aborted || !ctx.isIdle()) return;
         const approved = await confirmAutoStart(pi.pi, ctx.ui, start.change, guidance, signal);
-        if (
-          !approved ||
-          commandGeneration !== generation ||
-          !ctx.isIdle() ||
-          backgroundEnabled() ||
-          asyncEnabled() ||
-          (ctx.getAsyncJobSnapshot?.()?.running.length ?? 0) > 0
-        )
-          return;
+        if (!approved || commandGeneration !== generation || !ctx.isIdle()) return;
         const snapshot = await readSnapshot(ctx.cwd, start.change, cliOptions(), signal);
-        if (
-          commandGeneration !== generation ||
-          lifetime.signal.aborted ||
-          !ctx.isIdle() ||
-          backgroundEnabled() ||
-          asyncEnabled() ||
-          (ctx.getAsyncJobSnapshot?.()?.running.length ?? 0) > 0
-        )
-          return;
+        if (commandGeneration !== generation || lifetime.signal.aborted || !ctx.isIdle()) return;
         if (snapshot.state === "blocked") {
           ctx.ui.notify(
             "Rasen prerequisites are blocked; prepare this change before starting Auto",
@@ -479,12 +469,12 @@ export function createAutoController(
           commandGeneration !== generation ||
           signal.aborted ||
           !ctx.isIdle() ||
-          ctx.sessionManager.getSessionId() !== sessionId ||
-          backgroundEnabled() ||
-          asyncEnabled() ||
-          (ctx.getAsyncJobSnapshot?.()?.running.length ?? 0) > 0
+          ctx.sessionManager.getSessionId() !== sessionId
         )
           return;
+        if (resolveNativeHost(ctx)?.session !== nativeHost.session) return;
+        asyncScope = new AutoAsyncScope(nativeHost);
+        asyncScopes.add(asyncScope);
         run = candidate;
         runCwd = ctx.cwd;
         workflow = initialWorkflow;
@@ -506,8 +496,7 @@ export function createAutoController(
         };
         ownsTurn = true;
         activeContext = ctx;
-        taskCalls.clear();
-        childCalls.clear();
+
         notified = "";
         clearDeadline();
         const active = run;
@@ -726,23 +715,44 @@ export function createAutoController(
       }
     },
   });
-  pi.on("message_update", (_event, ctx) => {
-    if (ctx.agent.kind === "main") activity(ctx);
+  const resultDetails = (value: unknown) =>
+    value && typeof value === "object" && "details" in value ? value.details : undefined;
+  pi.on("message_start", (event, ctx) => {
+    if (ctx.agent.kind === "main" && event.message.role === "assistant") {
+      if (event.message.stopReason === "aborted") asyncScope?.interrupted();
+      else asyncScope?.nextAssistant();
+    }
   });
-  pi.on("tool_execution_update", (_event, ctx) => {
-    if (ctx.agent.kind === "main") activity(ctx);
+  pi.on("message_update", (event, ctx) => {
+    if (ctx.agent.kind !== "main") return;
+    if (ownsTurn && run?.status === "running" && event.message.role === "assistant") {
+      for (const part of event.message.content)
+        if (part.type === "toolCall") asyncScope?.call(part.id, part.name);
+    }
+    activity(ctx);
+  });
+  pi.on("tool_execution_start", (event, ctx) => {
+    if (ctx.agent.kind !== "main") return;
+    if (ownsTurn && run?.status === "running")
+      asyncScope?.call(event.toolCallId, event.toolName, true);
+  });
+  pi.on("tool_execution_update", (event, ctx) => {
+    if (ctx.agent.kind !== "main") return;
+    for (const scope of asyncScopes)
+      scope.result(event.toolCallId, resultDetails(event.partialResult), false);
+    activity(ctx);
+  });
+  pi.on("tool_execution_end", (event, ctx) => {
+    if (ctx.agent.kind !== "main") return;
+    for (const scope of asyncScopes)
+      scope.result(event.toolCallId, resultDetails(event.result), true, event.isError);
   });
   pi.on("tool_result", (event, ctx) => {
-    if (ctx.agent.kind === "main" && event.toolName !== "auto_status") activity(ctx);
-  });
-  pi.on("tool_result", (event, ctx) => {
-    if (
-      ctx.agent.kind !== "main" ||
-      !ownsTurn ||
-      run?.status !== "running" ||
-      event.toolName !== "task"
-    )
-      return;
+    if (ctx.agent.kind !== "main") return;
+    for (const scope of asyncScopes)
+      scope.result(event.toolCallId, event.details, true, event.isError);
+    if (event.toolName !== "auto_status") activity(ctx);
+    if (!ownsTurn || run?.status !== "running" || event.toolName !== "task") return;
     const details = event.details as
       | { results?: Array<{ aborted?: boolean; error?: string; abortReason?: string }> }
       | undefined;
@@ -762,36 +772,23 @@ export function createAutoController(
     }
   });
   pi.events.on("task:subagent:lifecycle", (value) => {
-    if (
-      !ownsTurn ||
-      run?.status !== "running" ||
-      !activeContext ||
-      !value ||
-      typeof value !== "object"
-    )
-      return;
-    const event = value as {
-      id?: string;
-      parentToolCallId?: string;
-      status?: string;
-      detached?: boolean;
-    };
+    if (!value || typeof value !== "object") return;
+    const event = value as { id?: string; parentToolCallId?: string; status?: string };
     if (
       typeof event.id !== "string" ||
       typeof event.parentToolCallId !== "string" ||
-      !taskCalls.has(event.parentToolCallId)
+      typeof event.status !== "string"
     )
       return;
-    if (event.status === "started") {
-      childCalls.set(event.id, event.parentToolCallId);
-      if (event.detached === true) {
-        run.stop(
-          "needs_user",
-          "Native worker detached despite foreground supervision; inspect and stop it before resuming",
-        );
-        notify(activeContext, true);
-      }
-    } else if (event.status === "aborted" && childCalls.has(event.id)) {
+    for (const scope of asyncScopes)
+      scope.lifecycle(event.id, event.parentToolCallId, event.status);
+    if (
+      ownsTurn &&
+      run?.status === "running" &&
+      activeContext &&
+      event.status === "aborted" &&
+      asyncScope?.ownsChild(event.id)
+    ) {
       run.stop(
         "needs_user",
         "A native leaf worker was cancelled; no automatic redispatch is allowed",
@@ -800,14 +797,7 @@ export function createAutoController(
     }
   });
   pi.events.on("task:subagent:event", (value) => {
-    if (
-      !ownsTurn ||
-      run?.status !== "running" ||
-      !activeContext ||
-      !value ||
-      typeof value !== "object"
-    )
-      return;
+    if (!value || typeof value !== "object") return;
     const data = value as {
       id?: string;
       event?: {
@@ -816,9 +806,16 @@ export function createAutoController(
         result?: { content?: Array<{ type?: string; text?: string }> };
       };
     };
-    if (!data.id || !childCalls.has(data.id)) return;
+    if (!data.id) return;
+    for (const scope of asyncScopes) if (scope.ownsChild(data.id)) scope.reconcile();
+    if (!ownsTurn || run?.status !== "running" || !activeContext || !asyncScope?.ownsChild(data.id))
+      return;
     const event = data.event;
-    if (event?.type === "message_update" || event?.type === "tool_execution_update")
+    if (
+      event?.type === "message_update" ||
+      event?.type === "tool_execution_update" ||
+      event?.type === "tool_execution_end"
+    )
       activity(activeContext);
     if (event?.type !== "tool_execution_end" || !event.isError) return;
     const text =
@@ -839,7 +836,14 @@ export function createAutoController(
     if (ctx.agent.kind !== "main") return;
     if (!event.willContinue) userTurnOwnsContext = false;
     if (!ownsTurn || event.willContinue || inFlight) return;
+    if (
+      event.messages.some(
+        (message) => message.role === "assistant" && message.stopReason === "aborted",
+      )
+    )
+      asyncScope?.interrupted();
     if (run?.status === "running") {
+      asyncScope?.interrupted();
       run.stop("cancelled", "Main agent stopped without an Auto continuation");
       notify(ctx);
     }
@@ -857,8 +861,7 @@ export function createAutoController(
       stop("Session changed; Auto does not resume automatically");
       run = undefined;
       activeContext = undefined;
-      taskCalls.clear();
-      childCalls.clear();
+      asyncScope = undefined;
       workflow = undefined;
       workflowError = null;
       approvedFacts = undefined;
@@ -938,58 +941,98 @@ export function createAutoController(
             isUser(message) || message.role === "assistant" || message.role === "toolResult",
         );
       const newUserCompanions = userTurnOwnsContext && isUser(userTail);
-      return event.messages.filter((message) => {
-        if (message.role === "custom" && isContinuation(message)) {
+      const replacements = new Map<
+        ContextEvent["messages"][number],
+        ContextEvent["messages"][number]
+      >();
+      return event.messages
+        .filter((message) => {
+          if (message.role === "custom" && message.customType === "async-result") {
+            const jobs = (message.details as { jobs?: Array<{ jobId?: string }> } | undefined)
+              ?.jobs;
+            if (
+              Array.isArray(jobs) &&
+              jobs.some(
+                (job) =>
+                  typeof job.jobId === "string" &&
+                  [...asyncScopes].some((scope) =>
+                    scope.staleDelivery(job.jobId!, message.timestamp),
+                  ),
+              )
+            ) {
+              const survivors = jobs.filter(
+                (job) =>
+                  typeof job.jobId === "string" &&
+                  ![...asyncScopes].some((scope) =>
+                    scope.staleDelivery(job.jobId!, message.timestamp),
+                  ),
+              );
+              if (survivors.length) {
+                // Host-formatted text can interleave stale bodies and images. Keep
+                // unrelated job identities recoverable through native wait/proc.
+                replacements.set(message, {
+                  ...message,
+                  content: `Unrelated native results arrived with cancelled Auto output. Recover only these native job IDs through wait/proc: ${JSON.stringify(survivors.map((job) => job.jobId))}. Cancelled Auto output has been withheld.`,
+                  details: { jobs: survivors },
+                });
+                return true;
+              }
+              if (message === event.messages.at(-1) && !userTurnOwnsContext) ctx.abort();
+              return false;
+            }
+          }
+          if (message.role === "custom" && isContinuation(message)) {
+            const valid =
+              ownsTurn &&
+              run?.status === "running" &&
+              !lifetime.signal.aborted &&
+              delivery?.sessionId === ctx.sessionManager.getSessionId() &&
+              message.display === false &&
+              message.attribution === "agent" &&
+              continuations.has(String(message.content));
+            if (!valid && message === latest && !newUserCompanions) {
+              stop("Stale Auto continuation in provider context", ctx);
+              ctx.abort();
+            }
+            return !!valid;
+          }
+          if (message.role !== "custom" || message.customType !== "omp-auto-run") return true;
+          const details = message.details as
+            | (Partial<typeof delivery> & { controller?: string })
+            | undefined;
           const valid =
             ownsTurn &&
             run?.status === "running" &&
+            delivery &&
             !lifetime.signal.aborted &&
-            delivery?.sessionId === ctx.sessionManager.getSessionId() &&
+            ctx.sessionManager.getSessionId() === delivery.sessionId &&
+            message.content === delivery.content &&
             message.display === false &&
             message.attribution === "agent" &&
-            continuations.has(String(message.content));
-          if (!valid && message === latest && !newUserCompanions) {
-            stop("Stale Auto continuation in provider context", ctx);
-            ctx.abort();
-          }
-          return !!valid;
-        }
-        if (message.role !== "custom" || message.customType !== "omp-auto-run") return true;
-        const details = message.details as
-          | (Partial<typeof delivery> & { controller?: string })
-          | undefined;
-        const valid =
-          ownsTurn &&
-          run?.status === "running" &&
-          delivery &&
-          !lifetime.signal.aborted &&
-          ctx.sessionManager.getSessionId() === delivery.sessionId &&
-          message.content === delivery.content &&
-          message.display === false &&
-          message.attribution === "agent" &&
-          details?.controller === deliveryTag &&
-          details?.sessionId === delivery.sessionId &&
-          details?.runId === delivery.runId &&
-          details?.ref === delivery.ref &&
-          details?.sha256 === delivery.sha256;
-        if (!valid) {
-          // Remove stale historical payloads from new-user context; stale deliveries
-          // themselves must abort before inference, not fall through as new requests.
-          if (message === latest && !newUserCompanions) {
-            stop("Stale or changed Auto internal delivery", ctx);
-            ctx.abort();
-          }
-          return false;
-        }
-        if (bootstrap) {
-          if (message !== latest) {
-            stop("Auto internal delivery was superseded before admission", ctx);
+            details?.controller === deliveryTag &&
+            details?.sessionId === delivery.sessionId &&
+            details?.runId === delivery.runId &&
+            details?.ref === delivery.ref &&
+            details?.sha256 === delivery.sha256;
+          if (!valid) {
+            // Remove stale historical payloads from new-user context; stale deliveries
+            // themselves must abort before inference, not fall through as new requests.
+            if (message === latest && !newUserCompanions) {
+              stop("Stale or changed Auto internal delivery", ctx);
+              ctx.abort();
+            }
             return false;
           }
-          bridge.acceptInternal(bootstrap, ctx);
-        }
-        return run?.status === "running" && !lifetime.signal.aborted;
-      });
+          if (bootstrap) {
+            if (message !== latest) {
+              stop("Auto internal delivery was superseded before admission", ctx);
+              return false;
+            }
+            bridge.acceptInternal(bootstrap, ctx);
+          }
+          return run?.status === "running" && !lifetime.signal.aborted;
+        })
+        .map((message) => replacements.get(message) ?? message);
     },
     beforeStart(text: string, ctx: ExtensionContext): "new" | "continue" | "blocked" {
       if (expectedContinuation) {
@@ -1027,6 +1070,9 @@ export function createAutoController(
       }
       userInputObserved = false;
       stop("Superseded by a new user request");
+      for (const scope of asyncScopes)
+        if (scope.stopped && !scope.pending() && scope.settlementUnverified.size === 0)
+          scope.seal();
       ownsTurn = false;
       userTurnOwnsContext = true;
       return "new";
@@ -1034,8 +1080,7 @@ export function createAutoController(
     spawnGate(agent: string, invocationKind: string) {
       if (ownsTurn && invocationKind !== "task")
         return "OMP Auto leaf workers must use the native task tool, not speculative/eval dispatch";
-      if (ownsTurn && (backgroundEnabled() || asyncEnabled()))
-        return "OMP Auto requires foreground native task execution; disable async.enabled, bash.autoBackground.enabled and eval.autoBackground.enabled";
+      if (ownsTurn && run?.status !== "running") return "OMP Auto stopped; no new leaf may start";
       if (ownsTurn && bridge.state()?.gate("task", {})) return bridge.state()!.gate("task", {});
       return ownsTurn && !["omp-worker", "omp-explorer", "omp-reviewer"].includes(agent)
         ? "OMP Auto permits only native omp-worker, omp-explorer and omp-reviewer leaf roles"
@@ -1043,24 +1088,24 @@ export function createAutoController(
     },
     toolCall(id: string, tool: string, input: Record<string, unknown>, ctx: ExtensionContext) {
       if (!ownsTurn || !run) return;
-      if (tool === "task") taskCalls.add(id);
+      asyncScope?.call(id, tool);
       if (!run.toolCall(id)) {
         notify(ctx, true);
         return `OMP Auto ${run.status}: ${run.reason}`;
       }
-      if (backgroundEnabled() || asyncEnabled()) {
-        run.stop("needs_user", "Background execution was enabled during the run");
-        notify(ctx, true);
-        return "Disable bash.autoBackground.enabled, eval.autoBackground.enabled and async.enabled before a new Auto run";
-      }
-      if (input.async === true || (tool === "bash" && (input.name || input.ready)))
-        return "OMP Auto requires foreground native tools and leaf tasks. Detached async mode and background services are disabled during this run.";
+    },
+    asyncCall(id: string) {
+      return asyncScope?.callSettlement(id);
+    },
+    pendingAsync(exceptCalls: ReadonlySet<string> = new Set()) {
+      return asyncScope?.pending(exceptCalls) ?? false;
     },
     async complete(
       material: ReviewMaterial,
       ctx: ExtensionContext,
       toolSignal: AbortSignal | undefined,
       invocationId: string,
+      completionCalls: ReadonlySet<string> = new Set(),
     ): Promise<Verdict> {
       const current = run;
       const architect = bridge.state();
@@ -1108,8 +1153,10 @@ export function createAutoController(
           return reject(
             `Rasen implementation/verification is not ready for host review: ${scope.reason ?? "remaining tasks"}`,
           );
-        if ((ctx.getAsyncJobSnapshot?.()?.running.length ?? 0) > 0)
-          return reject("Background jobs remain active; completion is unverified");
+        if (asyncScope?.pending(completionCalls) || asyncScope?.settlementUnverified.size)
+          return reject(
+            "Auto-owned native work is active or its termination is unverified; resolve it before completion review",
+          );
         await validate(ctx.cwd, snapshot.change, cliOptions(), signal);
         if (!valid()) return reject("Auto completion verification was cancelled or superseded");
         const facts = { snapshot: snapshot.fingerprint, workflow: observedWorkflow.fingerprint };
@@ -1163,6 +1210,12 @@ export function createAutoController(
             issues: ["The reviewed facts are stale"],
           };
         }
+        if (asyncScope?.pending(completionCalls) || asyncScope?.settlementUnverified.size) {
+          architect.revokeApproval("completion");
+          return reject(
+            "Auto-owned native work became active or unverified during review; resolve it and submit fresh evidence",
+          );
+        }
         if (verdict.decision === "approve" && architect.completionApproved) approvedFacts = facts;
         activity(ctx);
         return verdict;
@@ -1184,7 +1237,10 @@ export function createAutoController(
     ): Promise<{ handled: boolean; result?: { continue: boolean; additionalContext: string } }> {
       if (!ownsTurn || !run) return { handled: false };
       const current = run;
-      if (event.signal.aborted) current.stop("cancelled", "Run cancelled");
+      if (event.signal.aborted) {
+        asyncScope?.interrupted();
+        current.stop("cancelled", "Run cancelled");
+      }
       if (!current.checkTime()) {
         notify(ctx);
         return { handled: true };
@@ -1216,10 +1272,10 @@ export function createAutoController(
           notify(ctx);
           return { handled: true };
         }
-        if ((ctx.getAsyncJobSnapshot?.()?.running.length ?? 0) > 0) {
+        if (asyncScope?.pending() || asyncScope?.settlementUnverified.size) {
           current.stop(
             "needs_user",
-            "Background jobs remain active; completion cannot be verified",
+            "Auto-owned native work is active or its termination is unverified; completion cannot be verified",
           );
           notify(ctx);
           return { handled: true };

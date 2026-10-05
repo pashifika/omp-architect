@@ -1,10 +1,6 @@
-# Merge only when opting in to /auto. This is a native OMP setting.
-# Auto uses foreground native tools and leaf tasks so cancellation can reach them.
-bash:
-  autoBackground:
-    enabled: false
-async:
-  enabled: false
-eval:
-  autoBackground:
-    enabled: false
+# Auto preserves native OMP async settings; no async/background override is required.
+# Keep your existing async.enabled, bash.autoBackground.enabled and
+# eval.autoBackground.enabled choices. Auto tracks run-owned native jobs and
+# /auto stop cancels them without cancelling unrelated Main jobs.
+# Configure Auto supervision in auto.json, not this native OMP settings file.
+{}

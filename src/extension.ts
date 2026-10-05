@@ -360,8 +360,18 @@ export function extensionFactory(
       if (ctx.agent.kind !== "main" || !state) return;
       const toolName = effectiveToolName(event.toolName, event.input);
       if (toolName === "eval") {
-        activeEvals.delete(event.toolCallId);
-        if (autoCompletionCarriers.delete(event.toolCallId)) return;
+        const pending = auto.asyncCall(event.toolCallId);
+        if (pending) {
+          const input = activeEvals.get(event.toolCallId);
+          void pending.then(() => {
+            if (activeEvals.get(event.toolCallId) === input) activeEvals.delete(event.toolCallId);
+            autoCompletionCarriers.delete(event.toolCallId);
+          });
+        } else activeEvals.delete(event.toolCallId);
+        if (autoCompletionCarriers.has(event.toolCallId)) {
+          if (!pending) autoCompletionCarriers.delete(event.toolCallId);
+          return;
+        }
       }
       if (toolName === "auto_status" || toolName === "architect_checkpoint") return;
       const text = event.content
@@ -405,6 +415,7 @@ export function extensionFactory(
     pi.on("tool_execution_end", (event, ctx) => {
       if (ctx.agent.kind !== "main" || event.toolName !== "eval") return;
       const input = activeEvals.get(event.toolCallId);
+      if (auto.asyncCall(event.toolCallId)) return; // Initial native background receipt, not settlement.
       if (!input) return; // The normal tool_result already recorded this execution.
       activeEvals.delete(event.toolCallId);
       state?.observe(
@@ -558,6 +569,7 @@ export function extensionFactory(
         }
         if (
           params.phase === "completion" &&
+          !auto.handlesCompletion() &&
           (ctx.getAsyncJobSnapshot?.()?.running.length ?? 0) > 0
         ) {
           const verdict = state?.rejectReview(
@@ -583,7 +595,7 @@ export function extensionFactory(
             const verdict = state?.rejectReview(
               "completion",
               invocationId,
-              "Auto completion inside Eval requires one dedicated foreground JavaScript reset=true single-call native checkpoint carrier; await all other effects first",
+              "Auto completion inside Eval requires one dedicated JavaScript reset=true single-call native checkpoint carrier; await all other effects first",
             );
             const result = { ...verdict, invocationId, status: "input_rejected", charged: false };
             return {
@@ -595,7 +607,13 @@ export function extensionFactory(
           for (const evalId of activeEvals.keys()) autoCompletionCarriers.add(evalId);
           const current = state;
           const requestGeneration = generation;
-          const verdict = await auto.complete(material, ctx, signal, invocationId);
+          const verdict = await auto.complete(
+            material,
+            ctx,
+            signal,
+            invocationId,
+            new Set(autoCompletionCarriers),
+          );
           if (
             state &&
             state === current &&

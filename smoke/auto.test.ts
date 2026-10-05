@@ -5,6 +5,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createAssistantMessageEventStream, type AssistantMessage } from "@oh-my-pi/pi-ai";
 import {
+  AgentRegistry,
+  type AgentSession,
   AuthStorage,
   createAgentSession,
   ModelRegistry,
@@ -20,7 +22,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
 import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
-import { cfgBashAutoBackgroundEnabled } from "@oh-my-pi/pi-coding-agent/exec/settings";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { readRasenWorkflow, type RasenWorkflow } from "../src/auto/workflow.ts";
 import type { AutoConfig } from "../src/auto/config.ts";
@@ -168,6 +170,12 @@ async function loaderFixture(
   runtime.sendUserMessage = () => {
     throw new Error("Auto must never fabricate a user message");
   };
+  const nativeManager = new AsyncJobManager({});
+  const nativeRegistry = new AgentRegistry();
+  const nativeSession = {
+    asyncJobManager: nativeManager,
+    getAgentId: () => "main",
+  } as AgentSession;
   const factory = extensionFactory(() => overrides.reviewer ?? (async () => approved), {
     snapshot: async () => {
       reads++;
@@ -183,8 +191,7 @@ async function loaderFixture(
     fallback: () => async () => {
       throw new Error("Unexpected fallback");
     },
-    backgroundEnabled: () => false,
-    asyncEnabled: () => false,
+    nativeHost: () => ({ session: nativeSession, registry: nativeRegistry }),
     ...overrides.dependencies,
   });
   const extension = await loadExtensionFromFactory(
@@ -194,6 +201,7 @@ async function loaderFixture(
     runtime,
   );
   const sessionManager = SessionManager.create(cwd, path.join(cwd, ".test-sessions"));
+  Object.defineProperty(nativeSession, "sessionId", { get: () => sessionManager.getSessionId() });
   const ctx = {
     cwd,
     sessionManager,
@@ -247,6 +255,7 @@ async function loaderFixture(
     cwd,
     extension,
     ctx,
+    nativeManager,
     async evidence(content: string): Promise<string> {
       const id = await sessionManager.saveArtifact(content, "architect-review");
       if (!id) throw new Error("Fixture review artifact was not saved");
@@ -290,6 +299,7 @@ async function loaderFixture(
     counts: () => ({ reads, decisions, aborts }),
     async close() {
       await extension.handlers.get("session_shutdown")![0]({ type: "session_shutdown" }, ctx);
+      nativeManager.dispose();
       await fs.rm(cwd, { recursive: true, force: true });
     },
   };
@@ -1097,7 +1107,7 @@ test("Auto checkpoint review keeps the normal Architect timeout beyond the 24s s
   }
 });
 
-test("real loader blocks unregistered spawning and detached/background-capable tool paths during Auto", async () => {
+test("real loader blocks unregistered spawning while preserving native async tool paths during Auto", async () => {
   const fixture = await loaderFixture();
   try {
     await fixture.start();
@@ -1126,7 +1136,7 @@ test("real loader blocks unregistered spawning and detached/background-capable t
           },
           fixture.ctx,
         ),
-      ).toMatchObject({ block: true });
+      ).toBeUndefined();
     }
     expect(await fixture.status()).toMatchObject({ status: "running" });
   } finally {
@@ -1560,9 +1570,6 @@ for (const mode of [
       fallback: () => async () => {
         throw new Error("Unexpected fallback");
       },
-      // SDK callers can isolate settings without binding OMP's process-global CLI settings.
-      backgroundEnabled: () => cfgBashAutoBackgroundEnabled.get(settings),
-      asyncEnabled: () => false,
     };
     // Keep the journal isolated in memory while native review artifacts remain readable on disk.
     const sessionManager = SessionManager.inMemory(cwd);
@@ -2544,6 +2551,110 @@ test("Jev advice rejects an in-flight stage-status change even when completed/re
   } finally {
     release.resolve();
     await pending?.catch(() => {});
+    await f.close();
+  }
+});
+
+for (const mixed of [false, true]) {
+  test(`stale Auto async delivery preserves a newer active user turn, mixed=${mixed}`, async () => {
+    const f = await loaderFixture();
+    try {
+      await f.start();
+      await f.extension.handlers.get("tool_call")![0](
+        { type: "tool_call", toolName: "bash", toolCallId: "owned", input: { command: "fixture" } },
+        f.ctx,
+      );
+      const id = f.nativeManager.register("bash", "owned", async () => "old", { ownerId: "main" });
+      for (const handler of f.extension.handlers.get("tool_result") ?? [])
+        await handler(
+          {
+            type: "tool_result",
+            toolName: "bash",
+            toolCallId: "owned",
+            input: {},
+            content: [],
+            details: { async: { jobId: id } },
+            isError: false,
+          },
+          f.ctx,
+        );
+      await f.nativeManager.getJob(id)!.promise;
+      const delivery = {
+        role: "custom",
+        customType: "async-result",
+        attribution: "agent",
+        display: true,
+        content: "STALE BODY plus unrelated",
+        details: { jobs: [{ jobId: id }, ...(mixed ? [{ jobId: "unrelated-job" }] : [])] },
+        timestamp: Date.now(),
+      };
+      await f.extension.handlers.get("input")![0](
+        { type: "input", text: "New user task", source: "interactive" },
+        f.ctx,
+      );
+      await f.extension.handlers.get("before_agent_start")![0](
+        { type: "before_agent_start", prompt: "New user task", systemPrompt: [] },
+        f.ctx,
+      );
+      const messages = [
+        { role: "user", content: "New user task", timestamp: Date.now() },
+        { role: "assistant", content: [], stopReason: "toolUse", timestamp: Date.now() },
+        {
+          role: "toolResult",
+          toolCallId: "new-read",
+          toolName: "read",
+          content: [],
+          isError: false,
+          timestamp: Date.now(),
+        },
+      ];
+      const aborts = f.counts().aborts;
+      const result = await f.extension.handlers.get("context")![0](
+        { type: "context", messages: [...messages, delivery] },
+        f.ctx,
+      );
+      expect(f.counts().aborts).toBe(aborts);
+      expect(JSON.stringify(result)).not.toContain("STALE BODY");
+      if (mixed) expect(JSON.stringify(result)).toContain("unrelated-job");
+      else expect(result).toEqual({ messages });
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+test("unreceipted interrupted native work cannot pass Auto completion", async () => {
+  const f = await loaderFixture();
+  try {
+    await f.start();
+    await f.extension.handlers.get("tool_call")![0](
+      {
+        type: "tool_call",
+        toolName: "bash",
+        toolCallId: "interrupted",
+        input: { command: "fixture" },
+      },
+      f.ctx,
+    );
+    for (const handler of f.extension.handlers.get("tool_execution_end") ?? [])
+      await handler(
+        {
+          type: "tool_execution_end",
+          toolName: "bash",
+          toolCallId: "interrupted",
+          isError: true,
+          result: { content: [], details: { __interrupted: true, execution: "started" } },
+        },
+        f.ctx,
+      );
+    f.complete();
+    const result = await f.checkpoint();
+    expect(JSON.stringify(result)).toContain("termination is unverified");
+    expect(await f.status()).toMatchObject({
+      completionVerified: false,
+      nativeWork: { settlementUnverified: ["interrupted"] },
+    });
+  } finally {
     await f.close();
   }
 });

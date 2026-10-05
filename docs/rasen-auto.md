@@ -36,7 +36,7 @@ source guidance is never reconstructed from display rows.
 
 1. Build/install the pinned Rasen development source with `bun run prepare:rasen` (see the script's reported executable path), then run `rasen init --tools omp --profile full` in your project using that executable. Use the builtin profile; no external YAML profile import is needed. The script installs into a temporary test prefix; use Rasen's upstream packaging workflow for a persistent installation. Prepare the change's proposal, design, specs, and tasks first
 2. Both the global and project `auto.json` files are **optional**. Set common defaults in the active OMP agent directory's `auto.json` (normally `~/.omp/agent/auto.json`), then override individual settings in `<project>/.omp/auto.json` if needed. With neither file, Auto uses its bounded builtins and `rasen` on PATH. See [configuration inheritance](#configuration-inheritance) below; restart OMP after editing. A missing file or `enabled: true` never starts a run automatically
-3. Merge [examples/auto-config.yml](../examples/auto-config.yml) to set native OMP `async.enabled: false`, `bash.autoBackground.enabled: false`, and `eval.autoBackground.enabled: false`, and finish existing background jobs. Auto requires foreground tools and leaf tasks. Native tasks otherwise run asynchronously by default even without an explicit `async` argument. Eval auto-backgrounding is already off by default; keep it off so a long native checkpoint cannot detach. The regular `modelRoles` and Architect `reviews.min/max` settings in the [Architect guide](architect.md) remain authoritative
+3. Keep your native OMP async settings: Auto supports native task/wait and Bash/Eval jobs without disabling async or changing global configuration. [examples/auto-config.yml](../examples/auto-config.yml) explains the settings policy. The regular `modelRoles` and Architect `reviews.min/max` settings in the [Architect guide](architect.md) remain authoritative
 4. Authenticate the `typesafe` provider through OMP's `/login`, or provide `TYPESAFE_API_KEY` in the OMP process environment through your normal secure setup. Auto resolves credentials through the current OMP session's `authStorage.keys.get("typesafe")` on each Jev invocation, using OMP's standard precedence; a key saved by `/login` takes precedence over the environment variable. You do not need to configure both. Credential lookup shares the decision's timeout and cancellation boundary. Never put keys in `auto.json`, this repository, task artifacts, or tool arguments. No external private connector key is imported. `jev-latest` is the fixed TypeSafe routing model; OMP generative models/efforts still use native roles
 5. Run `/auto start my-change` in interactive OMP and confirm the scoped run and evidence sharing. `/auto status` and `auto_status` independently re-read bounded, fresh Rasen CLI state and show progress, supervision, and review budgets, including after a run stops. `/auto stop` cancels; a fresh user start is required to reset budgets
 
@@ -110,7 +110,7 @@ Tab completes Auto subcommands, actual local Rasen change directories, `--brief`
 
 The rendered brief and extra instructions are shown at confirmation and frozen for that run. Later template edits cannot change a running request; use `/auto stop` and start again to pick them up. The complete guidance is retained in the LEAD turn, any bounded continuation, and Architect request evidence. Inputs exceeding the current Architect request-evidence budget are rejected before starting, rather than silently truncated. Shorten the guidance or deliberately increase `architect.json`'s `maxEvidenceChars` and restart. The reader additionally bounds source packs to 64 KiB/128 entries and rendered text to 12,000 characters, rejecting unsafe pack/file links, invalid UTF-8 and unknown blocks.
 
-Guidance cannot override budgets, normal tool approvals, native leaf/foreground constraints, or grant permission to publish, merge, deploy, or expand scope. Existing brief blocks requesting delegation are adapted to native OMP leaf roles. Permission to run Auto is scoped to applying, verifying, and reviewing the named prepared change.
+Guidance cannot override budgets, normal tool approvals, native leaf constraints, or grant permission to publish, merge, deploy, or expand scope. Existing brief blocks requesting delegation are adapted to native OMP leaf roles. Permission to run Auto is scoped to applying, verifying, and reviewing the named prepared change.
 
 OMP's `pi.sendUserMessage()` bypasses slash-command dispatch. Therefore, a `/brief` template whose output merely starts with `/auto start` **does not start Auto**. Invoke `/auto start ... --brief ...` directly. The separately optional standalone `/brief` extension uses the same text renderer; see [installation](installation.md) for opt-in setup.
 
@@ -132,11 +132,11 @@ The main session owns planning, routing, Rasen state, and permission checks. Its
 
 - `omp-worker` / `@implementation`: implementation and fixes
 - `omp-explorer` / `@research`: narrow read-only repository research
-- `omp-reviewer` / `@architect`: independent scoped diff review and foreground verification, without implementation edits
+- `omp-reviewer` / `@architect`: independent scoped diff review and verification, without implementation edits
 
 Each worker is a one-shot leaf with `spawns: []`; it may not redelegate or call Architect checkpoints. The no-tool Architect checkpoint reviewer remains the independent completion gate. Native worker findings and test results are evidence for that gate, not a second semantic completion-review loop.
 
-Foreign Claude/Codex processes, foreign dispatch bridges, recursive delegation, explicit async work, Bash service mode, and background jobs are not supported during Auto. Unsupported explicit foreign-runtime routing requires user attention. Record only actual native task handles and artifacts; do not invent Claude/Codex runtime identifiers or resumable worker handles. Ordinary non-Auto routing is unchanged.
+Foreign Claude/Codex processes, foreign dispatch bridges, recursive delegation, and detached OS processes outside native OMP job tracking are not supported during Auto. Native async task/wait and Bash/Eval jobs remain available; each leaf must join its own jobs before yielding. Unsupported explicit foreign-runtime routing requires user attention. Record only actual native task handles and artifacts; do not invent Claude/Codex runtime identifiers or resumable worker handles. Ordinary non-Auto routing is unchanged.
 
 At the initial executable frontier and after recording each meaningful workflow stage boundary, the LEAD calls the synchronous `auto_step` tool. It refreshes bounded Rasen state before requesting Jev's existing `continue`, `replan`, `needs_user`, or `uncertain` decision, with the bounded Architect fallback described below. A semantic boundary includes the selected pipeline, stage frontier/status, findings, and review rounds. Identical semantic boundaries reuse the cached decision; task-checkbox ticks, assistant summaries, and timestamps do not create new decisions. Jev remains active in next-step selection; it is neither a workflow driver nor a callback on every tool, skill read, or task-checkbox update. The LEAD continues the loaded workflow within the same native turn after receiving advice.
 
@@ -163,7 +163,7 @@ Resubmit the native completion checkpoint within that turn until approved or the
 `reviews.min/max` budget is exhausted. Do not run a second `rasen-review-cycle`; worker verification
 does not consume a semantic review round or create another review/fix loop.
 
-If the checkpoint is called inside Eval, Auto accepts only a dedicated **foreground JavaScript
+If the checkpoint is called inside Eval, Auto accepts only a dedicated **JavaScript
 (`language: "js"`, `reset: true`), single-call** carrier using `tool.write` to
 `xd://architect_checkpoint` with literal completion parameters. Write the evidence file in a
 separate earlier call. Do not batch unrelated effects, another tool call, or a general program with
@@ -205,6 +205,42 @@ The confidence threshold is an uncalibrated routing heuristic, not a correctness
 
 Auto sends bounded stage/task counts, stage-frontier and finding evidence, a progress summary, and recent tool evidence to the fixed TypeSafe endpoint. No generated skill, full source artifact, or separate brief field is automatically included in that request, but summaries/tool evidence can still contain source, instructions, or private data: confirm only for data you may send. The separate no-tool architect completion session receives the full admitted native artifact, exact canonical plan, and bounded host evidence through your configured architect provider; frozen instructions and the rendered brief remain in its request evidence. This full-file handoff does not expand semantic triage: Jev and its fallback retain their bounded progress evidence. HTTP redirects are refused, response/request sizes are bounded, and provider errors do not echo credentials or response bodies.
 
-These are orchestration controls, not an OS sandbox: arbitrary shell code can create processes outside native job tracking, and streamed assistant claims cannot be retracted. Completion is refused with running native background jobs; wait for all background work to finish and collect fresh evidence before review. Auto still requires foreground execution. Use normal OMP approval settings and review the final evidence.
+These are orchestration controls, not an OS sandbox: arbitrary shell code can create processes outside native job tracking, and streamed assistant claims cannot be retracted. Completion is refused while Auto-owned native work remains unsettled; await results and collect fresh evidence before review. Unrelated Main jobs do not block the Auto completion checkpoint, though native OMP terminal `session_stop` scheduling still waits for all Main-owned jobs. Use normal OMP approval settings and review the final evidence.
 
 See [verification and known coverage limits](rasen-auto-verification.md) for recorded evidence and reproduction steps. Historical verification is not proof of live end-to-end coverage for this native workflow port. Return to the [README](../README.md).
+
+## Native async ownership and stopping
+
+Auto uses OMP's exported agent registry, native job manager, task receipts and child
+lifecycle events to associate jobs with its own run. It cancels only those exact
+jobs and leaf sessions on `/auto stop`, new user input, or session changes. A
+cancelled job status does not prove termination: the job promise must finish
+unwinding before a new run can begin or completion can be accepted. Late receipts
+remain associated with the stopped run, and stale native result delivery is
+suppressed. If a host delivery had already batched old and unrelated results,
+the unrelated job IDs remain available through a native wait/proc recovery notice
+instead of replaying the mixed stale body. Existing unrelated jobs in the same
+Main session are left alone.
+
+Use `/auto stop` for explicit cancellation, including when Main is idle waiting
+for detached workers. Main's live-stream ESC interrupt reaches Auto through the
+native interrupted-turn path. An idle ESC may instead backtrack, and ESC while a
+child is focused may switch focus to Main; neither is a promise that all detached
+jobs were cancelled. Inspect `auto_status.nativeWork` and native job status before
+restarting. Native wait/resume scheduling does not consume an extra Auto hidden
+continuation budget.
+
+Bash/Eval ownership relies on native result metadata exposing the actual job ID;
+Auto does not infer ownership from a session-wide job-list difference or cancel
+all jobs belonging to Main. Native Main jobs missing those receipts cannot safely be
+attributed to an Auto run. For an interrupted in-flight Bash/Eval call without a
+receipt, `nativeWork.settlementUnverified` names the unresolved call. This means
+termination is unknown, not that the process is proven to be running. Auto blocks
+another start in that session; inspect native jobs and use a new session. A later
+exact receipt can resolve the uncertainty. Native owner-scoped joins cover the
+one-shot leaves' hidden jobs without joining unrelated Main work. A tool error
+immediately followed by interruption before the next assistant message can be
+ambiguous because the host omits a per-call abort/job handle; normal errors that
+continue to the model do not retain this fence. Processes launched outside the
+native manager are also outside this cancellation guarantee. These limits do not justify changing global
+async settings; keep normal tool approvals and verify actual termination.

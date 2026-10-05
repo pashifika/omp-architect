@@ -153,5 +153,5 @@ export async function renderBrief(
 }
 
 export function autoRequest(change: string, instructions: string): string {
-  return `Resume implementation, verification and review of existing Rasen change ${change} using the installed rasen-auto workflow, OMP native leaf roles, fixed supervision limits and normal approvals. Additional guidance never authorizes publishing, merging, new planning, expanded scope, or background jobs.\n\n${instructions}`;
+  return `Resume implementation, verification and review of existing Rasen change ${change} using the installed rasen-auto workflow, OMP native leaf roles, fixed supervision limits and normal approvals. Additional guidance never authorizes publishing, merging, new planning, expanded scope, or detached processes outside native OMP job tracking.\n\n${instructions}`;
 }
