@@ -9,7 +9,7 @@ while a separate reviewer checks plans, recovery approaches, and completion evid
 - **Role-based agents:** Send coding tasks to `omp-worker` and read-only research to `omp-explorer`.
 - **Independent reviews:** Hand a complete native OMP file to an architect model at meaningful checkpoints.
 - **Bounded review rounds:** Set minimum and maximum rounds; unresolved findings stop the workflow.
-- **Optional Rasen Auto:** Load the full generated [Rasen](https://github.com/DumoeDss/rasen) Auto workflow through native OMP skill autoload for a prepared change. The main LEAD uses native implementation/research/reviewer leaves, with Jev stage-boundary advice, time supervision, and the existing synchronous native-file Architect checkpoint as its sole bounded completion-review loop.
+- **Optional Rasen Auto:** Run the extension-owned apply, verification, and review flow for a prepared [Rasen](https://github.com/DumoeDss/rasen) change. No generated `rasen-auto` skill or full profile is required. The main LEAD uses native implementation/research/reviewer leaves, with Jev stage-boundary advice, time supervision, and the existing synchronous native-file Architect checkpoint as its sole bounded completion-review loop.
 
 ## Install
 
@@ -85,7 +85,7 @@ do not replace tool approvals or prove that assistant-authored claims occurred.
 | Install, preview, update, or remove the local plugin | [Installation guide](docs/installation.md) |
 | Choose models and reasoning effort | Native OMP `modelRoles`; [model-role guide](docs/architect.md#one-source-of-truth-for-models-and-reasoning) |
 | Set review rounds, role names, and thresholds | Project `.omp/architect.json`; [review guide](docs/architect.md#bounded-review-rounds) and [sample settings](examples/architect.json) |
-| Apply, verify, and review a prepared Rasen change, with extra instructions or existing brief packs | [Rasen Auto setup and limits](docs/rasen-auto.md); initialize pinned Rasen with `rasen init --tools omp --profile full` (builtin profile, not the `full-feature` pipeline). Global `~/.omp/agent/auto.json` defaults and project `.omp/auto.json` overrides are both optional (the active OMP profile determines the global path); TypeSafe authentication through OMP `/login` or `TYPESAFE_API_KEY` is required |
+| Apply, verify, and review a prepared Rasen change, with extra instructions or existing brief packs | [Rasen Auto setup and limits](docs/rasen-auto.md); initialize pinned Rasen with `rasen init --tools omp` and prepare the local change and apply skill; the extension owns Auto orchestration. Global `~/.omp/agent/auto.json` defaults and project `.omp/auto.json` overrides are both optional (the active OMP profile determines the global path); TypeSafe authentication through OMP `/login` or `TYPESAFE_API_KEY` is required |
 | Add the standalone `/brief` command with Tab completion | [Optional brief installation](docs/installation.md); use `bun run dev:install -- --with-brief` only when another `/brief` is not installed |
 | Understand tested behavior and reproduce verification | [Verification record](docs/rasen-auto-verification.md) |
 | Develop, run local checks, or submit a pull request | [Contributing](CONTRIBUTING.md) |

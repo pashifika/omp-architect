@@ -80,7 +80,7 @@ async function fake(overrides: { resume?: unknown; plan?: unknown } = {}) {
 const args = process.argv.slice(2);
 if (args[0] !== 'pipeline') process.exit(10);
 if (args[1] === 'resume') console.log(JSON.stringify(${JSON.stringify(overrides.resume ?? resume)}));
-else if (args[1] === 'show' && args.includes('--for-execution') && args.includes('--json')) console.log(JSON.stringify(${JSON.stringify(overrides.plan ?? plan)}));
+else if (args[1] === 'show' && !args.includes('--for-execution') && args.includes('--json')) console.log(JSON.stringify(${JSON.stringify(overrides.plan ?? plan)}));
 else process.exit(11);`);
 }
 
@@ -100,7 +100,7 @@ beforeAll(async () => {
   cli(["new", "change", change, "--schema", "spec-driven", "--json"]);
   const status = JSON.parse(cli(["status", "--change", change, "--json"]));
   stateFile = path.join(status.ephemeraDir, "auto-run.json");
-  plan = JSON.parse(cli(["pipeline", "show", "small-feature", "--for-execution", "--json"]));
+  plan = JSON.parse(cli(["pipeline", "show", "small-feature", "--json"]));
   expect(plan.hostRuntime).toBe("omp");
   expect(
     (plan.stages as Array<Record<string, unknown>>).every(

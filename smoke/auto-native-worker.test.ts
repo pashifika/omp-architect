@@ -152,50 +152,52 @@ async function nativeFixture(
       });
       const calls =
         main && request === 1
-          ? [
-              call("task", {
-                name: id,
-                agent: "omp-worker",
-                task: "Execute the local fake-provider test assignment once",
-                solutionSpace: "Only the fixture action and one terminal yield",
-              }),
-            ]
-          : main && detached && mainMode === "wait" && request === 2
-            ? [call("wait", {})]
-            : child && mode === "nested-bash" && request === 1
-              ? [
-                  call("bash", {
-                    command: "sleep 30",
-                    async: true,
-                    timeout: 30,
-                    intent: "Exercise cancellation of a native child-owned async job",
-                  }),
-                ]
-              : child && mode === "recursion" && request === 1
+          ? [call("auto_step", { summary: "Admit the extension-owned implementation boundary" })]
+          : main && request === 2
+            ? [
+                call("task", {
+                  name: id,
+                  agent: "omp-worker",
+                  task: "Execute the local fake-provider test assignment once",
+                  solutionSpace: "Only the fixture action and one terminal yield",
+                }),
+              ]
+            : main && detached && mainMode === "wait" && request === 3
+              ? [call("wait", {})]
+              : child && mode === "nested-bash" && request === 1
                 ? [
-                    call("task", {
-                      agent: "omp-worker",
-                      task: "Forbidden nested fixture",
-                      solutionSpace: "Must be rejected",
+                    call("bash", {
+                      command: "sleep 30",
+                      async: true,
+                      timeout: 30,
+                      intent: "Exercise cancellation of a native child-owned async job",
                     }),
                   ]
-                : child && (mode === "prompt" || mode === "deny") && request === 1
+                : child && mode === "recursion" && request === 1
                   ? [
-                      call("bash", {
-                        command: "printf synthetic-test",
-                        intent: "Verify native approval denial",
+                      call("task", {
+                        agent: "omp-worker",
+                        task: "Forbidden nested fixture",
+                        solutionSpace: "Must be rejected",
                       }),
                     ]
-                  : child && mode !== "cancel" && mode !== "nested-bash"
+                  : child && (mode === "prompt" || mode === "deny") && request === 1
                     ? [
-                        call(
-                          "yield",
-                          mode === "child-abort"
-                            ? { error: "Synthetic child cancellation" }
-                            : { data: leafResult },
-                        ),
+                        call("bash", {
+                          command: "printf synthetic-test",
+                          intent: "Verify native approval denial",
+                        }),
                       ]
-                    : [];
+                    : child && mode !== "cancel" && mode !== "nested-bash"
+                      ? [
+                          call(
+                            "yield",
+                            mode === "child-abort"
+                              ? { error: "Synthetic child cancellation" }
+                              : { data: leafResult },
+                          ),
+                        ]
+                      : [];
       const message: AssistantMessage = {
         role: "assistant",
         api,
@@ -261,7 +263,7 @@ async function nativeFixture(
       };
       const heldChild =
         child && (mode === "cancel" || mode === "nested-bash" || (detached && request === 1));
-      const heldMain = main && detached && mainMode === "stream" && request === 2;
+      const heldMain = main && detached && mainMode === "stream" && request === 3;
       if (heldChild || heldMain) {
         if (heldChild) releaseChild = finish;
         options?.signal?.addEventListener("abort", abort, { once: true });
@@ -309,12 +311,6 @@ async function nativeFixture(
               change: "fixture-change",
               reason: "Synthetic pipeline not yet recorded",
               fingerprint: "absent",
-            }),
-            skill: async () => ({
-              message: "Synthetic complete Auto skill",
-              path: "fixture",
-              bytes: 29,
-              sha256: "fixture",
             }),
             validate: async () => {},
             decision: () => async () => ({ choice: "continue", confidence: 0.99 }),
@@ -531,7 +527,7 @@ type NativeFixture = Awaited<ReturnType<typeof nativeFixture>>;
 
 async function detachedJob(fixture: NativeFixture, mainMode: "pause" | "wait" | "stream") {
   await waitUntil(
-    () => fixture.counts().childRequests === 1 && fixture.counts().mainRequests >= 2,
+    () => fixture.counts().childRequests === 1 && fixture.counts().mainRequests >= 3,
     "native detached child and Main's next provider call",
   );
   if (mainMode === "wait") {

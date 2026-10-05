@@ -70,7 +70,11 @@ export function completionCarrier(input: Record<string, unknown>, limit: number)
   }
 }
 
-async function readComplete(file: string, limit: number, signal?: AbortSignal): Promise<string> {
+export async function readComplete(
+  file: string,
+  limit: number,
+  signal?: AbortSignal,
+): Promise<string> {
   signal?.throwIfAborted();
   const handle = await fs.open(
     file,

@@ -15,7 +15,7 @@ import {
   completionCarrier,
 } from "./artifacts.ts";
 import { createReviewer } from "./reviewer.ts";
-import { createAutoController, type AutoDependencies } from "./auto/extension.ts";
+import { createAutoController, autoStepCarrier, type AutoDependencies } from "./auto/extension.ts";
 import instructions from "./prompts/orchestration.md" with { type: "text" };
 
 // Only the documented canonical devices share their native tool identity.
@@ -373,7 +373,14 @@ export function extensionFactory(
           return;
         }
       }
-      if (toolName === "auto_status" || toolName === "architect_checkpoint") return;
+      if (toolName === "eval" && auto.isRunning() && !event.isError && autoStepCarrier(event.input))
+        return;
+      if (
+        toolName === "auto_status" ||
+        toolName === "architect_checkpoint" ||
+        (toolName === "auto_step" && !event.isError)
+      )
+        return;
       const text = event.content
         .filter((c) => c.type === "text")
         .map((c) => c.text)

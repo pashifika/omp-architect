@@ -1,4 +1,4 @@
-import { expect, jest, test } from "bun:test";
+import { expect, jest, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -22,17 +22,13 @@ import {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
 import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
+import { MemorySessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { readRasenWorkflow, type RasenWorkflow } from "../src/auto/workflow.ts";
 import type { AutoConfig } from "../src/auto/config.ts";
-import type { AutoDependencies } from "../src/auto/extension.ts";
-import {
-  loadRasenAutoSkill,
-  readRasenSnapshot,
-  validateRasenChange,
-  type RasenSnapshot,
-} from "../src/auto/rasen.ts";
+import { autoStepCarrier, type AutoDependencies } from "../src/auto/extension.ts";
+import { readRasenSnapshot, validateRasenChange, type RasenSnapshot } from "../src/auto/rasen.ts";
 import { createJevProvider } from "../src/auto/decision.ts";
 import type { Reviewer } from "../src/core.ts";
 import { extensionFactory } from "../src/extension.ts";
@@ -112,15 +108,6 @@ function workflow(complete = false): RasenWorkflow {
   } as RasenWorkflow;
 }
 
-const fullSkill =
-  "Complete installed rasen-auto fixture body: supervise registered pipeline stages and native leaf roles";
-const skillFixture = async () => ({
-  message: fullSkill,
-  path: "/fixture/.omp/skills/rasen-auto/SKILL.md",
-  sha256: "fixture-sha",
-  bytes: Buffer.byteLength(fullSkill),
-});
-
 async function project(
   config: Partial<AutoConfig> | null = {},
   minReviews = 1,
@@ -181,7 +168,6 @@ async function loaderFixture(
       reads++;
       return snapshot(completed);
     },
-    skill: skillFixture,
     workflow: async () => workflow(true),
     validate: async () => {},
     decision: () => async () => {
@@ -251,6 +237,67 @@ async function loaderFixture(
       ctx,
     );
   };
+  const step = async (summary = "Recorded pipeline stage frontier", transition?: "triage") => {
+    const result = await extension.tools
+      .get("auto_step")!
+      .definition.execute(
+        "step",
+        { summary, ...(transition ? { transition } : {}) },
+        undefined,
+        undefined,
+        ctx,
+      );
+    const content = result.content[0];
+    if (content.type !== "text") throw new Error("Missing stage advice");
+    return { ...JSON.parse(content.text), isError: !!result.isError };
+  };
+  const verify = async () => {
+    // This loader fixture deliberately delivers lifecycle events. The real
+    // AgentSession cases below exercise actual native reviewer workers instead.
+    expect(await step("Observe the completed loader-fixture task set")).toMatchObject({
+      allowedNextPhase: "verify",
+      isError: false,
+    });
+    const toolCallId = `fixture-reviewer-${crypto.randomUUID()}`;
+    const input = {
+      agent: "omp-reviewer",
+      task: "Independently inspect the current fixture",
+      solutionSpace: "Read-only fixture verification",
+    };
+    for (const handler of extension.handlers.get("tool_call") ?? [])
+      expect(
+        await handler({ type: "tool_call", toolName: "task", toolCallId, input }, ctx),
+      ).toBeUndefined();
+    const details = {
+      results: [
+        {
+          id: toolCallId,
+          agent: "omp-reviewer",
+          exitCode: 0,
+          aborted: false,
+          output:
+            "Inspected current loader-fixture implementation and task evidence; no blocking findings",
+        },
+      ],
+    };
+    for (const handler of extension.handlers.get("tool_result") ?? [])
+      await handler(
+        {
+          type: "tool_result",
+          toolName: "task",
+          toolCallId,
+          input,
+          content: [{ type: "text", text: "Independent fixture verification complete" }],
+          details,
+          isError: false,
+        },
+        ctx,
+      );
+    expect(await step("Record the settled independent loader-fixture receipt")).toMatchObject({
+      allowedNextPhase: "review",
+      isError: false,
+    });
+  };
   return {
     cwd,
     extension,
@@ -270,14 +317,8 @@ async function loaderFixture(
     setProgress(value: number) {
       completed = value;
     },
-    async step(summary = "Recorded pipeline stage frontier") {
-      const result = await extension.tools
-        .get("auto_step")!
-        .definition.execute("step", { summary }, undefined, undefined, ctx);
-      const content = result.content[0];
-      if (content.type !== "text") throw new Error("Missing stage advice");
-      return { ...JSON.parse(content.text), isError: !!result.isError };
-    },
+    step,
+    verify,
     deliveries,
     async checkpoint(signal?: AbortSignal) {
       const id = await sessionManager.saveArtifact(
@@ -306,13 +347,7 @@ async function loaderFixture(
   };
 }
 
-for (const stage of [
-  "confirmation",
-  "change snapshot",
-  "workflow",
-  "skill loading",
-  "artifact storage",
-] as const) {
+for (const stage of ["confirmation", "change snapshot", "workflow", "artifact storage"] as const) {
   test(`preflight ${stage} failures identify the boundary without leaking host error text`, async () => {
     const fail = async () => {
       throw Object.assign(new Error("PRIVATE HOST TOKEN"), { code: "EACCES" });
@@ -323,7 +358,6 @@ for (const stage of [
         dependencies: {
           ...(stage === "change snapshot" ? { snapshot: fail } : {}),
           ...(stage === "workflow" ? { workflow: fail } : {}),
-          ...(stage === "skill loading" ? { skill: fail } : {}),
         },
       },
     );
@@ -343,6 +377,22 @@ for (const stage of [
     }
   });
 }
+
+test("real loader admits extension-owned Auto without any installed rasen-auto skill", async () => {
+  const fixture = await loaderFixture();
+  try {
+    await expect(fs.lstat(path.join(fixture.cwd, ".omp/skills/rasen-auto"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await fixture.start();
+    expect(await fixture.status()).toMatchObject({ status: "running" });
+    expect(fixture.bootstraps).toHaveLength(1);
+    expect(fixture.bootstraps[0]).not.toContain("installed rasen-auto workflow");
+    expect(fixture.bootstraps[0]).toContain("fixture-change");
+  } finally {
+    await fixture.close();
+  }
+});
 
 for (const queued of [false, true]) {
   test(`native delivery failure cancels admission and queued payload, queued=${queued}`, async () => {
@@ -596,6 +646,7 @@ test("brief is frozen after consent; new runs replace instructions and stopped r
       fixture.ctx,
     );
     fixture.complete();
+    await fixture.verify();
     const next = (await fixture.stop()) as { additionalContext: string };
     expect(next.additionalContext).toContain("Frozen fixture-change");
     expect(next.additionalContext).toContain("Preserve me");
@@ -631,6 +682,7 @@ for (const delivery of ["bootstrap", "continuation"] as const) {
             fixture.ctx,
           );
           fixture.complete();
+          await fixture.verify();
           text = ((await fixture.stop()) as { additionalContext: string }).additionalContext;
         }
         if (cancel === "stop")
@@ -904,15 +956,16 @@ test("real loader stops Auto at its turn cap without another decision or retry",
   try {
     await fixture.start();
     fixture.complete();
+    await fixture.verify();
     expect(await fixture.stop()).toBeUndefined();
     expect(await fixture.status()).toMatchObject({
       status: "budget_exhausted",
       steps: "1/1",
       completionVerified: false,
     });
-    expect(fixture.counts()).toMatchObject({ decisions: 0, aborts: 0 });
+    expect(fixture.counts()).toMatchObject({ decisions: 2, aborts: 0 });
     expect(await fixture.stop()).toBeUndefined();
-    expect(fixture.counts()).toMatchObject({ decisions: 0, aborts: 0 });
+    expect(fixture.counts()).toMatchObject({ decisions: 2, aborts: 0 });
     expect(fixture.messages.filter((message) => message.customType === "omp-auto")).toHaveLength(1);
   } finally {
     await fixture.close();
@@ -1101,6 +1154,7 @@ for (const valid of [true, false]) {
     );
     try {
       await fixture.start();
+      await fixture.verify();
       const explicit = await fixture.extension.tools
         .get("architect_checkpoint")!
         .definition.execute(
@@ -1129,6 +1183,260 @@ for (const valid of [true, false]) {
   });
 }
 
+test("Auto step Eval carriers require one reset-safe literal call and reject batching", () => {
+  const input = {
+    path: "xd://auto_step",
+    content: JSON.stringify({ summary: "Inspect the current allowed host phase" }),
+  };
+  const literal = `await tool.write(${JSON.stringify(input)})`;
+  expect(autoStepCarrier({ language: "js", reset: true, code: literal })).toBe(true);
+  expect(autoStepCarrier({ language: "js", reset: true, code: `console.log(${literal});` })).toBe(
+    true,
+  );
+  for (const candidate of [
+    { language: "js", reset: false, code: literal },
+    { language: "js", reset: true, async: true, code: literal },
+    {
+      language: "js",
+      reset: true,
+      code: `${literal}; await tool.write({"path":"fixture.ts","content":"changed"})`,
+    },
+    {
+      language: "js",
+      reset: true,
+      code: `const args = ${JSON.stringify(input)}; await tool.write(args)`,
+    },
+    {
+      language: "js",
+      reset: true,
+      code: `await tool.write(${JSON.stringify({ ...input, extra: true })})`,
+    },
+  ])
+    expect(autoStepCarrier(candidate)).toBe(false);
+});
+
+for (const phase of ["unadmitted", "apply", "verify", "review", "triage", "fix"] as const) {
+  test(`Main mutations obey the extension-owned ${phase} phase boundary`, async () => {
+    const fixture = await loaderFixture(
+      {},
+      {
+        reviewer: async () => ({
+          decision: "revise",
+          summary: "A scoped correction is needed",
+          issues: ["Repair the fixture output"],
+        }),
+      },
+    );
+    try {
+      await fixture.start();
+      if (phase !== "unadmitted") await fixture.step();
+      if (["verify", "review", "triage", "fix"].includes(phase)) {
+        fixture.complete();
+        if (phase === "verify") await fixture.step();
+        else await fixture.verify();
+      }
+      if (phase === "triage" || phase === "fix") {
+        expect((await fixture.checkpoint()).isError).toBe(true);
+        expect(await fixture.status()).toMatchObject({ hostWorkflow: { phase: "triage" } });
+      }
+      if (phase === "fix")
+        expect(await fixture.step("Triage the recorded scoped finding", "triage")).toMatchObject({
+          allowedNextPhase: "fix",
+        });
+      for (const [toolName, input] of [
+        ["write", { path: "fixture.ts", content: "changed" }],
+        ["edit", { path: "fixture.ts", oldText: "old", newText: "new" }],
+        ["bash", { command: "printf changed > fixture.ts" }],
+      ] as const) {
+        const admission = await fixture.extension.handlers.get("tool_call")![0](
+          { type: "tool_call", toolName, input, toolCallId: `${phase}-${toolName}` },
+          fixture.ctx,
+        );
+        if (phase === "apply" || phase === "fix") expect(admission).toBeUndefined();
+        else expect(admission).toMatchObject({ block: true });
+      }
+      for (const [toolName, input] of [
+        ["write", { path: "agent://finished-leaf", content: "Resume untracked work" }],
+        ["send", { agent: "finished-leaf", message: "Resume untracked work" }],
+        ["irc", { target: "finished-leaf", message: "Resume untracked work" }],
+      ] as const)
+        expect(
+          await fixture.extension.handlers.get("tool_call")![0](
+            { type: "tool_call", toolName, input, toolCallId: `${phase}-revive-${toolName}` },
+            fixture.ctx,
+          ),
+        ).toMatchObject({ block: true });
+      expect(await fixture.status()).toMatchObject({
+        status: "running",
+        completionVerified: false,
+      });
+    } finally {
+      await fixture.close();
+    }
+  });
+}
+
+test("parallel reviewer receipts stay bound to their admitted sequential verification stage", async () => {
+  const observed = workflow(true);
+  if (observed.kind !== "present") throw new Error("Expected workflow fixture");
+  observed.stages.splice(2, 0, {
+    id: "verify-extra",
+    skill: "rasen-cso",
+    kind: "standard",
+    role: "verify",
+    requires: ["verify"],
+    status: "done",
+  });
+  observed.stages.find((stage) => stage.id === "review-loop")!.requires = ["verify-extra"];
+  observed.completed.push("verify-extra");
+  observed.fingerprint = "sequential-verify-fixture";
+  const fixture = await loaderFixture(
+    {},
+    { dependencies: { snapshot: async () => snapshot(2), workflow: async () => observed } },
+  );
+  const input = {
+    agent: "omp-reviewer",
+    task: "Verify only the admitted stage",
+    solutionSpace: "The current stage",
+  };
+  const dispatch = async (toolCallId: string) => {
+    for (const handler of fixture.extension.handlers.get("tool_call") ?? [])
+      expect(
+        await handler({ type: "tool_call", toolName: "task", toolCallId, input }, fixture.ctx),
+      ).toBeUndefined();
+  };
+  const receipt = async (toolCallId: string) => {
+    for (const handler of fixture.extension.handlers.get("tool_result") ?? [])
+      await handler(
+        {
+          type: "tool_result",
+          toolName: "task",
+          toolCallId,
+          input,
+          content: [],
+          isError: false,
+          details: {
+            results: [
+              {
+                id: toolCallId,
+                agent: "omp-reviewer",
+                exitCode: 0,
+                aborted: false,
+                output: "Finished the admitted stage's independent verification",
+              },
+            ],
+          },
+        },
+        fixture.ctx,
+      );
+  };
+  try {
+    await fixture.start();
+    expect(await fixture.step()).toMatchObject({
+      hostWorkflow: { phase: "verify", stage: "verify" },
+    });
+    await dispatch("first-check-a");
+    await dispatch("first-check-b");
+    await receipt("first-check-a");
+    await receipt("first-check-b");
+    expect(await fixture.step()).toMatchObject({
+      hostWorkflow: { phase: "verify", stage: "verify-extra", verifiedStages: ["verify"] },
+    });
+    expect((await fixture.checkpoint()).isError).toBe(true);
+    await dispatch("second-check");
+    await receipt("second-check");
+    expect(await fixture.step()).toMatchObject({
+      hostWorkflow: {
+        phase: "review",
+        readyForReview: true,
+        verifiedStages: ["verify", "verify-extra"],
+      },
+    });
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("uncharged oversized enriched completion evidence can be corrected within the same host review phase", async () => {
+  let reviews = 0;
+  const fixture = await loaderFixture(
+    {},
+    {
+      prepare: async (cwd) => {
+        await Bun.write(
+          path.join(cwd, ".omp/architect.json"),
+          JSON.stringify({ maxReviewBytes: 8192, reviews: { min: 1, max: 2 } }),
+        );
+      },
+      reviewer: async () => {
+        reviews++;
+        return approved;
+      },
+    },
+  );
+  try {
+    await fixture.start();
+    fixture.complete();
+    await fixture.verify();
+    const rejected = await fixture.extension.tools
+      .get("architect_checkpoint")!
+      .definition.execute(
+        "oversized-enriched",
+        { phase: "completion", evidenceRef: await fixture.evidence("F".repeat(7000)) },
+        undefined,
+        undefined,
+        fixture.ctx,
+      );
+    expect(rejected.isError).toBe(true);
+    expect(reviews).toBe(0);
+    expect(await fixture.status()).toMatchObject({
+      status: "running",
+      hostWorkflow: { phase: "review", readyForReview: true },
+      architect: {
+        attempts: { completion: 0 },
+        lastReview: { status: "input_rejected", charged: false },
+      },
+    });
+    expect((await fixture.checkpoint()).isError).toBe(false);
+    await fixture.stop();
+    expect(await fixture.status()).toMatchObject({ status: "completed", completionVerified: true });
+    expect(reviews).toBe(1);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("external completion flags and model claims cannot replace a native verification receipt", async () => {
+  let reviews = 0;
+  const fixture = await loaderFixture(
+    {},
+    {
+      dependencies: { snapshot: async () => snapshot(2), workflow: async () => workflow(true) },
+      reviewer: async () => {
+        reviews++;
+        return approved;
+      },
+    },
+  );
+  try {
+    await fixture.start();
+    expect(await fixture.step("All verification passed according to the assistant")).toMatchObject({
+      allowedNextPhase: "verify",
+      hostWorkflow: { readyForReview: false, verifiedStages: [] },
+    });
+    const result = await fixture.checkpoint();
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result)).toContain("independent verification");
+    expect(reviews).toBe(0);
+    expect(await fixture.status()).toMatchObject({
+      completionVerified: false,
+      architect: { completionApproved: false },
+    });
+  } finally {
+    await fixture.close();
+  }
+});
+
 test("Auto checkpoint review keeps the normal Architect timeout beyond the 24s stop-hook window", async () => {
   const started = Promise.withResolvers<void>();
   const cancel = new AbortController();
@@ -1153,6 +1461,7 @@ test("Auto checkpoint review keeps the normal Architect timeout beyond the 24s s
   let pending: ReturnType<typeof f.checkpoint> | undefined;
   try {
     await f.start();
+    await f.verify();
     jest.useFakeTimers();
     let settled = false;
     pending = f.checkpoint(cancel.signal);
@@ -1185,6 +1494,7 @@ test("real loader blocks unregistered spawning while preserving native async too
   const fixture = await loaderFixture();
   try {
     await fixture.start();
+    await fixture.step();
     expect(
       await fixture.extension.handlers.get("before_subagent_spawn")![0](
         {
@@ -1244,6 +1554,7 @@ for (const interrupt of ["status", "unexpected-hidden", "new-user"] as const) {
     try {
       await fixture.start();
       fixture.complete();
+      await fixture.verify();
       const continuation = (await fixture.stop()) as {
         continue: boolean;
         additionalContext: string;
@@ -1285,10 +1596,10 @@ for (const interrupt of ["status", "unexpected-hidden", "new-user"] as const) {
         expect(await fixture.status()).toMatchObject({ status: "running", steps: "2" });
         expect(await fixture.stop()).toMatchObject({ continue: true });
         expect(await fixture.status()).toMatchObject({ status: "running", steps: "3" });
-        expect(fixture.counts().decisions).toBe(0);
+        expect(fixture.counts().decisions).toBe(2);
       } else {
         expect(await fixture.status()).toMatchObject({ status: "cancelled", steps: "2" });
-        expect(fixture.counts().decisions).toBe(0);
+        expect(fixture.counts().decisions).toBe(2);
         expect(fixture.counts().aborts).toBe(interrupt === "unexpected-hidden" ? 1 : 0);
       }
     } finally {
@@ -1343,29 +1654,15 @@ for (const mode of [
       );
     }
     const taskPath = path.join(cwd, "rasen", "changes", "fixture-change", "tasks.md");
+    const implementationPath = path.join(cwd, "fixture-output.txt");
+    const taskCount = mode === "real-cli" ? 15 : 2;
     const tasks = (complete: number) =>
-      `## 1. Local integration fixture\n\n- [${complete >= 1 ? "x" : " "}] 1.1 Mark fixture unit one\n- [${complete >= 2 ? "x" : " "}] 1.2 Mark fixture unit two\n`;
+      `## 1. Local integration fixture\n\n${Array.from(
+        { length: taskCount },
+        (_, index) =>
+          `- [${complete > index ? "x" : " "}] 1.${index + 1} Mark fixture unit ${index + 1}\n`,
+      ).join("")}`;
     let workflowPath = "";
-    let actualSkillBody = "";
-    let admittedSkillMessage = "";
-    const recordedWorkflow = (complete: boolean) =>
-      JSON.stringify({
-        pipeline: "small-feature",
-        hostRuntime: "omp",
-        stages: {
-          propose: {
-            status: "skipped",
-            note: "Pre-existing prepared artifacts; no proposal execution",
-          },
-          apply: { status: complete ? "done" : "pending" },
-          verify: { status: complete ? "done" : "pending" },
-          "review-loop": { status: "pending" },
-          ship: { status: "pending" },
-          archive: { status: "pending" },
-        },
-        rounds: 0,
-        openFindings: [],
-      });
     if (executable) {
       const cli = (args: string[]) => {
         const result = spawnSync(executable!, args, {
@@ -1378,6 +1675,8 @@ for (const mode of [
             ...process.env,
             HOME: path.join(cwd, "isolated-home"),
             XDG_CONFIG_HOME: path.join(cwd, "isolated-config"),
+            XDG_DATA_HOME: path.join(cwd, "isolated-data"),
+            XDG_STATE_HOME: path.join(cwd, "isolated-state"),
             RASEN_TELEMETRY: "0",
             DO_NOT_TRACK: "1",
             CI: "1",
@@ -1389,10 +1688,13 @@ for (const mode of [
         return result.stdout;
       };
       expect(cli(["--version"]).trim()).toMatch(/^0\.1\.8 \(dev\.local f0ae20d[0-9a-f]*\)$/);
-      cli(["init", "--tools", "omp", "--profile", "full"]);
-      const skillSource = await Bun.file(path.join(cwd, ".omp/skills/rasen-auto/SKILL.md")).text();
-      expect(Buffer.byteLength(skillSource)).toBeGreaterThan(65536);
-      actualSkillBody = skillSource.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, "").trim();
+      // Install only the generated apply skill. rasen-auto is never installed.
+      cli(["config", "set", "profile", "custom"]);
+      cli(["config", "set", "workflows", '["apply"]']);
+      cli(["init", "--tools", "omp", "--profile", "custom"]);
+      await expect(fs.lstat(path.join(cwd, ".omp/skills/rasen-auto"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
       cli(["new", "change", "fixture-change", "--schema", "spec-driven", "--json"]);
       await Bun.write(taskPath, tasks(0));
       await Promise.all(
@@ -1405,21 +1707,74 @@ for (const mode of [
       );
       const status = JSON.parse(cli(["status", "--change", "fixture-change", "--json"]));
       workflowPath = path.join(status.ephemeraDir, "auto-run.json");
-      await Bun.write(workflowPath, recordedWorkflow(false));
+      await expect(fs.lstat(workflowPath)).rejects.toMatchObject({ code: "ENOENT" });
       await Bun.write(
         path.join(path.dirname(taskPath), "specs", "fixture-progress", "spec.md"),
         "## ADDED Requirements\n\n### Requirement: Fixture progress\nThe fixture SHALL record the completion of its local units.\n\n#### Scenario: Unit completed\n- **WHEN** a local fixture unit finishes\n- **THEN** its task checkbox is checked\n",
       );
     }
+    if (mode === "real-cli") {
+      const initialized = spawnSync("git", ["init", "--quiet"], { cwd, encoding: "utf8" });
+      expect(initialized.status).toBe(0);
+      await Bun.write(
+        path.join(cwd, ".gitignore"),
+        ".test-artifacts/\nisolated-agent/\nisolated-home/\nisolated-config/\nisolated-data/\nisolated-state/\n",
+      );
+    }
     const auth = await AuthStorage.create(":memory:");
+    const provider = `auto-fixture-${crypto.randomUUID()}`;
+    const api = `auto-api-${crypto.randomUUID()}`;
     const settings = Settings.isolated({
       "memory.backend": "off",
       "bash.autoBackground.enabled": false,
-      "async.enabled": false,
+      "async.enabled": mode === "real-cli",
+      // This fixture exercises in-process jobs, not the separate service broker.
+      // The container forbids its native FileLock; do not change user settings.
+      "launch.enabled": false,
+      "tools.xdev": mode === "brief",
+      "task.speculativeLaunch": false,
+      "task.maxRuntimeMs": 30000,
+      "task.agentIdleTtlMs": 1,
+      modelRoles: Object.fromEntries(
+        [
+          "default",
+          "implementation",
+          "architect",
+          "research",
+          "task",
+          "smol",
+          "tiny",
+          "title",
+          "compaction",
+        ].map((role) => [role, `${provider}/${role === "default" ? "main" : role}`]),
+      ),
     });
+    for (const agent of ["omp-worker", "omp-reviewer"])
+      await Bun.write(
+        path.join(cwd, ".omp/agents", `${agent}.md`),
+        (await Bun.file(path.resolve(import.meta.dir, "../agents", `${agent}.md`)).text()).replace(
+          "spawns: []",
+          "spawns: []\nblocking: false",
+        ),
+      );
+    const workerPrefix = `auto_${crypto.randomUUID().replaceAll("-", "")}`;
+    const workerIds = ["apply", "verify", "fix", "delta"].map(
+      (phase) => `${workerPrefix}_${phase}`,
+    );
+    const childStorage = new MemorySessionStorage();
+    const originalOpen = SessionManager.open.bind(SessionManager);
+    const open = spyOn(SessionManager, "open").mockImplementation(
+      (file, directory, backend, options) =>
+        originalOpen(
+          file,
+          directory,
+          workerIds.some((id) => path.basename(file) === `${id}.jsonl`) ? childStorage : backend,
+          options,
+        ),
+    );
+    // Native child journals use the same supported in-memory test backend as
+    // auto-native-worker.test.ts. Native tasks, tools and result receipts are real.
     const registry = new ModelRegistry(auth, path.join(cwd, "models.yml"), { settings });
-    const provider = `auto-fixture-${crypto.randomUUID()}`;
-    const api = `auto-api-${crypto.randomUUID()}`;
     auth.keys.setRuntime(provider, "fixture-not-a-secret");
     let requests = 0;
     let reads = 0;
@@ -1427,6 +1782,7 @@ for (const mode of [
     let decisions = 0;
     let reviews = 0;
     const reviewEvidence: string[] = [];
+    const reviewMaterials: string[] = [];
     let confirms = 0;
     let beforeStarts = 0;
     const stops: boolean[] = [];
@@ -1434,13 +1790,21 @@ for (const mode of [
     const sends: Promise<unknown>[] = [];
     const contexts: string[] = [];
     const prompts: string[] = [];
+    const childTurns = new Map<string, number>();
+    const nativeTaskResults: unknown[] = [];
+    const phaseResults: unknown[] = [];
+    const decisionStates: Array<Record<string, unknown>> = [];
     const providerConfig: Parameters<ModelRegistry["registerProvider"]>[1] = {
       baseUrl: "https://unused.invalid",
       apiKey: "fixture-not-a-secret",
       api,
       streamSimple(model, context) {
-        requests++;
-        contexts.push(JSON.stringify(context.messages));
+        const child = context.tools?.some((tool) => tool.name === "yield");
+        const main = model.id === "main";
+        if (main) {
+          requests++;
+          contexts.push(JSON.stringify(context.messages));
+        }
         const stream = createAssistantMessageEventStream();
         const calls: Array<{
           type: "toolCall";
@@ -1448,63 +1812,159 @@ for (const mode of [
           name: string;
           arguments: Record<string, unknown>;
         }> = [];
-        if (requests === 1 || (mode === "real-cli" && requests === 4))
+        const call = (name: string, args: Record<string, unknown>) => {
           calls.push({
             type: "toolCall",
-            id: `stage-${requests}`,
-            name: "auto_step",
-            arguments: {
-              summary:
-                requests === 1
-                  ? "Initial recorded executable frontier"
-                  : "Apply and independent verification recorded done",
-            },
+            id: `${name}-${crypto.randomUUID()}`,
+            name,
+            arguments: args,
           });
-        if (mode === "real-cli" && requests === 2)
-          for (let i = 0; i < 85; i++)
-            calls.push({
-              type: "toolCall",
-              id: `legitimate-read-${i}`,
-              name: "read",
-              arguments: { path: path.join(cwd, "fixture-sources", `${i}.txt`) },
+        };
+        if (child) {
+          const serialized = JSON.stringify(context.messages);
+          const assignment = workerIds
+            .filter((id) => serialized.includes(id))
+            .sort((a, b) => serialized.lastIndexOf(b) - serialized.lastIndexOf(a))[0];
+          if (!assignment)
+            throw new Error("Native child did not receive its named fixture assignment");
+          const turn = (childTurns.get(assignment) ?? 0) + 1;
+          childTurns.set(assignment, turn);
+          const applying = assignment.endsWith("_apply");
+          const fixing = assignment.endsWith("_fix");
+          if (turn === 1) {
+            if (applying) {
+              call("write", { path: taskPath, content: tasks(taskCount) });
+              call("write", { path: implementationPath, content: "Scoped fixture output\n" });
+            } else if (fixing)
+              call("write", {
+                path: implementationPath,
+                content: "Scoped fixture output\nVerified footer\n",
+              });
+            else {
+              call("read", { path: taskPath });
+              call("read", { path: implementationPath });
+            }
+          } else {
+            const report = `Native ${assignment}: ${applying ? "Completed the actual implementation and task-file update" : fixing ? "Added the requested footer" : "Read the actual implementation and completed task file"}`;
+            call("yield", {
+              data:
+                mode === "real-cli" && !applying && !fixing
+                  ? {
+                      report,
+                      // More lines than OMP's native 5000-line preview limit;
+                      // the full retained artifact still fits Auto's 128 KiB bound.
+                      checks: Array.from({ length: 6000 }, () => "ok"),
+                      finalFinding: assignment.endsWith("_verify")
+                        ? "LATE_NATIVE_FINDING: add the missing fixture footer"
+                        : "LATE_NATIVE_DELTA: verified footer; no remaining blocking findings",
+                    }
+                  : report,
             });
-        if (mode === "real-cli" && requests === 3) {
-          calls.push({
-            type: "toolCall",
-            id: "fixture-write-tasks",
-            name: "write",
-            arguments: { path: taskPath, content: tasks(2) },
-          });
-          calls.push({
-            type: "toolCall",
-            id: "fixture-write-workflow",
-            name: "write",
-            arguments: { path: workflowPath, content: recordedWorkflow(true) },
-          });
-        }
-        const evidenceStep = mode === "real-cli" ? 5 : 2;
-        if (mode !== "max-cap") {
-          if (requests === evidenceStep)
-            calls.push({
-              type: "toolCall",
-              id: "fixture-evidence",
-              name: "write",
-              arguments: {
+          }
+        } else if (main) {
+          const step =
+            mode === "real-cli"
+              ? [
+                  1,
+                  "reads",
+                  2,
+                  "wait",
+                  3,
+                  4,
+                  "wait",
+                  5,
+                  6,
+                  7,
+                  8,
+                  9,
+                  "wait",
+                  10,
+                  11,
+                  "wait",
+                  12,
+                  13,
+                  14,
+                  15,
+                  16,
+                ][requests - 1]
+              : requests;
+          if (requests === 1)
+            call("auto_step", { summary: "Initial extension-owned prepared-change frontier" });
+          else if (step === "wait") call("wait", {});
+          else if (step === "reads") {
+            for (let i = 0; i < 85; i++)
+              call("read", { path: path.join(cwd, "fixture-sources", `${i}.txt`) });
+          } else {
+            const assignment = (phase: number, agent: string) =>
+              call("task", {
+                name: workerIds[phase],
+                agent,
+                task: `${workerIds[phase]}: ${phase === 0 ? "Complete the scoped fixture tasks" : "Independently inspect the scoped completed tasks"}`,
+                solutionSpace: "Only the fixture task file and one terminal native yield",
+              });
+            if (step === 2) assignment(0, "omp-worker");
+            if (step === 3)
+              call("auto_step", {
+                summary: "Native implementation completed the actual fixture tasks",
+              });
+            if (step === 4) assignment(1, "omp-reviewer");
+            if (step === 5)
+              call("auto_step", {
+                summary: "Independent native verification settled with its actual receipt",
+              });
+            if ((mode !== "max-cap" && step === 6) || (mode === "real-cli" && step === 13))
+              call("write", {
                 path: "local://architect-review/auto-result.md",
-                content:
-                  "Completed scoped implementation. Independent verification recorded. Full fixture tests passed. Downstream shipping is pending.",
-              },
-            });
-          if (requests === evidenceStep + 1 || requests === evidenceStep + 2)
-            calls.push({
-              type: "toolCall",
-              id: `fixture-completion-${requests}`,
-              name: "architect_checkpoint",
-              arguments: {
+                content: `${step === 6 ? "Initial" : "Delta"} evidence: native implementation completed the scoped task file; an independent native reviewer read the completed tasks and reported no blocking findings. Downstream shipping is pending.`,
+              });
+            if (step === 7 || (mode === "real-cli" && step === 14))
+              call("architect_checkpoint", {
                 phase: "completion",
                 evidenceRef: "local://architect-review/auto-result.md",
-              },
-            });
+              });
+            if (mode === "real-cli") {
+              if (step === 8)
+                call("auto_step", {
+                  summary: "Triage the missing-footer review finding",
+                  transition: "triage",
+                });
+              if (step === 9) assignment(2, "omp-worker");
+              if (step === 10)
+                call("auto_step", { summary: "Native fixer added the requested footer" });
+              if (step === 11) assignment(3, "omp-reviewer");
+              if (step === 12)
+                call("auto_step", {
+                  summary: "Independent delta verification settled with its actual receipt",
+                });
+              if (step === 15)
+                call("auto_step", {
+                  summary:
+                    "Confirm the approved host settlement before returning the final summary",
+                });
+            } else {
+              if (step === 8)
+                call("auto_step", {
+                  summary: "Proceed to the configured additional independent review round",
+                });
+              if (step === 9)
+                call("architect_checkpoint", {
+                  phase: "completion",
+                  evidenceRef: "local://architect-review/auto-result.md",
+                });
+              if (step === 10) {
+                const summary =
+                  "Confirm the approved host settlement before returning the final summary";
+                if (mode === "brief")
+                  call("eval", {
+                    language: "js",
+                    reset: true,
+                    code: `console.log(await tool.write(${JSON.stringify({ path: "xd://auto_step", content: JSON.stringify({ summary }) })}))`,
+                    timeout: 20,
+                  });
+                else call("auto_step", { summary });
+              }
+            }
+          }
         }
         const toolStep = calls.length > 0;
         const message: AssistantMessage = {
@@ -1542,32 +2002,27 @@ for (const mode of [
         return stream;
       },
       models: [
-        {
-          id: "implementation",
-          name: "Local Auto fixture",
-          reasoning: false,
-          input: ["text"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: 1000000,
-          maxTokens: 1024,
-        },
-      ],
+        "main",
+        "implementation",
+        "architect",
+        "research",
+        "task",
+        "smol",
+        "tiny",
+        "title",
+        "compaction",
+      ].map((name) => ({
+        id: name,
+        name: `Local Auto fixture ${name}`,
+        reasoning: false,
+        input: ["text" as const],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 1000000,
+        maxTokens: 1024,
+      })),
     };
     registry.registerProvider(provider, providerConfig, provider);
     const dependencies: AutoDependencies = {
-      skill:
-        mode === "real-cli"
-          ? async (...args) => {
-              try {
-                const loaded = await loadRasenAutoSkill(...args);
-                admittedSkillMessage = loaded.message;
-                return loaded;
-              } catch (error) {
-                errors.push(error);
-                throw error;
-              }
-            }
-          : skillFixture,
       workflow:
         mode === "real-cli"
           ? async (...args) => {
@@ -1581,17 +2036,14 @@ for (const mode of [
               }
             }
           : async () => workflow(requests >= 2),
-      snapshot: async (...args) => {
-        reads++;
-        try {
-          return mode === "real-cli"
-            ? await readRasenSnapshot(...args)
-            : snapshot(requests >= 2 ? 2 : 0);
-        } catch (error) {
-          errors.push({ phase: "snapshot", error: String(error) });
-          throw error;
-        }
-      },
+      ...(mode !== "real-cli"
+        ? {
+            snapshot: async () => {
+              reads++;
+              return snapshot(requests >= 2 ? 2 : 0);
+            },
+          }
+        : {}),
       validate: async (...args) => {
         validations++;
         try {
@@ -1610,11 +2062,11 @@ for (const mode of [
                 fetch: async (url, init) => {
                   decisions++;
                   expect(url).toBe("https://api.typesafe.ai/v1/systemone");
-                  expect(JSON.parse(String(init.body)).state).toMatchObject({
-                    change: "fixture-change",
-                    completed: decisions === 1 ? 1 : 3,
-                    remaining: decisions === 1 ? 3 : 1,
-                  });
+                  const state = JSON.parse(String(init.body)).state;
+                  expect(state.change).toBe("fixture-change");
+                  expect(Number.isInteger(state.completed)).toBe(true);
+                  expect(Number.isInteger(state.remaining)).toBe(true);
+                  decisionStates.push(state);
                   return new Response(
                     JSON.stringify({
                       model: "jev-latest",
@@ -1655,7 +2107,9 @@ for (const mode of [
         agentDir: path.join(cwd, "isolated-agent"),
         authStorage: auth,
         modelRegistry: registry,
-        model: registry.getAvailable().find((model) => model.provider === provider),
+        model: registry
+          .getAvailable()
+          .find((model) => model.provider === provider && model.id === "main"),
         settings,
         sessionManager,
         extensions: [
@@ -1673,7 +2127,14 @@ for (const mode of [
               () => async (request) => {
                 reviews++;
                 reviewEvidence.push(request.evidence);
-                return approved;
+                reviewMaterials.push(request.material.content);
+                return mode === "real-cli" && reviews === 1
+                  ? {
+                      decision: "revise",
+                      summary: "Add the missing fixture footer",
+                      issues: ["The output needs the verified footer before completion"],
+                    }
+                  : approved;
               },
               dependencies,
             ),
@@ -1681,12 +2142,18 @@ for (const mode of [
           ),
           (pi) => {
             pi.registerProvider(provider, providerConfig);
-            pi.on("before_agent_start", (event) => {
+            pi.on("before_agent_start", (event, ctx) => {
+              if (ctx.agent.kind !== "main") return;
               beforeStarts++;
               prompts.push(event.prompt);
             });
-            pi.on("session_stop", (event) => {
-              stops.push(event.stop_hook_active);
+            pi.on("session_stop", (event, ctx) => {
+              if (ctx.agent.kind === "main") stops.push(event.stop_hook_active);
+            });
+            pi.on("tool_result", (event, ctx) => {
+              if (ctx.agent.kind !== "main") return;
+              if (event.toolName === "task") nativeTaskResults.push(event.details);
+              if (event.toolName === "auto_step") phaseResults.push(event.content);
             });
           },
         ],
@@ -1700,8 +2167,13 @@ for (const mode of [
         enableLsp: false,
         enableIrc: false,
         skipPythonPreflight: true,
-        spawns: "",
-        toolNames: mode === "real-cli" ? ["read", "write"] : ["write"],
+        spawns: "omp-worker,omp-reviewer",
+        toolNames:
+          mode === "real-cli"
+            ? ["task", "wait", "read", "write"]
+            : mode === "brief"
+              ? ["task", "read", "write", "eval"]
+              : ["task", "write"],
         autoApprove: true,
         cacheWarming: false,
         bindProcessState: false,
@@ -1759,7 +2231,11 @@ for (const mode of [
         (message) => message.role === "custom" && message.customType === "omp-auto-run",
       );
       expect(delivered).toHaveLength(1);
-      expect(delivered[0]).toMatchObject({ role: "custom", display: false, attribution: "agent" });
+      expect(delivered[0]).toMatchObject({
+        role: "custom",
+        display: false,
+        attribution: "agent",
+      });
       expect(session.agent.state.messages.filter((message) => message.role === "user")).toEqual([]);
       const firstContext = JSON.parse(contexts[0]);
       const payload = firstContext.find((message: { content: unknown }) =>
@@ -1767,29 +2243,41 @@ for (const mode of [
       );
       expect(payload.role).toBe("developer");
       expect(JSON.stringify(payload.content)).toContain("Register the exact approved todo steps");
-      expect(JSON.stringify(payload.content)).toContain("installed rasen-auto workflow");
-      if (mode === "real-cli") {
-        const text = payload.content.map((part: { text?: string }) => part.text ?? "").join("");
-        const native = delivered[0];
-        if (native.role !== "custom") throw new Error("Expected internal native message");
-        const ref = (native.details as { ref: string }).ref;
-        const saved = await Bun.file((await sessionManager.getArtifactPath(ref.slice(11)))!).text();
-        expect(saved.includes(admittedSkillMessage)).toBe(true);
-        expect(saved.replace(/\s/g, "").includes(actualSkillBody.replace(/\s/g, ""))).toBe(true);
-        // OMP's native autoload renderer compacts Markdown table whitespace.
-        // Artifact bytes preserve its exact result; source and provider keep all non-whitespace content.
-        expect(text.replace(/\s/g, "").includes(actualSkillBody.replace(/\s/g, ""))).toBe(true);
-      } else expect(JSON.stringify(payload.content)).toContain(fullSkill);
+      expect(JSON.stringify(payload.content)).not.toContain("installed rasen-auto workflow");
+      expect(JSON.stringify(payload.content)).not.toContain(
+        "Complete installed rasen-auto fixture body",
+      );
+      await expect(fs.lstat(path.join(cwd, ".omp/skills/rasen-auto"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      const native = delivered[0];
+      if (native.role !== "custom") throw new Error("Expected internal native message");
+      const ref = (native.details as { ref: string }).ref;
+      const saved = await Bun.file((await sessionManager.getArtifactPath(ref.slice(11)))!).text();
+      expect(saved).toContain("Auto run:");
+      expect(saved).not.toContain("installed rasen-auto workflow");
       expect(confirms).toBe(1);
-      expect(requests).toBe(mode === "max-cap" ? 2 : mode === "real-cli" ? 8 : 5);
-      expect(reads).toBeGreaterThanOrEqual(mode === "max-cap" ? 3 : 4);
-      expect(decisions).toBe(mode === "real-cli" ? 2 : 1);
+      expect(requests).toBe(mode === "max-cap" ? 6 : mode === "real-cli" ? 21 : 11);
+      if (mode !== "real-cli") expect(reads).toBeGreaterThanOrEqual(mode === "max-cap" ? 3 : 4);
+      expect(decisions).toBe(mode === "max-cap" ? 3 : mode === "real-cli" ? 6 : 4);
       expect(validations).toBe(mode === "max-cap" ? 1 : 3);
       expect(reviews).toBe(mode === "max-cap" ? 0 : 2);
       expect(beforeStarts).toBe(0);
       expect(stops).toEqual([false]);
+      if (mode === "brief") {
+        const evalResults = session.agent.state.messages.filter(
+          (message) => message.role === "toolResult" && message.toolName === "eval",
+        );
+        expect(evalResults).toHaveLength(1);
+        expect(evalResults[0]).toMatchObject({ isError: false });
+        expect(JSON.stringify(evalResults[0])).toContain("settled");
+      }
       if (mode !== "max-cap")
-        expect(contexts.at(-1)).toContain("Minimum independent review rounds not yet met");
+        expect(contexts.at(-1)).toContain(
+          mode === "real-cli"
+            ? "Add the missing fixture footer"
+            : "Minimum independent review rounds not yet met",
+        );
       const tool = session.extensionRunner!.getRegisteredTool("auto_status")!.definition;
       const result = await tool.execute(
         "status",
@@ -1804,12 +2292,63 @@ for (const mode of [
         status: mode === "max-cap" ? "budget_exhausted" : "completed",
         steps: mode === "max-cap" ? "1/1" : "1",
         completionVerified: mode !== "max-cap",
+        hostWorkflow: { phase: mode === "max-cap" ? "review" : "settled" },
       });
+      const phases = phaseResults.map((content) => {
+        const text = (content as Array<{ type: string; text?: string }>).find(
+          (part) => part.type === "text",
+        );
+        return JSON.parse(text!.text!).hostWorkflow.phase;
+      });
+      expect(phases).toEqual(
+        mode === "max-cap"
+          ? ["apply", "verify", "review"]
+          : mode === "real-cli"
+            ? ["apply", "verify", "review", "fix", "verify", "delta-review", "settled"]
+            : ["apply", "verify", "review", "delta-review", "settled"],
+      );
       if (mode === "real-cli") {
-        expect(await Bun.file(taskPath).text()).toBe(tasks(2));
+        expect(await Bun.file(taskPath).text()).toBe(tasks(15));
+        expect((await readRasenSnapshot(cwd, "fixture-change", { executable })).progress).toEqual({
+          total: 15,
+          complete: 15,
+          remaining: 0,
+        });
+        expect((await readRasenWorkflow(cwd, "fixture-change", { executable })).kind).toBe(
+          "absent",
+        );
+        await expect(fs.lstat(workflowPath)).rejects.toMatchObject({ code: "ENOENT" });
+        expect(nativeTaskResults).toHaveLength(4);
+        const nativeJobs = session
+          .asyncJobManager!.getAllJobs()
+          .filter((job) => workerIds.includes(job.agentId ?? ""));
+        expect(nativeJobs).toHaveLength(4);
+        expect(nativeJobs.every((job) => job.type === "task" && job.status === "completed")).toBe(
+          true,
+        );
+        expect(childTurns.size).toBe(4);
+        expect(reviewMaterials[0]).toContain("LATE_NATIVE_FINDING: add the missing fixture footer");
+        expect(reviewMaterials[1]).toContain(
+          "LATE_NATIVE_DELTA: verified footer; no remaining blocking findings",
+        );
+        const verificationJobs = nativeJobs.filter(
+          (job) => job.agentId?.endsWith("_verify") || job.agentId?.endsWith("_delta"),
+        );
+        expect(verificationJobs).toHaveLength(2);
+        for (const job of verificationJobs) expect(job.resultText).not.toContain("LATE_NATIVE_");
+        expect(
+          decisionStates.map((state) => JSON.parse(String(state.summary)).allowedPhase),
+        ).toEqual(phases.slice(0, -1));
+        expect(JSON.parse(result.content[0].text)).toMatchObject({
+          hostWorkflow: { source: "builtin", phase: "settled", verifiedStages: ["verify"] },
+          workflow: { kind: "absent" },
+        });
+        expect(await Bun.file(implementationPath).text()).toBe(
+          "Scoped fixture output\nVerified footer\n",
+        );
         for (const evidence of reviewEvidence) {
-          expect(evidence).toContain("Mark fixture unit one");
-          expect(evidence).toContain("Mark fixture unit two");
+          expect(evidence).toContain("Mark fixture unit 1");
+          expect(evidence).toContain("Mark fixture unit 15");
           expect(evidence).toContain("Strict CLI artifact validation passed");
         }
         expect(Number(JSON.parse(result.content[0].text).toolCalls)).toBeGreaterThan(80);
@@ -1828,17 +2367,21 @@ for (const mode of [
           toolName: "architect_checkpoint",
           details: { decision: "revise", review: { charged: true, attempt: 1 } },
         });
-        expect(JSON.stringify(failures[0])).toContain(
-          "Minimum independent review rounds not yet met",
-        );
+        expect(JSON.stringify(failures[0])).toContain("Add the missing fixture footer");
       }
     } finally {
       await session?.dispose();
+      for (const id of workerIds) {
+        const child = AgentRegistry.global().get(id);
+        await child?.session?.dispose();
+        AgentRegistry.global().unregister(id);
+      }
+      open.mockRestore();
       registry.clearSourceRegistrations(provider);
       auth.close();
       await fs.rm(cwd, { recursive: true, force: true });
     }
-  }, 30000);
+  }, 60000);
 }
 
 test.each([
@@ -2038,6 +2581,7 @@ test("delayed Auto native artifact admission cannot alter a newer request after 
   let stopping: ReturnType<typeof f.checkpoint> | undefined;
   try {
     await f.start();
+    await f.verify();
     const evidenceRef = await f.evidence(
       "Full scoped verification evidence before the delayed admission",
     );
@@ -2222,6 +2766,7 @@ for (const userKind of ["text", "skill"] as const) {
     try {
       await f.start();
       f.complete();
+      await f.verify();
       const next = (await f.stop()) as { additionalContext: string };
       const continuation = {
         role: "custom",
@@ -2292,9 +2837,12 @@ test("Jev selects recorded stage frontiers, caches task-only churn, and never su
     });
     expect(f.counts().decisions).toBe(1);
     observed = workflow(true);
-    expect(await f.step("Recorded apply and independent verification complete")).toMatchObject({
+    expect(
+      await f.step("External stage claims changed while a task remains incomplete"),
+    ).toMatchObject({
       cached: false,
-      ready: ["review-loop"],
+      ready: ["apply"],
+      allowedNextPhase: "apply",
     });
     expect(f.counts().decisions).toBe(2);
     expect(await f.status()).toMatchObject({
@@ -2421,6 +2969,7 @@ test("native registered implementation/research/reviewer leaves preserve configu
   const f = await loaderFixture();
   try {
     await f.start();
+    await f.step();
     const ctx = {
       ...f.ctx,
       models: { resolve: () => ({ model: { id: "fixture" } }) },
@@ -2428,7 +2977,6 @@ test("native registered implementation/research/reviewer leaves preserve configu
     for (const [agent, model] of [
       ["omp-worker", "@implementation"],
       ["omp-explorer", "@research"],
-      ["omp-reviewer", "@architect"],
     ]) {
       expect(
         await f.extension.handlers.get("before_subagent_spawn")![0](
@@ -2437,6 +2985,14 @@ test("native registered implementation/research/reviewer leaves preserve configu
         ),
       ).toMatchObject({ model });
     }
+    f.complete();
+    expect(await f.step()).toMatchObject({ allowedNextPhase: "verify" });
+    expect(
+      await f.extension.handlers.get("before_subagent_spawn")![0](
+        { type: "before_subagent_spawn", agent: "omp-reviewer", invocationKind: "task" },
+        ctx,
+      ),
+    ).toMatchObject({ model: "@architect" });
     expect(
       await f.extension.handlers.get("before_subagent_spawn")![0](
         { type: "before_subagent_spawn", agent: "other-agent", invocationKind: "task" },
@@ -2473,6 +3029,7 @@ test("status refresh during a delayed completion review cannot approve different
   let reviewing: ReturnType<typeof f.checkpoint> | undefined;
   try {
     await f.start();
+    await f.verify();
     reviewing = f.checkpoint();
     await entered.promise;
     revision = "B";
@@ -2620,8 +3177,8 @@ test("Jev advice rejects an in-flight stage-status change even when completed/re
       status: "running",
       architect: { pendingRecovery: false },
     });
-    expect(await f.step()).toMatchObject({ choice: "continue", cached: false });
-    expect(decisions).toBe(2);
+    expect(await f.step()).toMatchObject({ status: "needs_user", isError: true });
+    expect(decisions).toBe(1);
   } finally {
     release.resolve();
     await pending?.catch(() => {});
@@ -2634,6 +3191,7 @@ for (const mixed of [false, true]) {
     const f = await loaderFixture();
     try {
       await f.start();
+      await f.step();
       await f.extension.handlers.get("tool_call")![0](
         { type: "tool_call", toolName: "bash", toolCallId: "owned", input: { command: "fixture" } },
         f.ctx,
@@ -2701,15 +3259,18 @@ test("unreceipted interrupted native work cannot pass Auto completion", async ()
   const f = await loaderFixture();
   try {
     await f.start();
-    await f.extension.handlers.get("tool_call")![0](
-      {
-        type: "tool_call",
-        toolName: "bash",
-        toolCallId: "interrupted",
-        input: { command: "fixture" },
-      },
-      f.ctx,
-    );
+    await f.step();
+    expect(
+      await f.extension.handlers.get("tool_call")![0](
+        {
+          type: "tool_call",
+          toolName: "bash",
+          toolCallId: "interrupted",
+          input: { command: "fixture" },
+        },
+        f.ctx,
+      ),
+    ).toBeUndefined();
     for (const handler of f.extension.handlers.get("tool_execution_end") ?? [])
       await handler(
         {
@@ -2723,7 +3284,7 @@ test("unreceipted interrupted native work cannot pass Auto completion", async ()
       );
     f.complete();
     const result = await f.checkpoint();
-    expect(JSON.stringify(result)).toContain("termination is unverified");
+    expect(result.isError).toBe(true);
     expect(await f.status()).toMatchObject({
       completionVerified: false,
       nativeWork: { settlementUnverified: ["interrupted"] },

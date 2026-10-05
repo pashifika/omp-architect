@@ -6,7 +6,6 @@ export type AutoPreflightStage =
   | "confirmation"
   | "change snapshot"
   | "workflow"
-  | "skill loading"
   | "artifact storage"
   | "native delivery";
 
@@ -40,8 +39,6 @@ export function autoPreflightDiagnostic(stage: AutoPreflightStage, error: unknow
     "change snapshot":
       "Check the named local change and run rasen status --change <change> --json locally",
     workflow: "Run rasen pipeline resume <change> --json locally and inspect the recorded pipeline",
-    "skill loading":
-      "Check .omp/skills/rasen-auto/SKILL.md in this project; generate the OMP skills with Rasen's builtin full profile if missing",
     "artifact storage":
       "Use a persistent OMP session and check its artifact storage permissions and free space",
     "native delivery": "Check the native OMP session before retrying delivery",

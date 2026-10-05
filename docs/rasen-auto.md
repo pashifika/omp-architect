@@ -1,24 +1,31 @@
 # Rasen Auto setup and limits
 
-`/auto start <change>` runs the installed Rasen Auto workflow for a **prepared, existing local Rasen change**, scoped to remaining apply, verification, and review. The main OMP session is the LEAD and uses native one-shot leaf workers. Jev actively advises next-step selection at actual workflow stage boundaries; code supervises ownership, permissions, time limits, and the final completion gate. Existing Architect behavior remains the default when Auto is off.
+`/auto start <change>` runs the extension-owned Auto flow for a **prepared, existing local Rasen change**, scoped to remaining apply, verification, and review. The main OMP session is the LEAD and uses native one-shot leaf workers. Jev actively advises next-step selection at actual workflow stage boundaries; code supervises ownership, permissions, time limits, and the final completion gate. Existing Architect behavior remains the default when Auto is off.
 
-The supported Rasen source is **dev/0.1.8 at `f0ae20d19a30c265ad3f3ffaaa5bb3cd148d12dd`**. Build and locally install that source, then initialize with Rasen's **builtin `full` profile**. Auto admits the entire generated `.omp/skills/rasen-auto/SKILL.md` body through the running OMP host's native skill autoload renderer. That renderer compacts Markdown table whitespace; admission verifies that the complete body survives without truncation, not byte-identical source formatting. It does not replace that workflow with a package-authored task loop. Generated skills remain in the project and are not copied into this package.
+The supported Rasen source is **dev/0.1.8 at `f0ae20d19a30c265ad3f3ffaaa5bb3cd148d12dd`**. Build and locally install that source, then initialize OMP integration with `rasen init --tools omp`. The generated `rasen-apply-change` skill and bounded change artifacts provide apply context. Auto orchestration is implemented by this extension: it does not read or load `.omp/skills/rasen-auto/SKILL.md`, and it does not require a `full` profile. Existing generated Auto skills can remain in the project; they do not drive this command.
 
-The `full` profile installs skills; it does **not** select Rasen's `full-feature` pipeline. The LEAD reads Rasen's public pipeline resume/execution state, preserves the recorded pipeline (or the skill's selection policy when absent), and resumes only the authorized stages. This start does not authorize new proposal/design work, scope expansion, ship, retain, archive, commit, publish, merge, or deploy. Prepared stages must be recorded honestly as pre-existing/skipped rather than claimed as newly executed. Planning-only and external-store modes are outside this contract.
+The extension reads Rasen's public pipeline resume/execution state. When a recorded pipeline exists, its supported apply/verification stages constrain execution. When absent, the extension uses session-local apply, verification, and review phases without choosing an external pipeline or writing project pipeline state. This start does not authorize new proposal/design work, scope expansion, ship, retain, archive, commit, publish, merge, or deploy. Prepared stages must be treated honestly as pre-existing rather than claimed as newly executed. Planning-only and external-store modes are outside this contract.
+
+Auto runs from the Git project root. Fresh review identity includes HEAD, the
+current tracked diff, and bounded hashes of tracked and non-ignored untracked
+files; raw workspace contents are not sent to Jev by this observation. Gitlinks,
+assume-unchanged/skip-worktree entries, workspace symlinks, more than 20,000 files, or more than 32 MiB
+of file content fail closed. Non-Git roots require version control before Auto
+can bind independent verification to the current code. The extension never
+initializes Git or changes index flags automatically.
 
 ## Internal delivery and confirmation
 
 Auto startup uses OMP's native hidden custom-message route (`sendMessage`,
-`triggerTurn: true`, `deliverAs: "nextTurn"`, agent attribution). The complete native
-skill message, bounded change context, and run identity are internal context,
+`triggerTurn: true`, `deliverAs: "nextTurn"`, agent attribution). The extension-owned
+flow instructions, bounded change context, and run identity are internal context,
 never a fabricated user transcript entry.
 OMP maps text-only custom messages to its canonical developer role; each provider
 then applies its native role mapping. The complete exact payload is also saved and
 verified in originating-session `artifact://` storage, without project `.rasen`
-files. Missing storage fails before a run starts. The generated Auto skill has a separate
-256 KiB UTF-8 source limit; the aggregate task/apply context remains bounded to
-64 KiB, and the complete native delivery payload is bounded to 512 KiB. Oversize
-inputs are rejected, never silently truncated.
+files. Missing storage fails before a run starts. The aggregate task/apply context
+remains bounded to 64 KiB, and the complete native delivery payload is bounded to
+512 KiB. Oversize inputs are rejected, never silently truncated.
 
 The extension admits idle and queued startup through the same ownership check;
 stop, new input, session changes, or changed delivery content cannot revive a run.
@@ -34,7 +41,7 @@ source guidance is never reconstructed from display rows.
 
 ## Setup
 
-1. Build/install the pinned Rasen development source with `bun run prepare:rasen` (see the script's reported executable path), then run `rasen init --tools omp --profile full` in your project using that executable. Use the builtin profile; no external YAML profile import is needed. The script installs into a temporary test prefix; use Rasen's upstream packaging workflow for a persistent installation. Prepare the change's proposal, design, specs, and tasks first
+1. Build/install the pinned Rasen development source with `bun run prepare:rasen` (see the script's reported executable path), then run `rasen init --tools omp` in your project using that executable. Ensure the generated apply skill is available; no Auto skill or specific profile is required. The script installs into a temporary test prefix; use Rasen's upstream packaging workflow for a persistent installation. Prepare the change's proposal, design, specs, and tasks first
 2. Both the global and project `auto.json` files are **optional**. Set common defaults in the active OMP agent directory's `auto.json` (normally `~/.omp/agent/auto.json`), then override individual settings in `<project>/.omp/auto.json` if needed. With neither file, Auto uses its bounded builtins and `rasen` on PATH. See [configuration inheritance](#configuration-inheritance) below; restart OMP after editing. A missing file or `enabled: true` never starts a run automatically
 3. Keep your native OMP async settings: Auto supports native task/wait and Bash/Eval jobs without disabling async or changing global configuration. [examples/auto-config.yml](../examples/auto-config.yml) explains the settings policy. The regular `modelRoles` and Architect `reviews.min/max` settings in the [Architect guide](architect.md) remain authoritative
 4. Authenticate the `typesafe` provider through OMP's `/login`, or provide `TYPESAFE_API_KEY` in the OMP process environment through your normal secure setup. Auto resolves credentials through the current OMP session's `authStorage.keys.get("typesafe")` on each Jev invocation, using OMP's standard precedence; a key saved by `/login` takes precedence over the environment variable. You do not need to configure both. Credential lookup shares the decision's timeout and cancellation boundary. Never put keys in `auto.json`, this repository, task artifacts, or tool arguments. No external private connector key is imported. `jev-latest` is the fixed TypeSafe routing model; OMP generative models/efforts still use native roles
@@ -124,11 +131,11 @@ RASEN_AGENT_RUNTIME=omp rasen pipeline resume my-change --json
 RASEN_AGENT_RUNTIME=omp rasen pipeline show <pipeline-name> --for-execution --json
 ```
 
-The LEAD also follows the generated workflow's public `rasen pipeline resume <change> --json` and `rasen pipeline show <name> --for-execution --json` interfaces with `RASEN_AGENT_RUNTIME=omp`, rather than inventing a pipeline DAG. Workflow execution and run-state updates use normal OMP tools and approvals.
+The extension uses these public interfaces to observe recorded pipeline constraints with `RASEN_AGENT_RUNTIME=omp`. It owns Auto phase selection and supervision, while the LEAD performs authorized implementation and verification through normal OMP tools and approvals. No external pipeline is invented when state is absent.
 
 ## Native roles and stage decisions
 
-The main session owns planning, routing, Rasen state, and permission checks. Its workers use OMP's native task tool and configured model roles:
+The extension owns Auto phase state and admission gates. The main session reasons about the authorized work, chooses native leaf tasks within that phase, and follows normal permission checks. Its workers use OMP's native task tool and configured model roles:
 
 - `omp-worker` / `@implementation`: implementation and fixes
 - `omp-explorer` / `@research`: narrow read-only repository research
@@ -138,7 +145,27 @@ Each worker is a one-shot leaf with `spawns: []`; it may not redelegate or call 
 
 Foreign Claude/Codex processes, foreign dispatch bridges, recursive delegation, and detached OS processes outside native OMP job tracking are not supported during Auto. Native async task/wait and Bash/Eval jobs remain available; each leaf must join its own jobs before yielding. Unsupported explicit foreign-runtime routing requires user attention. Record only actual native task handles and artifacts; do not invent Claude/Codex runtime identifiers or resumable worker handles. Ordinary non-Auto routing is unchanged.
 
-At the initial executable frontier and after recording each meaningful workflow stage boundary, the LEAD calls the synchronous `auto_step` tool. It refreshes bounded Rasen state before requesting Jev's existing `continue`, `replan`, `needs_user`, or `uncertain` decision, with the bounded Architect fallback described below. A semantic boundary includes the selected pipeline, stage frontier/status, findings, and review rounds. Identical semantic boundaries reuse the cached decision; task-checkbox ticks, assistant summaries, and timestamps do not create new decisions. Jev remains active in next-step selection; it is neither a workflow driver nor a callback on every tool, skill read, or task-checkbox update. The LEAD continues the loaded workflow within the same native turn after receiving advice.
+At the initial executable frontier and after recording each meaningful workflow stage boundary, the LEAD calls the synchronous `auto_step` tool. It refreshes bounded Rasen state before requesting Jev's existing `continue`, `replan`, `needs_user`, or `uncertain` decision, with the bounded Architect fallback described below. A semantic boundary includes the extension-owned phase, any recorded pipeline, stage frontier/status, findings, and review rounds. Identical semantic boundaries reuse the cached decision; task-checkbox ticks, assistant summaries, and timestamps do not create new decisions. Jev remains active in next-step selection; it is neither a workflow driver nor a callback on every tool, skill read, or task-checkbox update. The LEAD continues the extension-owned flow within the same native turn after receiving advice.
+
+The host phases are `apply → verify → review`. A substantive review finding enters
+`triage`; `auto_step` with `transition: "triage"` admits `fix`, whose successful native
+fixer receipt leads to fresh independent verification and `delta-review`. A clean
+minimum-round request goes directly to another independent delta checkpoint.
+Only the existing Architect review settings count and cap semantic rounds.
+
+Each verification receipt is bound to its admitted stage and exact code/task/source
+fingerprints. Parallel receipts for one check cannot satisfy a later dependent check.
+A recorded DAG must have one apply stage, followed by supported verification stages;
+unsupported multi-apply or pre-apply verification topologies stop for attention.
+Main mutation tools require an admitted apply/fix phase. Other phases allow read-only
+Main work, native leaf tasks and the narrow review-file/checkpoint handoff. Auto blocks
+peer messages and `agent://` wakes: completed leaves are not resumed outside its ledger.
+
+A detached verification/fix task must supply its actual complete, retained native
+artifact. Rendered task previews are never accepted as complete evidence. Synchronous
+untruncated outputs may supply the full native receipt; truncated results likewise
+require their complete artifact. Successful task execution is not itself a test pass:
+all captured verification findings reach the independent Architect review material.
 
 ## Native completion handoff
 
@@ -176,7 +203,7 @@ Overall run supervision still applies. It does not squeeze the provider review i
 timeout.
 
 After approval, return a factual final summary. Auto's `session_stop` hook performs only fresh
-task/workflow reads, strict validation, and settlement against the approved task and workflow
+task/workflow/code reads, strict validation, and settlement against the approved task, code and workflow
 fingerprints. No model provider runs inside that hook, which uses a **24-second** deadline below the
 SDK's 30-second handler cap. A changed fingerprint cannot settle an old approval. Assistant claims
 alone do not advance progress.
@@ -192,7 +219,7 @@ completion reminder, not a task-by-task implementation loop.
 - Jev can return only `continue`, `replan`, `needs_user`, or `uncertain`. It cannot approve a plan, grant permission, mark a task done, or declare completion
 - Low confidence, malformed output, timeout, or provider error permits at most one isolated no-tool architect-role triage fallback for that decision, within `maxFallbacks` for the run. `fallback: "stop"` disables it. Continued uncertainty stops explicitly. No provider retry loop exists
 - `replan` requires the existing Architect recovery checkpoint. Plan, recovery and explicit blocked checkpoints use the [native-file handoff](architect.md#native-file-handoff): write `local://architect-review/NAME.md`, then submit `{ phase, evidenceRef, steps? }`; inline `summary` is unsupported. A denied OMP tool approval stops Auto as `needs_user`; no confidence can override it
-- The existing Architect `reviews.min/max` settings (defaults **1/3**) are the sole semantic completion review/fix loop, using the native handoff above. Required independent verification still runs, but skill reads, CLI queries, task progress, and test commands are not review rounds. The Rasen review-cycle stage remains pending for the host gate; downstream stages remain outside this start's scope. Unresolved plan/recovery checkpoints, review findings, or exhausted review budgets cannot become success
+- The existing Architect `reviews.min/max` settings (defaults **1/3**) are the sole semantic completion review/fix loop, using the native handoff above. Required independent verification still runs, but skill reads, CLI queries, task progress, and test commands are not review rounds. Any recorded Rasen review-cycle stage remains pending for the host gate; downstream stages remain outside this start's scope. Unresolved plan/recovery checkpoints, review findings, or exhausted review budgets cannot become success
 - Task identity/order/description, schema, and local project root are frozen for a run. Scope changes require the user to review and explicitly restart. Deleted/replaced tasks and repeated checkbox toggling do not manufacture progress
 - Default supervision is **4 hours overall** (`maxDurationMs: 14400000`, configurable up to 12 hours) and **10 minutes without native model/tool output** (`noOutputTimeoutMs: 600000`, configurable up to 30 minutes). The inactivity timer measures output activity, not checkbox progress. Both time limits remain finite
 - `maxSteps`, `maxToolCalls`, and `maxStalls` default to `null`, so there is no default whole-change 8-turn, 80-tool-call, or checkbox-stall cap. Explicit legacy integer limits remain accepted and enforced: `maxSteps` 1–10000 for native execution turns, `maxToolCalls` 1–100000 for main-session tool attempts (including failed attempts), and `maxStalls` 1–10000 for observed turns without newly completed tasks before continuation. Use `null` to disable an optional count cap. Counts and elapsed time never reset on hidden continuations
@@ -207,7 +234,7 @@ Auto sends bounded stage/task counts, stage-frontier and finding evidence, a pro
 
 These are orchestration controls, not an OS sandbox: arbitrary shell code can create processes outside native job tracking, and streamed assistant claims cannot be retracted. Completion is refused while Auto-owned native work remains unsettled; await results and collect fresh evidence before review. Unrelated Main jobs do not block the Auto completion checkpoint, though native OMP terminal `session_stop` scheduling still waits for all Main-owned jobs. Use normal OMP approval settings and review the final evidence.
 
-See [verification and known coverage limits](rasen-auto-verification.md) for recorded evidence and reproduction steps. Historical verification is not proof of live end-to-end coverage for this native workflow port. Return to the [README](../README.md).
+See [verification and known coverage limits](rasen-auto-verification.md) for recorded evidence and reproduction steps. Historical verification is not proof of live end-to-end coverage for the current extension-owned flow. Return to the [README](../README.md).
 
 ## Native async ownership and stopping
 
@@ -248,21 +275,19 @@ async settings; keep normal tool approvals and verify actual termination.
 ### Diagnosing a refused start
 
 A preflight notification names the failed boundary: confirmation, change snapshot,
-workflow, skill loading, or native session artifact storage. Integration-owned
+workflow, native session artifact storage, or native delivery. Integration-owned
 errors include the relative file, limit, read-only CLI command, or allowlisted OS
 error code where available. Raw CLI output, arbitrary host exceptions, full local
 paths and environment values are withheld. No provider call is made during these
 checks.
 
-For missing generated skills, inspect `.omp/skills/rasen-apply-change/SKILL.md` and
-`.omp/skills/rasen-auto/SKILL.md` in the project where OMP started. Use the same
-Rasen executable configured in `auto.json`. A fresh or partial install can be
-regenerated with `rasen init --tools omp --profile full`; this changes generated
-project files, so inspect existing customizations first. The pinned development
-CLI's `core` profile also includes Auto: a profile name alone does not prove a
-missing skill. Native autoload renders the explicit project skill, rather than
-searching for an unrelated global skill. Project-contained skill links work;
-links outside the project remain refused by the local admission boundary.
+For missing apply context, inspect `.omp/skills/rasen-apply-change/SKILL.md` in the
+project where OMP started. Use the same Rasen executable configured in `auto.json`.
+`rasen init --tools omp` generates OMP integration files; inspect existing
+customizations before regenerating them. Auto does not require
+`.omp/skills/rasen-auto/SKILL.md` or call native skill autoload. Project-contained
+apply-skill links work; links outside the project remain refused by the local
+admission boundary.
 
 For CLI errors, run the exact read-only command shown locally. `ENOENT` at a CLI
 boundary means the configured executable could not start; inspect the OMP

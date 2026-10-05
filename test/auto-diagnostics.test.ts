@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import {
   AutoPreflightError,
+  type AutoPreflightStage,
   autoPreflightDiagnostic,
   diagnosticPath,
 } from "../src/auto/diagnostics.ts";
@@ -23,4 +24,22 @@ test("preflight shows only integration-owned diagnostics and allowlisted OS code
   ).toContain("Expected local change");
   expect(diagnosticPath("a\x1b[31m\n\u202eb")).toBe("a?[31m??b");
   expect(diagnosticPath("x".repeat(1000))).toHaveLength(240);
+});
+
+test("supported admission diagnostics do not require a generated Auto workflow skill", () => {
+  const stages: AutoPreflightStage[] = [
+    "confirmation",
+    "change snapshot",
+    "workflow",
+    "artifact storage",
+    "native delivery",
+  ];
+  for (const stage of stages) {
+    const message = autoPreflightDiagnostic(stage, { code: "ENOENT" });
+    expect(message).toContain(`[${stage}]`);
+    expect(message).toContain("ENOENT");
+    expect(message).not.toContain("rasen-auto/SKILL.md");
+    expect(message).not.toContain("full profile");
+    expect(message).not.toContain("undefined");
+  }
 });

@@ -1,6 +1,66 @@
 # Rasen Auto verification
 
-## Safe preflight diagnostics (2026-10-05)
+## Current ownership contract
+
+Auto orchestration belongs to the extension. It reads bounded local change/apply
+context and public Rasen pipeline observations; it does not load the generated
+`rasen-auto` skill or require the builtin `full` profile. With no recorded pipeline,
+it uses session-local apply/verification/review phases without creating external
+pipeline state. See [setup and limits](rasen-auto.md) for the current contract.
+
+## Extension-owned flow verification (2026-10-05)
+
+On locked OMP **18.6.0**, Bun **1.3.14**, actual Node **24.19.0**, and the pinned
+Rasen `0.1.8 (dev.local f0ae20d)` build:
+
+- Formatting and TypeScript passed
+- **354 unit/installer tests**, **2,316 assertions** passed
+- **179 smoke tests**, **1,668 assertions** passed
+- Separate **111 installer tests**, **923 assertions** passed
+- **44-entry** packed extension loading, workflow/ruleset checks and `git diff --check` passed
+
+Focused compatibility checks also passed on isolated OMP **18.5.1** and **18.6.1**:
+**57 tests / 697 assertions per host**, TypeScript, the 44-entry packed package,
+and native/sparse bundled startup. Each host ran the owned-workflow/workspace/no-skill
+units, all native-worker cases, and every real AgentSession/no-skill case. The
+execution-file manifest SHA-256 for those source-matching snapshots is
+`1ccebb2f66b2858c5d65b45d76b3f0bec5fefb9b6eb14134c226743e4fa60c4e`.
+No manifest, lockfile, user configuration, or native async setting was changed.
+
+The real CLI fixture uses an isolated custom profile containing only `apply`;
+`rasen-auto` is never installed. It completes **15 nonempty task checkboxes**,
+performs **85 additional reads** without a default 80-tool cutoff, and uses the
+real native task/wait implementation for four detached leaves: implementer,
+independent verifier, fixer, and independent delta verifier. A real missing-footer
+finding causes a real file edit before re-verification. The six Jev boundaries
+follow host-owned phases within one native LEAD turn; no project `auto-run.json`
+is created. Both direct and dedicated Eval `auto_step` after approval preserve
+fresh final settlement rather than charging another review.
+
+Native verifier outputs over 6,000 lines put a late finding beyond the SDK's
+rendered preview. Tests assert that the full retained native artifact, including
+the late finding, reaches Architect's complete review material. Task completion
+is never substituted for a test pass. Coverage also includes sequential-stage
+receipt binding, scope/identity changes, stale code facts, minimum/final review
+rounds, failed-fix retries, uncharged oversize recovery, phase mutation gates,
+peer-wake refusal, denial/cancellation, owned async settlement and fresh terminal
+progress. A separate read-only review identified and rechecked these boundaries.
+
+Model responses and Jev routing responses are deterministic local fixtures; Rasen
+CLI operations, task dispatch, native async ownership, file changes, validation,
+and artifact handoff are real. No paid provider, private upload, production
+settings write, publish, merge, or deploy was used. The container does not verify
+native persistent journal locks or the unrelated named-service daemon: fixture
+journals use the SDK's supported memory backend, and the real-session fixture
+sets `launch.enabled: false` only in `Settings.isolated` to exclude named-service
+probes that fail with OS FileLock `EPERM`. Native async tasks, waits and job ownership
+remain enabled and real; production settings are unchanged. Platform-specific installer
+results and remote CI must be checked on the published commit.
+
+The dated sections below are historical. Their skill-autoload tests and older
+host/test counts are not evidence for the current extension-owned implementation.
+
+## Historical safe preflight diagnostics (2026-10-05)
 
 Auto start now names the failed admission boundary and exposes only integration-
 owned diagnostics: bounded relative paths, allowlisted OS codes, byte limits and
@@ -9,9 +69,9 @@ executable paths, environment and file contents are withheld. Workflow rejection
 reasons are preserved. Synchronous native-delivery failure cancels ownership and
 revokes queued payloads, without trying another send through the broken transport.
 
-Actual pinned Rasen/OMP tests cover fresh full, existing core, and deliberately
-partial full installations. Core already includes Auto in this CLI; its profile
-name alone is not evidence of a missing skill. Full reinitialization restores the
+At that revision, pinned Rasen/OMP tests covered fresh full, existing core, and
+deliberately partial full installations. Core already included Auto in that CLI;
+its profile name alone was not evidence of a missing skill. Full reinitialization restores the
 partial installation. Tests also cover complete >64 KiB native loading, oversize,
 missing/changed/truncated skills, project-contained versus external links, missing
 CLI executable, nonzero exit codes, secret-output suppression, each admission
@@ -46,13 +106,14 @@ multi-version record below belongs to the preceding workflow port. Remote CI and
 cross-platform installer results must still be checked on the published commit.
 
 
-## Native builtin-full workflow port (2026-10-05)
+## Historical native builtin-full workflow port (2026-10-05)
 
-This section describes the current Auto implementation. The older records below
-are historical evidence for the earlier apply-loop and transport layers.
+This section describes the former skill-consuming implementation. Its generated
+Auto skill and full-profile requirements do not apply to the current extension.
+The older records below document the earlier apply-loop and transport layers.
 
-The port reads the complete generated `rasen-auto` skill from Rasen's **builtin
-full profile**, using the running OMP host's native autoload API. It preserves
+That port read the complete generated `rasen-auto` skill from Rasen's **builtin
+full profile**, using the running OMP host's native autoload API. It preserved
 Rasen's workflow as the driver, with a scoped OMP host adaptation and Jev advice
 at recorded semantic stage boundaries. The UI supervisor is the reference for
 finite wall-clock/activity supervision and independent progress observation;
@@ -87,7 +148,7 @@ and `>=18.5.1` peer minimum unchanged. Compatibility runs use isolated copies wi
 exact SDK installations, not a changed project lockfile. Remote CI must still
 verify the published commit separately.
 
-### What the integration proves
+### What that integration proved
 
 - A real `rasen init --tools omp --profile full` generates the Auto body, over
   110,000 UTF-8 bytes. Native autoload admits its complete non-whitespace content
