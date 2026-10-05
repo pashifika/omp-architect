@@ -255,6 +255,7 @@ async function loaderFixture(
     cwd,
     extension,
     ctx,
+    runtime,
     nativeManager,
     async evidence(content: string): Promise<string> {
       const id = await sessionManager.saveArtifact(content, "architect-review");
@@ -303,6 +304,79 @@ async function loaderFixture(
       await fs.rm(cwd, { recursive: true, force: true });
     },
   };
+}
+
+for (const stage of [
+  "confirmation",
+  "change snapshot",
+  "workflow",
+  "skill loading",
+  "artifact storage",
+] as const) {
+  test(`preflight ${stage} failures identify the boundary without leaking host error text`, async () => {
+    const fail = async () => {
+      throw Object.assign(new Error("PRIVATE HOST TOKEN"), { code: "EACCES" });
+    };
+    const fixture = await loaderFixture(
+      {},
+      {
+        dependencies: {
+          ...(stage === "change snapshot" ? { snapshot: fail } : {}),
+          ...(stage === "workflow" ? { workflow: fail } : {}),
+          ...(stage === "skill loading" ? { skill: fail } : {}),
+        },
+      },
+    );
+    const notifications: string[] = [];
+    fixture.ctx.ui.notify = (message) => notifications.push(message);
+    if (stage === "confirmation") fixture.ctx.ui.custom = fail;
+    if (stage === "artifact storage") fixture.ctx.sessionManager.saveArtifact = fail;
+    try {
+      await fixture.extension.commands.get("auto")!.handler("start fixture-change", fixture.ctx);
+      expect(notifications.join(" ")).toContain(`[${stage}]`);
+      expect(notifications.join(" ")).toContain("EACCES");
+      expect(notifications.join(" ")).not.toContain("PRIVATE HOST TOKEN");
+      expect(fixture.bootstraps).toHaveLength(0);
+      expect((await fixture.status()).status).toBe("idle");
+    } finally {
+      await fixture.close();
+    }
+  });
+}
+
+for (const queued of [false, true]) {
+  test(`native delivery failure cancels admission and queued payload, queued=${queued}`, async () => {
+    const fixture = await loaderFixture();
+    const send = fixture.runtime.sendMessage;
+    const notifications: string[] = [];
+    fixture.ctx.ui.notify = (message) => notifications.push(message);
+    fixture.runtime.sendMessage = (...args) => {
+      if (queued) send(...args);
+      throw new Error("PRIVATE DELIVERY ERROR");
+    };
+    try {
+      await fixture.extension.commands.get("auto")!.handler("start fixture-change", fixture.ctx);
+      expect(notifications.join(" ")).toContain("[native delivery]");
+      expect(notifications.join(" ")).not.toContain("PRIVATE DELIVERY ERROR");
+      expect((await fixture.status()).status).toBe("cancelled");
+      if (queued) {
+        const result = await fixture.extension.handlers.get("context")![0](
+          { type: "context", messages: fixture.deliveries },
+          fixture.ctx,
+        );
+        expect(result).toEqual({ messages: [] });
+        // Leave the transport broken while any asynchronous status callback settles.
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      fixture.runtime.sendMessage = send;
+      fixture.bootstraps.length = 0;
+      await fixture.start();
+      expect((await fixture.status()).status).toBe("running");
+    } finally {
+      fixture.runtime.sendMessage = send;
+      await fixture.close();
+    }
+  });
 }
 
 const loginFixtureKey = "synthetic-typesafe-login-not-a-secret";

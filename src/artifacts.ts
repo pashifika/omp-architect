@@ -1,3 +1,4 @@
+import { AutoPreflightError } from "./auto/diagnostics.ts";
 import { constants } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -138,14 +139,16 @@ export async function saveAutoPayload(
   const limit = 512 * 1024;
   const bytes = Buffer.byteLength(content, "utf8");
   if (!content.trim() || content.includes("\0") || bytes > limit)
-    throw new Error("Auto payload must be bounded UTF-8 text");
+    throw new AutoPreflightError(
+      `Auto payload must be non-empty UTF-8 text within ${limit} bytes (received ${bytes} bytes)`,
+    );
   if (!ctx.sessionManager.getArtifactsDir() || !ctx.sessionManager.getArtifactManager())
-    throw new Error("Native session artifact storage is unavailable for Auto");
+    throw new AutoPreflightError("Native session artifact storage is unavailable for Auto");
   const id = await ctx.sessionManager.saveArtifact(content, "auto-run");
-  if (id === undefined) throw new Error("OMP could not save the Auto payload");
+  if (id === undefined) throw new AutoPreflightError("OMP could not save the Auto payload");
   const ref = `artifact://${id}`;
   if ((await readComplete(await artifactPath(ctx, ref), limit, signal)) !== content)
-    throw new Error("Saved Auto payload does not match the admitted bytes");
+    throw new AutoPreflightError("Saved Auto payload does not match the admitted bytes");
   return Object.freeze({ ref, sha256: digest(content), bytes });
 }
 

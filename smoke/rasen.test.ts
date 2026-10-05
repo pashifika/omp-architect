@@ -151,7 +151,7 @@ Smoke fixture only.
     specPath,
     "## ADDED Requirements\n\n### Requirement: Broken\nMissing normative text and scenario.\n",
   );
-  await expect(validateRasenChange(cwd, change, options)).rejects.toThrow("Rasen command failed");
+  await expect(validateRasenChange(cwd, change, options)).rejects.toThrow("exited with code 1");
   await fs.writeFile(specPath, validSpec);
   await fs.writeFile(path.join(changeDir, "tasks.md"), pendingTasks.replaceAll("[ ]", "[x]"));
   const done = await readRasenSnapshot(cwd, change, options);
@@ -202,7 +202,7 @@ test("Rasen process output, timeout, cancellation and error messages stay bounde
     await readRasenSnapshot(cwd, change, { executable: secret });
     throw new Error("Expected failure");
   } catch (error) {
-    expect(String(error)).toContain("Rasen command failed");
+    expect(String(error)).toContain("exited with code 3");
     expect(String(error)).not.toContain("SECRET_ACCESS_TOKEN");
   }
   const hanging = await fakeScript("setTimeout(() => {}, 30000);");
@@ -229,17 +229,19 @@ test("Rasen adapter refuses missing or oversized generated skills and external s
   try {
     await fs.rm(skillPath);
     await expect(readRasenSnapshot(cwd, change, { executable })).rejects.toThrow(
-      "missing or unreadable",
+      ".omp/skills/rasen-apply-change/SKILL.md (ENOENT)",
     );
     await fs.writeFile(skillPath, "x".repeat(64 * 1024 + 1));
     await expect(readRasenSnapshot(cwd, change, { executable })).rejects.toThrow(
-      "bounded regular text",
+      "limit is 65536 bytes",
     );
     const outside = path.join(temp, "outside-skill.md");
     await fs.writeFile(outside, original);
     await fs.rm(skillPath);
     await fs.symlink(outside, skillPath);
-    await expect(readRasenSnapshot(cwd, change, { executable })).rejects.toThrow("escapes");
+    await expect(readRasenSnapshot(cwd, change, { executable })).rejects.toThrow(
+      "resolves outside this project",
+    );
     await fs.rm(skillPath);
   } finally {
     await fs.writeFile(skillPath, original);
@@ -272,5 +274,20 @@ test("Rasen strict validation requires a successful report for exactly this chan
   for (const report of reports) {
     const fake = await fakeScript(`console.log(${JSON.stringify(JSON.stringify(report))});`);
     await expect(validateRasenChange(cwd, change, { executable: fake })).rejects.toThrow("Rasen");
+  }
+});
+
+test("CLI admission diagnostics identify a missing executable and hide process output", async () => {
+  await expect(
+    readRasenSnapshot(cwd, change, { executable: path.join(temp, "not-installed") }),
+  ).rejects.toThrow("could not start (ENOENT)");
+  const failure = await fakeScript('console.error("PRIVATE CLI CONTENT"); process.exit(23);');
+  try {
+    await readRasenSnapshot(cwd, change, { executable: failure });
+    throw new Error("Expected admission failure");
+  } catch (error) {
+    expect(String(error)).toContain("exited with code 23");
+    expect(String(error)).toContain("--change adapter-smoke --json");
+    expect(String(error)).not.toContain("PRIVATE CLI CONTENT");
   }
 });

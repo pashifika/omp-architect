@@ -1,5 +1,29 @@
 # Rasen Auto verification
 
+## Safe preflight diagnostics (2026-10-05)
+
+Auto start now names the failed admission boundary and exposes only integration-
+owned diagnostics: bounded relative paths, allowlisted OS codes, byte limits and
+validated read-only Rasen command arguments. Arbitrary host errors, CLI output,
+executable paths, environment and file contents are withheld. Workflow rejection
+reasons are preserved. Synchronous native-delivery failure cancels ownership and
+revokes queued payloads, without trying another send through the broken transport.
+
+Actual pinned Rasen/OMP tests cover fresh full, existing core, and deliberately
+partial full installations. Core already includes Auto in this CLI; its profile
+name alone is not evidence of a missing skill. Full reinitialization restores the
+partial installation. Tests also cover complete >64 KiB native loading, oversize,
+missing/changed/truncated skills, project-contained versus external links, missing
+CLI executable, nonzero exit codes, secret-output suppression, each admission
+boundary, cancellation and retry after immediate or queued delivery failures.
+
+Verification uses locked OMP 18.6.0, Bun 1.3.14, actual Node 24.19.0 and the existing
+pinned Rasen build. Passed: formatting/typecheck, 332 unit/installer tests (2,107
+assertions), 172 smoke tests (1,491 assertions), separate 111 installer tests (923
+assertions), 43-entry packed loading, workflow checks and `git diff --check`.
+Independent review also checked failure cleanup and secret-output suppression.
+Other host versions and remote CI require separate verification.
+
 ## Global Auto defaults (2026-10-05)
 
 Auto now loads builtin defaults, the running host's agent-directory `auto.json`,

@@ -1,3 +1,4 @@
+import { AutoPreflightError, diagnosticPath, systemErrorCode } from "./diagnostics.ts";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
@@ -28,7 +29,7 @@ export interface RasenSnapshot {
 const MAX_CONTEXT_BYTES = 64 * 1024;
 const MAX_FILES = 128;
 const invalid = () =>
-  new Error("Rasen returned an unsupported or inconsistent local change contract");
+  new AutoPreflightError("Rasen returned an unsupported or inconsistent local change contract");
 const record = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 const text = (value: unknown): value is string =>
@@ -49,10 +50,15 @@ async function localPath(root: string, file: string): Promise<string> {
   let resolved: string;
   try {
     resolved = await fs.realpath(file);
-  } catch {
-    throw new Error("Rasen local change or generated skill is missing or unreadable");
+  } catch (error) {
+    throw new AutoPreflightError(
+      `Cannot read ${diagnosticPath(path.relative(root, file))} (${systemErrorCode(error)})`,
+    );
   }
-  if (!within(root, resolved)) throw new Error("Rasen path escapes the local project");
+  if (!within(root, resolved))
+    throw new AutoPreflightError(
+      `${diagnosticPath(path.relative(root, file))} resolves outside this project; external linked skills and artifacts are not admitted`,
+    );
   return resolved;
 }
 
@@ -60,38 +66,44 @@ async function localPath(root: string, file: string): Promise<string> {
 async function checkTree(directory: string, signal?: AbortSignal): Promise<void> {
   let entries = 0;
   async function visit(current: string, depth: number): Promise<void> {
-    if (depth > 12) throw new Error("Rasen change directory exceeds the depth limit");
+    if (depth > 12) throw new AutoPreflightError("Rasen change directory exceeds the depth limit");
     const directory = await fs.opendir(current);
     for await (const entry of directory) {
       signal?.throwIfAborted();
-      if (++entries > 1024) throw new Error("Rasen change directory exceeds the entry limit");
-      if (entry.isSymbolicLink()) throw new Error("Rasen change artifacts must not be symlinks");
+      if (++entries > 1024)
+        throw new AutoPreflightError("Rasen change directory exceeds the entry limit");
+      if (entry.isSymbolicLink())
+        throw new AutoPreflightError("Rasen change artifacts must not be symlinks");
       if (entry.isDirectory()) await visit(path.join(current, entry.name), depth + 1);
-      else if (!entry.isFile()) throw new Error("Rasen change artifacts must be regular files");
+      else if (!entry.isFile())
+        throw new AutoPreflightError("Rasen change artifacts must be regular files");
     }
   }
   try {
     await visit(directory, 0);
   } catch (error) {
     if (signal?.aborted) signal.throwIfAborted();
-    if (error instanceof Error && error.message.startsWith("Rasen ")) throw error;
-    throw new Error("Rasen local change is unreadable");
+    if (error instanceof AutoPreflightError) throw error;
+    throw new AutoPreflightError(`Rasen local change is unreadable (${systemErrorCode(error)})`);
   }
 }
 
 async function prepare(cwd: string, change: string, signal?: AbortSignal) {
   signal?.throwIfAborted();
   if (!/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/.test(change) || change.length > 128)
-    throw new Error("Rasen change must be a bounded kebab-case name");
+    throw new AutoPreflightError("Rasen change must be a bounded kebab-case name");
   let root: string;
   try {
     root = await fs.realpath(cwd);
-  } catch {
-    throw new Error("Rasen project directory is unreadable");
+  } catch (error) {
+    throw new AutoPreflightError(
+      `Rasen project directory is unreadable (${systemErrorCode(error)})`,
+    );
   }
   const expected = path.join(root, "rasen", "changes", change);
   const changeDir = await localPath(root, expected);
-  if (changeDir !== expected) throw new Error("Rasen change must use the local project directory");
+  if (changeDir !== expected)
+    throw new AutoPreflightError("Rasen change must use the local project directory");
   await checkTree(changeDir, signal);
   return { root, changeDir };
 }
@@ -108,8 +120,14 @@ async function boundedText(
     const handle = await fs.open(resolved, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     try {
       const stat = await handle.stat();
-      if (!stat.isFile() || stat.size > limit)
-        throw new Error("Rasen context must contain bounded regular text files");
+      if (!stat.isFile())
+        throw new AutoPreflightError(
+          `Expected a regular file: ${diagnosticPath(path.relative(root, file))}`,
+        );
+      if (stat.size > limit)
+        throw new AutoPreflightError(
+          `${diagnosticPath(path.relative(root, file))} is ${stat.size} bytes; limit is ${limit} bytes`,
+        );
       const buffer = Buffer.alloc(limit + 1);
       let length = 0;
       while (length < buffer.length) {
@@ -118,17 +136,20 @@ async function boundedText(
         if (read.bytesRead === 0) break;
         length += read.bytesRead;
       }
-      if (length > limit) throw new Error(`Rasen text exceeds its ${limit}-byte limit`);
+      if (length > limit)
+        throw new AutoPreflightError(`Rasen text exceeds its ${limit}-byte limit`);
       const result = new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, length));
-      if (result.includes("\0")) throw new Error("Rasen context must be UTF-8 text");
+      if (result.includes("\0")) throw new AutoPreflightError("Rasen context must be UTF-8 text");
       return result;
     } finally {
       await handle.close();
     }
   } catch (error) {
     if (signal?.aborted) signal.throwIfAborted();
-    if (error instanceof Error && error.message.startsWith("Rasen ")) throw error;
-    throw new Error("Rasen context is unreadable or is not UTF-8 text");
+    if (error instanceof AutoPreflightError) throw error;
+    throw new AutoPreflightError(
+      `Cannot read UTF-8 text from ${diagnosticPath(path.relative(root, file))} (${systemErrorCode(error)})`,
+    );
   }
 }
 
@@ -151,7 +172,8 @@ async function command(
     maxOutputBytes > 4 * 1024 * 1024 ||
     !text(executable)
   )
-    throw new Error("Invalid Rasen process limits");
+    throw new AutoPreflightError("Invalid Rasen process limits");
+  const invocation = `rasen ${args.join(" ")}`;
   return new Promise((resolve, reject) => {
     const child = spawn(executable, args, {
       cwd,
@@ -180,29 +202,45 @@ async function command(
         reject(error);
       } else resolve(value!);
     };
-    const abort = () => finish(new Error("Rasen command aborted"));
-    const timer = setTimeout(() => finish(new Error("Rasen command timed out")), timeoutMs);
+    const abort = () => finish(new AutoPreflightError("Rasen command aborted"));
+    const timer = setTimeout(
+      () => finish(new AutoPreflightError(`${invocation} timed out after ${timeoutMs} ms`)),
+      timeoutMs,
+    );
     signal?.addEventListener("abort", abort, { once: true });
     const consume = (chunk: Buffer, capture: boolean) => {
       if (settled) return;
       bytes += chunk.length;
-      if (bytes > maxOutputBytes) finish(new Error("Rasen command exceeded its output limit"));
+      if (bytes > maxOutputBytes)
+        finish(
+          new AutoPreflightError(`${invocation} exceeded the ${maxOutputBytes}-byte output limit`),
+        );
       else if (capture) stdout.push(chunk);
     };
     child.stdout.on("data", (chunk: Buffer) => consume(chunk, true));
     child.stderr.on("data", (chunk: Buffer) => consume(chunk, false));
-    child.on("error", () => finish(new Error("Rasen executable could not be started")));
+    child.on("error", (error) =>
+      finish(
+        new AutoPreflightError(
+          `${invocation} could not start (${systemErrorCode(error)}); check the configured executable and OMP process PATH`,
+        ),
+      ),
+    );
     child.on("close", (code) => {
       if (settled) return;
       if (code !== 0)
-        return finish(new Error("Rasen command failed; inspect it locally for details"));
+        return finish(
+          new AutoPreflightError(
+            `${invocation} exited with code ${code ?? "unknown"}; inspect that read-only command locally for details`,
+          ),
+        );
       try {
         const value: unknown = JSON.parse(Buffer.concat(stdout).toString("utf8"));
         if (!record(value) || (Array.isArray(value.status) && value.status.length > 0))
           throw invalid();
         finish(undefined, value);
       } catch {
-        finish(new Error("Rasen returned invalid JSON or an error result"));
+        finish(new AutoPreflightError(`${invocation} returned invalid JSON or an error result`));
       }
     });
     if (signal?.aborted) abort();
@@ -259,7 +297,9 @@ export async function readRasenSnapshot(
   );
   const frontmatter = skill.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1];
   if (!frontmatter || !/^name:\s*["']?rasen-apply-change["']?\s*$/m.test(frontmatter))
-    throw new Error("Rasen apply skill has an unexpected identity; run rasen init --tools omp");
+    throw new AutoPreflightError(
+      "Rasen apply skill has an unexpected identity; run rasen init --tools omp",
+    );
   const controller = new AbortController();
   const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
   let status: Record<string, unknown>;
@@ -336,7 +376,7 @@ export async function readRasenSnapshot(
     const content = await boundedText(changeDir, file, signal);
     contextFiles.push({ path: path.relative(root, file), content });
     if (Buffer.byteLength(JSON.stringify(contextFiles), "utf8") > MAX_CONTEXT_BYTES)
-      throw new Error("Rasen context exceeds the 64 KiB limit");
+      throw new AutoPreflightError("Rasen context exceeds the 64 KiB limit");
   }
   const payload = {
     change,
@@ -351,7 +391,7 @@ export async function readRasenSnapshot(
   };
   const encoded = JSON.stringify(payload);
   if (Buffer.byteLength(encoded, "utf8") > MAX_CONTEXT_BYTES)
-    throw new Error("Rasen context exceeds the 64 KiB limit");
+    throw new AutoPreflightError("Rasen context exceeds the 64 KiB limit");
   return { ...payload, fingerprint: createHash("sha256").update(encoded).digest("hex") };
 }
 
@@ -411,7 +451,7 @@ export async function loadRasenAutoSkill(
   const content = await boundedText(root, file, signal, limit);
   const frontmatter = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1];
   if (!frontmatter || !/^name:\s*["']?rasen-auto["']?\s*$/m.test(frontmatter))
-    throw new Error(
+    throw new AutoPreflightError(
       "Installed rasen-auto skill is missing or has the wrong identity; initialize Rasen with the builtin full profile",
     );
   const rendered = await host.buildSkillPromptMessage(
@@ -421,12 +461,14 @@ export async function loadRasenAutoSkill(
   );
   signal?.throwIfAborted();
   if ((await boundedText(root, file, signal, limit)) !== content)
-    throw new Error("Rasen Auto skill changed during admission");
+    throw new AutoPreflightError("Rasen Auto skill changed during admission");
   const body = content.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, "").trim();
   // Native prompt rendering compacts Markdown table whitespace. Verify every
   // non-whitespace source character survives; never truncate the skill to fit task evidence.
   if (!body || !rendered.message.replace(/\s/g, "").includes(body.replace(/\s/g, "")))
-    throw new Error("Native skill loader did not preserve the complete Rasen Auto body");
+    throw new AutoPreflightError(
+      "Native skill loader did not preserve the complete Rasen Auto body",
+    );
   return {
     message: rendered.message,
     path: file,

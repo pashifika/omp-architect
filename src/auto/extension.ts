@@ -1,3 +1,8 @@
+import {
+  AutoPreflightError,
+  autoPreflightDiagnostic,
+  type AutoPreflightStage,
+} from "./diagnostics.ts";
 import type {
   ContextEvent,
   ExtensionAPI,
@@ -411,6 +416,7 @@ export function createAutoController(
       }
       const commandGeneration = generation;
       inFlight = true;
+      let stage: AutoPreflightStage = "confirmation";
       try {
         lifetime.abort();
         lifetime = new AbortController();
@@ -446,6 +452,7 @@ export function createAutoController(
         if (commandGeneration !== generation || signal.aborted || !ctx.isIdle()) return;
         const approved = await confirmAutoStart(pi.pi, ctx.ui, start.change, guidance, signal);
         if (!approved || commandGeneration !== generation || !ctx.isIdle()) return;
+        stage = "change snapshot";
         const snapshot = await readSnapshot(ctx.cwd, start.change, cliOptions(), signal);
         if (commandGeneration !== generation || lifetime.signal.aborted || !ctx.isIdle()) return;
         if (snapshot.state === "blocked") {
@@ -455,14 +462,18 @@ export function createAutoController(
           );
           return;
         }
+        stage = "workflow";
         const initialWorkflow = await readWorkflow(ctx.cwd, start.change, cliOptions(), signal);
-        if (initialWorkflow.kind === "invalid") throw new Error("Invalid Rasen workflow state");
+        if (initialWorkflow.kind === "invalid")
+          throw new AutoPreflightError(initialWorkflow.reason);
+        stage = "skill loading";
         const skill = await loadSkill(ctx.cwd, request, pi.pi, signal);
         if (commandGeneration !== generation || signal.aborted || !ctx.isIdle()) return;
         const candidate = new AutoRun(config, snapshot, dependencies.now);
         runInstructions = guidance;
         const content = `${bridge.instructions()}\n\n${autoPolicy}\n\n${skill.message}\n\n${prompt(snapshot)}\n\nAuto run: ${deliveryTag}:${candidate.id}`;
         const sessionId = ctx.sessionManager.getSessionId();
+        stage = "artifact storage";
         const material = await saveAutoPayload(ctx, content, signal);
         // Artifact persistence is asynchronous: cancellation or session replacement must win.
         if (
@@ -473,6 +484,7 @@ export function createAutoController(
         )
           return;
         if (resolveNativeHost(ctx)?.session !== nativeHost.session) return;
+        stage = "native delivery";
         asyncScope = new AutoAsyncScope(nativeHost);
         asyncScopes.add(asyncScope);
         run = candidate;
@@ -518,12 +530,21 @@ export function createAutoController(
           },
           { triggerTurn: true, deliverAs: "nextTurn" },
         );
-      } catch {
-        if (commandGeneration !== generation) return;
-        ctx.ui.notify(
-          "Auto preflight failed. Check the installed Rasen CLI, generated OMP rasen-auto skill from the builtin full profile, change artifacts, native session artifact storage, and size limits",
-          "error",
-        );
+      } catch (error) {
+        if (commandGeneration !== generation || lifetime.signal.aborted) return;
+        const diagnostic = autoPreflightDiagnostic(stage, error);
+        if (stage === "native delivery") {
+          // A host may enqueue and then throw: revoke ownership and any queued payload.
+          // Do not use notify() here, because it attempts another native send.
+          stop("Native Auto delivery failed");
+          ownsTurn = false;
+          delivery = undefined;
+          activeContext = undefined;
+          // This diagnostic is the cancellation notification; stale delivery must
+          // not schedule another native message while the host transport is broken.
+          notified = run?.id ?? "";
+        }
+        ctx.ui.notify(diagnostic, "error");
       } finally {
         if (commandGeneration === generation) inFlight = false;
       }

@@ -313,7 +313,9 @@ test("workflow commands enforce output/time/cancellation limits without echoing 
     await readRasenWorkflow(cwd, change, { executable: failure });
     throw new Error("Expected process failure");
   } catch (error) {
-    expect(String(error)).toContain("command failed");
+    expect(String(error)).toContain(
+      "rasen pipeline resume workflow-smoke --json exited with code 2",
+    );
     expect(String(error)).not.toContain("SECRET_TOKEN");
   }
   const hanging = await script("setTimeout(() => {}, 30000);");

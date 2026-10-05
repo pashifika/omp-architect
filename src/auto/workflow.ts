@@ -1,3 +1,4 @@
+import { AutoPreflightError, systemErrorCode } from "./diagnostics.ts";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
@@ -76,13 +77,13 @@ const completedStatus = (status: WorkflowStageStatus) => status === "done" || st
 async function localPath(root: string, target: string, missing = false): Promise<void> {
   const relative = path.relative(root, target);
   if (path.isAbsolute(relative) || relative === ".." || relative.startsWith(`..${path.sep}`))
-    throw new Error("Rasen workflow state escapes the local project");
+    throw new AutoPreflightError("Rasen workflow state escapes the local project");
   let current = root;
   for (const part of relative.split(path.sep).filter(Boolean)) {
     current = path.join(current, part);
     try {
       if ((await fs.lstat(current)).isSymbolicLink())
-        throw new Error("Rasen workflow paths must not be symlinks");
+        throw new AutoPreflightError("Rasen workflow paths must not be symlinks");
     } catch (error) {
       if (missing && (error as NodeJS.ErrnoException).code === "ENOENT") return;
       throw error;
@@ -97,7 +98,7 @@ async function readState(root: string, file: string, signal?: AbortSignal): Prom
   try {
     const stat = await handle.stat();
     if (!stat.isFile() || stat.size > MAX_BYTES)
-      throw new Error("Rasen workflow state must be bounded regular UTF-8 text");
+      throw new AutoPreflightError("Rasen workflow state must be bounded regular UTF-8 text");
     const buffer = Buffer.alloc(MAX_BYTES + 1);
     let size = 0;
     while (size < buffer.length) {
@@ -106,9 +107,11 @@ async function readState(root: string, file: string, signal?: AbortSignal): Prom
       if (!result.bytesRead) break;
       size += result.bytesRead;
     }
-    if (size > MAX_BYTES) throw new Error("Rasen workflow state exceeds its size limit");
+    if (size > MAX_BYTES)
+      throw new AutoPreflightError("Rasen workflow state exceeds its size limit");
     const text = new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, size));
-    if (text.includes("\0")) throw new Error("Rasen workflow state must be UTF-8 text");
+    if (text.includes("\0"))
+      throw new AutoPreflightError("Rasen workflow state must be UTF-8 text");
     return text;
   } finally {
     await handle.close();
@@ -136,7 +139,8 @@ async function command(
     maxOutputBytes < 1 ||
     maxOutputBytes > 4 * 1024 * 1024
   )
-    throw new Error("Invalid Rasen workflow process limits");
+    throw new AutoPreflightError("Invalid Rasen workflow process limits");
+  const invocation = `rasen ${args.join(" ")}`;
   return new Promise((resolve, reject) => {
     const child = spawn(executable, args, {
       cwd,
@@ -166,31 +170,44 @@ async function command(
         reject(error);
       } else resolve(value!);
     };
-    const abort = () => finish(new Error("Rasen workflow command aborted"));
+    const abort = () => finish(new AutoPreflightError("Rasen workflow command aborted"));
     const timer = setTimeout(
-      () => finish(new Error("Rasen workflow command timed out")),
+      () => finish(new AutoPreflightError(`${invocation} timed out after ${timeoutMs} ms`)),
       timeoutMs,
     );
     const consume = (chunk: Buffer, capture: boolean) => {
       if (settled) return;
       bytes += chunk.length;
       if (bytes > maxOutputBytes)
-        finish(new Error("Rasen workflow command exceeded its output limit"));
+        finish(
+          new AutoPreflightError(`${invocation} exceeded the ${maxOutputBytes}-byte output limit`),
+        );
       else if (capture) output.push(chunk);
     };
     signal?.addEventListener("abort", abort, { once: true });
     child.stdout.on("data", (chunk: Buffer) => consume(chunk, true));
     child.stderr.on("data", (chunk: Buffer) => consume(chunk, false));
-    child.on("error", () => finish(new Error("Rasen workflow executable could not start")));
+    child.on("error", (error) =>
+      finish(
+        new AutoPreflightError(
+          `${invocation} could not start (${systemErrorCode(error)}); check the configured executable and OMP process PATH`,
+        ),
+      ),
+    );
     child.on("close", (code) => {
       if (settled) return;
-      if (code !== 0) return finish(new Error("Rasen workflow command failed"));
+      if (code !== 0)
+        return finish(
+          new AutoPreflightError(
+            `${invocation} exited with code ${code ?? "unknown"}; inspect that read-only command locally for details`,
+          ),
+        );
       try {
         const value: unknown = JSON.parse(Buffer.concat(output).toString("utf8"));
-        if (!record(value)) throw new Error();
+        if (!record(value)) throw new AutoPreflightError();
         finish(undefined, value);
       } catch {
-        finish(new Error("Rasen workflow returned invalid JSON"));
+        finish(new AutoPreflightError(`${invocation} returned invalid JSON`));
       }
     });
     if (signal?.aborted) abort();
@@ -210,13 +227,13 @@ export async function readRasenWorkflow(
 ): Promise<RasenWorkflow> {
   signal?.throwIfAborted();
   if (!slug.test(change) || change.length > 128)
-    throw new Error("Rasen workflow change must be a bounded kebab-case name");
+    throw new AutoPreflightError("Rasen workflow change must be a bounded kebab-case name");
   const root = await fs.realpath(cwd);
   const changeDir = path.join(root, "rasen", "changes", change);
   const ephemeraDir = path.join(root, ".rasen", "changes", change, "ephemera");
   await localPath(root, changeDir);
   if (!(await fs.stat(changeDir)).isDirectory())
-    throw new Error("Rasen workflow change must be a local directory");
+    throw new AutoPreflightError("Rasen workflow change must be a local directory");
   // Refuse local state symlinks before the CLI can follow them.
   for (const directory of [ephemeraDir, changeDir])
     for (const filename of ["auto-run.json", "portfolio-run.json"])
@@ -247,13 +264,15 @@ export async function readRasenWorkflow(
     return result("invalid", "Rasen workflow returned an invalid pipeline or state path");
   const runStateDir = path.resolve(resume.runStateDir);
   if (![changeDir, ephemeraDir].includes(runStateDir))
-    throw new Error("Rasen workflow state is outside the supported local state directories");
+    throw new AutoPreflightError(
+      "Rasen workflow state is outside the supported local state directories",
+    );
   const statePath = path.join(runStateDir, "auto-run.json");
   const before = await readState(root, statePath, signal);
   let state: Record<string, unknown>;
   try {
     const parsed: unknown = JSON.parse(before);
-    if (!record(parsed)) throw new Error();
+    if (!record(parsed)) throw new AutoPreflightError();
     state = parsed;
   } catch {
     return result("invalid", "Rasen run-state is invalid JSON");

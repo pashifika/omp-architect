@@ -66,3 +66,39 @@ for (const failure of ["identity", "oversize", "truncated", "changed", "aborted"
     }
   });
 }
+
+for (const mode of ["missing", "local-link", "external-link"] as const) {
+  test(`Rasen Auto ${mode} skill has a bounded actionable diagnostic`, async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-auto-skill-"));
+    const external = await fs.mkdtemp(path.join(os.tmpdir(), "omp-external-skill-"));
+    const file = path.join(root, ".omp/skills/rasen-auto/SKILL.md");
+    const body = "Complete workflow";
+    const host = {
+      async buildSkillPromptMessage(source: { name: string; filePath: string }) {
+        return {
+          message: body,
+          details: { name: source.name, path: source.filePath, lineCount: 1 },
+        };
+      },
+    };
+    try {
+      if (mode !== "missing") {
+        const target = path.join(mode === "local-link" ? root : external, "shared-skill.md");
+        await Bun.write(target, `---\nname: rasen-auto\n---\n${body}`);
+        await fs.mkdir(path.dirname(file), { recursive: true });
+        await fs.symlink(target, file);
+      }
+      if (mode === "local-link")
+        expect((await loadRasenAutoSkill(root, "Scoped task", host)).message).toBe(body);
+      else
+        await expect(loadRasenAutoSkill(root, "Scoped task", host)).rejects.toThrow(
+          mode === "missing"
+            ? ".omp/skills/rasen-auto/SKILL.md (ENOENT)"
+            : "resolves outside this project",
+        );
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+      await fs.rm(external, { recursive: true, force: true });
+    }
+  });
+}

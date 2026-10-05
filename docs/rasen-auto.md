@@ -244,3 +244,30 @@ ambiguous because the host omits a per-call abort/job handle; normal errors that
 continue to the model do not retain this fence. Processes launched outside the
 native manager are also outside this cancellation guarantee. These limits do not justify changing global
 async settings; keep normal tool approvals and verify actual termination.
+
+### Diagnosing a refused start
+
+A preflight notification names the failed boundary: confirmation, change snapshot,
+workflow, skill loading, or native session artifact storage. Integration-owned
+errors include the relative file, limit, read-only CLI command, or allowlisted OS
+error code where available. Raw CLI output, arbitrary host exceptions, full local
+paths and environment values are withheld. No provider call is made during these
+checks.
+
+For missing generated skills, inspect `.omp/skills/rasen-apply-change/SKILL.md` and
+`.omp/skills/rasen-auto/SKILL.md` in the project where OMP started. Use the same
+Rasen executable configured in `auto.json`. A fresh or partial install can be
+regenerated with `rasen init --tools omp --profile full`; this changes generated
+project files, so inspect existing customizations first. The pinned development
+CLI's `core` profile also includes Auto: a profile name alone does not prove a
+missing skill. Native autoload renders the explicit project skill, rather than
+searching for an unrelated global skill. Project-contained skill links work;
+links outside the project remain refused by the local admission boundary.
+
+For CLI errors, run the exact read-only command shown locally. `ENOENT` at a CLI
+boundary means the configured executable could not start; inspect the OMP
+process's PATH or use an absolute `rasenExecutable`. `ENOENT` with a relative skill
+path means that file could not be resolved. `ENOSPC` at artifact storage means to
+check free space in the persistent session's storage. Restart OMP after changing
+its Auto configuration. A cancelled or replaced admission is silent and never
+starts a run.
