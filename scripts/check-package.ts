@@ -61,6 +61,7 @@ try {
     "src/brief/format.ts",
     "src/brief/editor.ts",
     "examples/auto.json",
+    "examples/auto-project.json",
     "examples/auto-config.yml",
     "docs/rasen-auto-verification.md",
     "src/prompts/architect.md",

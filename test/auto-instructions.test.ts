@@ -2,7 +2,6 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { loadAutoConfig } from "../src/auto/config.ts";
 import { autoRequest, briefRoot, parseAutoStart, renderBrief } from "../src/auto/instructions.ts";
 import { completeAuto } from "../src/auto/completion.ts";
 import { Orchestrator } from "../src/core.ts";
@@ -28,19 +27,6 @@ async function fixture() {
   await Bun.write(path.join(pack, "ts.md"), "---\naliases: typescript, t\n---\nTS {scope}: {var}");
   return { cwd, global, pack };
 }
-
-test("missing config and omitted enabled use defaults; explicit false and invalid config are preserved", async () => {
-  const { cwd } = await fixture();
-  expect((await loadAutoConfig(cwd)).enabled).toBe(true);
-  await Bun.write(path.join(cwd, ".omp/auto.json"), '{"maxSteps":2}');
-  expect(await loadAutoConfig(cwd)).toMatchObject({ enabled: true, maxSteps: 2 });
-  await Bun.write(path.join(cwd, ".omp/auto.json"), '{"enabled":false}');
-  expect((await loadAutoConfig(cwd)).enabled).toBe(false);
-  await Bun.write(path.join(cwd, ".omp/auto.json"), '{"maxSteps":10001}');
-  await expect(loadAutoConfig(cwd)).rejects.toThrow();
-  await Bun.write(path.join(cwd, ".omp/auto.json"), "{");
-  await expect(loadAutoConfig(cwd)).rejects.toThrow();
-});
 
 test("instructions preserve quotes, multiple spaces, indentation, newlines, and trailing whitespace", () => {
   for (const text of [

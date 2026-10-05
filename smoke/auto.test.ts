@@ -34,6 +34,7 @@ import {
 import { createJevProvider } from "../src/auto/decision.ts";
 import type { Reviewer } from "../src/core.ts";
 import { extensionFactory } from "../src/extension.ts";
+import { withAgentDir } from "./isolated-host.ts";
 
 const approved = { decision: "approve" as const, summary: "Fixture evidence checked", issues: [] };
 
@@ -142,11 +143,12 @@ async function loaderFixture(
     minReviews?: number;
     maxReviews?: number;
     modelRegistry?: ModelRegistry;
-    prepare?: (cwd: string) => Promise<void>;
+    prepare?: (cwd: string, agentDir: string) => Promise<void>;
   } = {},
 ) {
   const cwd = await project(config, overrides.minReviews, overrides.maxReviews);
-  await overrides.prepare?.(cwd);
+  const agentDir = path.join(cwd, ".test-host-profile", "agent");
+  await overrides.prepare?.(cwd, agentDir);
   const runtime = new ExtensionRuntime();
   const messages: Array<{ customType: string; content: unknown }> = [];
   const bootstraps: string[] = [];
@@ -166,26 +168,27 @@ async function loaderFixture(
   runtime.sendUserMessage = () => {
     throw new Error("Auto must never fabricate a user message");
   };
+  const factory = extensionFactory(() => overrides.reviewer ?? (async () => approved), {
+    snapshot: async () => {
+      reads++;
+      return snapshot(completed);
+    },
+    skill: skillFixture,
+    workflow: async () => workflow(true),
+    validate: async () => {},
+    decision: () => async () => {
+      decisions++;
+      return { choice: "continue", confidence: 0.99 };
+    },
+    fallback: () => async () => {
+      throw new Error("Unexpected fallback");
+    },
+    backgroundEnabled: () => false,
+    asyncEnabled: () => false,
+    ...overrides.dependencies,
+  });
   const extension = await loadExtensionFromFactory(
-    extensionFactory(() => overrides.reviewer ?? (async () => approved), {
-      snapshot: async () => {
-        reads++;
-        return snapshot(completed);
-      },
-      skill: skillFixture,
-      workflow: async () => workflow(true),
-      validate: async () => {},
-      decision: () => async () => {
-        decisions++;
-        return { choice: "continue", confidence: 0.99 };
-      },
-      fallback: () => async () => {
-        throw new Error("Unexpected fallback");
-      },
-      backgroundEnabled: () => false,
-      asyncEnabled: () => false,
-      ...overrides.dependencies,
-    }),
+    withAgentDir(factory, agentDir),
     cwd,
     new EventBus(),
     runtime,
@@ -329,6 +332,75 @@ for (const mode of ["missing", "disabled", "invalid", "declined"] as const) {
       expect(confirms).toBe(mode === "disabled" || mode === "invalid" ? 0 : 1);
       expect(fixture.bootstraps).toHaveLength(mode === "missing" ? 1 : 0);
       expect(fixture.counts().reads).toBe(mode === "missing" ? 1 : 0);
+    } finally {
+      await fixture.close();
+    }
+  });
+}
+
+test("real loader uses host profile defaults with selective project overrides", async () => {
+  const fixture = await loaderFixture(
+    { noOutputTimeoutMs: 240000, maxSteps: null },
+    {
+      prepare: async (_cwd, agentDir) => {
+        await Bun.write(
+          path.join(agentDir, "auto.json"),
+          JSON.stringify({ maxDurationMs: 7200000, noOutputTimeoutMs: 300000, maxSteps: 12 }),
+        );
+      },
+    },
+  );
+  try {
+    expect(fixture.bootstraps).toEqual([]);
+    expect(await fixture.status()).toMatchObject({ status: "idle", enabled: true, error: null });
+    await fixture.start();
+    expect(await fixture.status()).toMatchObject({
+      status: "running",
+      supervision: { maxDurationMs: 7200000, noOutputTimeoutMs: 240000 },
+      steps: "1",
+    });
+  } finally {
+    await fixture.close();
+  }
+});
+
+for (const mode of ["disabled", "invalid", "overridden"] as const) {
+  test(`real loader ${mode} global config preserves consent and disabled-state checks`, async () => {
+    let globalFile = "";
+    const fixture = await loaderFixture(mode === "overridden" ? { enabled: true } : {}, {
+      prepare: async (_cwd, agentDir) => {
+        globalFile = path.join(agentDir, "auto.json");
+        await Bun.write(globalFile, mode === "invalid" ? "{" : '{"enabled":false}');
+      },
+    });
+    let confirms = 0;
+    const notifications: string[] = [];
+    const ctx = {
+      ...fixture.ctx,
+      ui: {
+        ...fixture.ctx.ui,
+        notify: (message: string) => notifications.push(message),
+        custom: async <T>() => {
+          confirms++;
+          return true as T;
+        },
+      },
+    };
+    try {
+      expect(await fixture.status()).toMatchObject({
+        status: "idle",
+        enabled: mode === "overridden",
+      });
+      expect(fixture.bootstraps).toEqual([]);
+      await fixture.extension.commands.get("auto")!.handler("start fixture-change", ctx);
+      expect(confirms).toBe(mode === "overridden" ? 1 : 0);
+      expect(fixture.bootstraps).toHaveLength(mode === "overridden" ? 1 : 0);
+      expect(fixture.counts().reads).toBe(mode === "overridden" ? 1 : 0);
+      if (mode === "invalid") {
+        expect((await fixture.status()).error).toContain(globalFile);
+        expect(notifications[0]).toContain(globalFile);
+      }
+      if (mode === "disabled") expect(notifications[0]).toContain("explicitly disabled");
     } finally {
       await fixture.close();
     }
@@ -1515,13 +1587,16 @@ for (const mode of [
                   .handler("stop", session!.extensionRunner!.createCommandContext());
               });
           },
-          extensionFactory(
-            () => async (request) => {
-              reviews++;
-              reviewEvidence.push(request.evidence);
-              return approved;
-            },
-            dependencies,
+          withAgentDir(
+            extensionFactory(
+              () => async (request) => {
+                reviews++;
+                reviewEvidence.push(request.evidence);
+                return approved;
+              },
+              dependencies,
+            ),
+            path.join(cwd, "isolated-agent"),
           ),
           (pi) => {
             pi.registerProvider(provider, providerConfig);

@@ -35,10 +35,58 @@ source guidance is never reconstructed from display rows.
 ## Setup
 
 1. Build/install the pinned Rasen development source with `bun run prepare:rasen` (see the script's reported executable path), then run `rasen init --tools omp --profile full` in your project using that executable. Use the builtin profile; no external YAML profile import is needed. The script installs into a temporary test prefix; use Rasen's upstream packaging workflow for a persistent installation. Prepare the change's proposal, design, specs, and tasks first
-2. `.omp/auto.json` is **optional**. When absent, Auto uses its bounded defaults and the `rasen` executable on PATH. To customize them, copy [examples/auto.json](../examples/auto.json) and set `rasenExecutable` if needed, then restart OMP. An explicit `"enabled": false` disables starts; malformed or invalid files fail closed. A missing file or `enabled: true` never starts a run automatically
+2. Both the global and project `auto.json` files are **optional**. Set common defaults in the active OMP agent directory's `auto.json` (normally `~/.omp/agent/auto.json`), then override individual settings in `<project>/.omp/auto.json` if needed. With neither file, Auto uses its bounded builtins and `rasen` on PATH. See [configuration inheritance](#configuration-inheritance) below; restart OMP after editing. A missing file or `enabled: true` never starts a run automatically
 3. Merge [examples/auto-config.yml](../examples/auto-config.yml) to set native OMP `async.enabled: false`, `bash.autoBackground.enabled: false`, and `eval.autoBackground.enabled: false`, and finish existing background jobs. Auto requires foreground tools and leaf tasks. Native tasks otherwise run asynchronously by default even without an explicit `async` argument. Eval auto-backgrounding is already off by default; keep it off so a long native checkpoint cannot detach. The regular `modelRoles` and Architect `reviews.min/max` settings in the [Architect guide](architect.md) remain authoritative
 4. Authenticate the `typesafe` provider through OMP's `/login`, or provide `TYPESAFE_API_KEY` in the OMP process environment through your normal secure setup. Auto resolves credentials through the current OMP session's `authStorage.keys.get("typesafe")` on each Jev invocation, using OMP's standard precedence; a key saved by `/login` takes precedence over the environment variable. You do not need to configure both. Credential lookup shares the decision's timeout and cancellation boundary. Never put keys in `auto.json`, this repository, task artifacts, or tool arguments. No external private connector key is imported. `jev-latest` is the fixed TypeSafe routing model; OMP generative models/efforts still use native roles
 5. Run `/auto start my-change` in interactive OMP and confirm the scoped run and evidence sharing. `/auto status` and `auto_status` independently re-read bounded, fresh Rasen CLI state and show progress, supervision, and review budgets, including after a run stops. `/auto stop` cancels; a fresh user start is required to reset budgets
+
+## Configuration inheritance
+
+Auto reads these layers in order, with later **explicitly specified keys** taking precedence:
+
+1. Builtin defaults, including 4 hours overall and 10 minutes without native output
+2. `<active OMP agent directory>/auto.json`, normally `~/.omp/agent/auto.json`
+3. `<project>/.omp/auto.json`
+
+The global path comes directly from the running host's `getAgentDir()`. Native
+profile selection and agent-directory overrides are honored; Auto does not assume
+that the current profile lives under `HOME/.omp/agent`. Both files may be absent,
+and reading configuration never creates or overwrites either file or changes
+Architect/native OMP settings.
+
+Use [examples/auto.json](../examples/auto.json) as a complete global template. A
+minimal global file is enough to change common time limits:
+
+```json
+{
+  "maxDurationMs": 7200000,
+  "noOutputTimeoutMs": 300000
+}
+```
+
+Keep the project file partial so unspecified options continue to inherit. For
+example, [examples/auto-project.json](../examples/auto-project.json) overrides the
+overall deadline and clears any inherited tool-count cap:
+
+```json
+{
+  "maxDurationMs": 3600000,
+  "maxToolCalls": null
+}
+```
+
+With these two files, the project runs with a 1-hour overall limit, the inherited
+5-minute no-output limit, and no tool-count cap. An empty project `{}` inherits all
+global options. Explicit `null` clears an inherited `maxSteps`, `maxToolCalls`, or
+`maxStalls` cap; it is invalid for the finite time limits. An inherited
+`"enabled": false` disables starts unless the project explicitly sets it to `true`;
+a project `false` always disables starts. Enabling Auto still requires an explicit
+`/auto start` and confirmation, and never starts or resumes work by itself.
+
+Each present file is validated independently. Malformed JSON, invalid options,
+and unreadable files disable Auto and report the failing file's path, even when a
+later project value would override it. Correct the file and restart the session.
+Unrelated Architect configuration continues to use its existing behavior.
 
 ## Extra instructions and existing brief packs
 

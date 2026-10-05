@@ -17,6 +17,7 @@ import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
 import { MemorySessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { extensionFactory } from "../src/extension.ts";
 import type { RasenSnapshot } from "../src/auto/rasen.ts";
+import { withAgentDir } from "./isolated-host.ts";
 
 type Mode = "success" | "prompt" | "deny" | "cancel" | "child-abort" | "recursion";
 type NativeEvent = {
@@ -252,30 +253,33 @@ async function nativeFixture(mode: Mode) {
     settings,
     sessionManager,
     extensions: [
-      extensionFactory(
-        () => async () => {
-          reviews++;
-          return { decision: "approve", summary: "Unexpected fixture review", issues: [] };
-        },
-        {
-          snapshot: async () => snapshot,
-          workflow: async () => ({
-            kind: "absent",
-            change: "fixture-change",
-            reason: "Synthetic pipeline not yet recorded",
-            fingerprint: "absent",
-          }),
-          skill: async () => ({
-            message: "Synthetic complete Auto skill",
-            path: "fixture",
-            bytes: 29,
-            sha256: "fixture",
-          }),
-          validate: async () => {},
-          decision: () => async () => ({ choice: "continue", confidence: 0.99 }),
-          backgroundEnabled: () => false,
-          asyncEnabled: () => false,
-        },
+      withAgentDir(
+        extensionFactory(
+          () => async () => {
+            reviews++;
+            return { decision: "approve", summary: "Unexpected fixture review", issues: [] };
+          },
+          {
+            snapshot: async () => snapshot,
+            workflow: async () => ({
+              kind: "absent",
+              change: "fixture-change",
+              reason: "Synthetic pipeline not yet recorded",
+              fingerprint: "absent",
+            }),
+            skill: async () => ({
+              message: "Synthetic complete Auto skill",
+              path: "fixture",
+              bytes: 29,
+              sha256: "fixture",
+            }),
+            validate: async () => {},
+            decision: () => async () => ({ choice: "continue", confidence: 0.99 }),
+            backgroundEnabled: () => false,
+            asyncEnabled: () => false,
+          },
+        ),
+        path.join(cwd, "isolated-agent"),
       ),
       (pi) => {
         pi.registerProvider(provider, providerConfig);

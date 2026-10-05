@@ -35,11 +35,11 @@ export const autoDefaults: AutoConfig = {
   rasenExecutable: "rasen",
 };
 
-export function parseAutoConfig(value: unknown): AutoConfig {
+export function parseAutoConfig(value: unknown, defaults: AutoConfig = autoDefaults): AutoConfig {
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw new Error("auto.json must contain an object");
   const input = value as Record<string, unknown>;
-  const result = { ...autoDefaults };
+  const result = { ...defaults };
   for (const key of Object.keys(input)) {
     if (!Object.hasOwn(autoDefaults, key)) throw new Error(`Unknown auto option: ${key}`);
   }
@@ -96,11 +96,27 @@ export function parseAutoConfig(value: unknown): AutoConfig {
   return result;
 }
 
-export async function loadAutoConfig(cwd: string): Promise<AutoConfig> {
+async function loadAutoLayer(file: string, defaults: AutoConfig): Promise<AutoConfig> {
+  let value: unknown;
   try {
-    return parseAutoConfig(await Bun.file(path.join(cwd, ".omp", "auto.json")).json());
+    value = await Bun.file(file).json();
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return parseAutoConfig({});
-    throw error;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { ...defaults };
+    // Do not echo malformed file contents, which may accidentally contain secrets.
+    throw new Error(`Invalid Auto configuration at ${file}: expected a readable JSON object`);
   }
+  try {
+    return parseAutoConfig(value, defaults);
+  } catch (error) {
+    throw new Error(
+      `Invalid Auto configuration at ${file}: ${error instanceof Error ? error.message : "invalid options"}`,
+    );
+  }
+}
+
+/** Both files are optional; the host resolves profiles and agent-directory overrides. */
+export async function loadAutoConfig(cwd: string, agentDir: string): Promise<AutoConfig> {
+  const global = await loadAutoLayer(path.join(agentDir, "auto.json"), autoDefaults);
+  // Validate each layer before merging so a project override cannot hide a broken global file.
+  return loadAutoLayer(path.join(cwd, ".omp", "auto.json"), global);
 }

@@ -1,5 +1,27 @@
 # Rasen Auto verification
 
+## Global Auto defaults (2026-10-05)
+
+Auto now loads builtin defaults, the running host's agent-directory `auto.json`,
+then explicitly specified project `.omp/auto.json` options. Both files are
+optional. Tests cover absent/global-only/project-only files, partial overrides,
+explicit `null` count caps and `false`, independent layer validation, exact failing
+paths, and unchanged files. The real source loader exercises consent and configured
+time supervision; the sparse bundled CLI exercises custom agent directories,
+named-profile precedence, disabled inheritance, project overrides and invalid
+global files without a model turn or network access.
+
+On locked OMP **18.6.0**, Bun **1.3.14**, actual Node **24.19.0**, and the existing
+pinned Rasen build, formatting/typecheck and **315 unit/installer tests (2,044
+assertions)** passed. The full **149-test smoke suite (1,250 assertions)** passed,
+including a final rerun with an isolated ambient global `enabled: false` file to
+verify that Auto-starting SDK fixtures use their own host agent directories.
+Packed loading (**41 entries**), workflow/ruleset checks, and `git diff --check`
+also passed. These additional changes were verified on the locked host; the
+multi-version record below belongs to the preceding workflow port. Remote CI and
+cross-platform installer results must still be checked on the published commit.
+
+
 ## Native builtin-full workflow port (2026-10-05)
 
 This section describes the current Auto implementation. The older records below

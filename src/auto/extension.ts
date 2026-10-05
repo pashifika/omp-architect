@@ -372,7 +372,7 @@ export function createAutoController(
         ctx.ui.notify(
           configError ||
             (!config.enabled
-              ? "Auto is explicitly disabled in .omp/auto.json; change enabled and restart the session"
+              ? "Auto is explicitly disabled by auto.json; change enabled in the project or active OMP agent configuration and restart the session"
               : "Initialize Architect before starting Auto"),
           "error",
         );
@@ -877,11 +877,10 @@ export function createAutoController(
       expectedContinuation = "";
       configError = "";
       try {
-        config = await loadAutoConfig(ctx.cwd);
-      } catch {
+        config = await loadAutoConfig(ctx.cwd, pi.pi.getAgentDir());
+      } catch (error) {
         config = { ...autoDefaults, enabled: false };
-        configError =
-          "Invalid .omp/auto.json; Auto is disabled until corrected and the session is restarted";
+        configError = `${error instanceof Error ? error.message : "Could not load Auto configuration"}; Auto is disabled until corrected and the session is restarted`;
       }
     },
     shutdown() {
